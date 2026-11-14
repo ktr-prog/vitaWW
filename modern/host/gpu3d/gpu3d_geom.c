@@ -540,7 +540,26 @@ static void debug_tex_poly(const char *what, const G3Vertex *v, int nv, int n) {
     fprintf(stderr, "\n");
 }
 
+int gG3ClipSpaceOut;   // set by a GPU backend (vita_gl3d) that consumes clip-space pos[] directly
 static void poly_screen(G3Polygon *poly, int n) {
+    if (gG3ClipSpaceOut) {
+        // The GPU backend feeds clip-space pos[] to the hardware, which does the perspective divide, viewport
+        // map and depth itself - so the software screen mapping here (screen_position(): 4 integer divides per
+        // vertex, plus a per-vertex z divide) is pure wasted work, and integer divide is expensive on the
+        // Cortex-A9 (it has none in hardware). Skip it; keep only the cheap w[] normalisation. Translucent draw
+        // order falls back to submission order + the GPU depth test (the software back-to-front sort is dropped).
+        int ws = 0;
+        for (int i = 0; i < n; i++) { u32 w = (u32)poly->v[i]->pos[3]; while ((w >> ws) && ws < 32) ws += 4; }
+        for (int i = 0; i < n; i++) {
+            u32 w = (u32)poly->v[i]->pos[3];
+            poly->w[i] = (s32)(ws < 16 ? w << (16 - ws) : w >> (ws - 16));
+            poly->z[i] = 0;
+        }
+        poly->vtop = poly->vbottom = 0;
+        poly->ytop = poly->ybottom = poly->xtop = poly->xbottom = 0;
+        poly->sortKey = poly->translucent ? 1u << 21 : 0;
+        return;
+    }
     s32 ytop = 0x7fff, ybot = 0, xtop = 0, xbot = 0;
     int vtop = 0, vbot = 0;
     int wsize = 0;

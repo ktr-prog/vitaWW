@@ -96,6 +96,8 @@ static void lazy_init(void) {
 int g3w_init(void *device, void *queue, int scale) {
     (void)device; (void)queue; (void)scale;
     sEnabled = 1;      // GL objects are created lazily on first render, once the vitaGL context exists
+    extern int gG3ClipSpaceOut;
+    gG3ClipSpaceOut = 1;   // this backend consumes clip-space pos[] directly; skip software screen/z setup
     return 1;
 }
 void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no shared picture
@@ -142,12 +144,14 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
         for (int i = 0; i < p->nv; i++) {
             const G3Vertex *v = p->v[i];
-            float w = (float)(p->w[i] > 0 ? p->w[i] : 1);
-            float x = (float)v->hx / 16.0f / VW * 2.0f - 1.0f;
-            float y = 1.0f - (float)v->hy / 16.0f / VH * 2.0f;
-            float z = (float)p->z[i] / 16777215.0f;
-            if (z < 0) z = 0; else if (z > 1) z = 1;
-            sVPos[i][0] = x * w; sVPos[i][1] = y * w; sVPos[i][2] = (2.0f * z - 1.0f) * w; sVPos[i][3] = w;
+            // Feed the DS clip-space position straight to GL and let the GPU do the perspective divide, viewport
+            // map and depth. This is algebraically identical to reconstructing (NDC*w) from the software screen
+            // coords (hx/hy) and poly z - pos[0]=NDC_x*w, pos[1]=NDC_y*w, pos[2]=NDC_z*w, pos[3]=w - but it means
+            // the CPU no longer has to run screen_position() (4 integer divides/vertex) or the per-vertex z divide
+            // in submit_polygon, which are costly on the Cortex-A9 (no hardware divide). gG3ClipSpaceOut tells the
+            // geometry pipeline to skip that software screen/z setup for this backend.
+            sVPos[i][0] = (float)v->pos[0]; sVPos[i][1] = (float)v->pos[1];
+            sVPos[i][2] = (float)v->pos[2]; sVPos[i][3] = (float)v->pos[3];
             // v->color is the DS's 9-bit interpolation value (5-bit vertex colour expanded as c<<4|0xf). The
             // software rasterizer takes the 6-bit channel as (color >> 3), so normalise by that, not /63 directly
             // (dividing the raw 0..511 value by 63 made everything ~8x too bright and clamp to white).
