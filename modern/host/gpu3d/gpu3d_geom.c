@@ -541,6 +541,7 @@ static void debug_tex_poly(const char *what, const G3Vertex *v, int nv, int n) {
 }
 
 int gG3ClipSpaceOut;   // set by a GPU backend (vita_gl3d) that consumes clip-space pos[] directly
+int gG3GpuXform;       // set by vita_gl3d: the GPU does the vertex transform/clip/cull from raw verts + matrix
 static void poly_screen(G3Polygon *poly, int n) {
     if (gG3ClipSpaceOut) {
         // The GPU backend feeds clip-space pos[] to the hardware, which does the perspective divide, viewport
@@ -595,6 +596,33 @@ static void poly_screen(G3Polygon *poly, int n) {
     poly->sortKey = (u32)(ybot << 10 | ytop) | (poly->translucent ? 1u << 21 : 0);
 }
 
+// GPU-transform fast path: store the de-stripped polygon with raw (model-space) verts + the DS clip matrix and
+// let the GPU do the transform, clip and cull. Skips the CPU vertex transform, Sutherland-Hodgman clip and the
+// facing/cull math entirely - the bulk of the per-frame geometry cost on the Cortex-A9.
+static void store_poly_gpu(const G3Vertex *v, int nv, u32 attr) {
+    if (sNumPolys >= MAX_POLYGONS || sNumVerts + nv > MAX_VERTICES) { sRamOverflow = 1; sStripValid = 0; return; }
+    update_clip();
+    G3Polygon *poly = &sPolyRam[sBank][sNumPolys];
+    memset(poly, 0, sizeof *poly);
+    poly->index = sNumPolys;
+    G3Vertex *ram = sVertexRam[sBank];
+    for (int i = 0; i < nv; i++) { G3Vertex *x = &ram[sNumVerts++]; *x = v[i]; poly->v[i] = x; }
+    poly->nv = nv;
+    poly->attr = attr;
+    poly->texparam = sTexParam;
+    poly->texpal = sTexPal;
+    u32 alpha = attr >> 16 & 31;
+    int fmt = sTexParam >> 26 & 7;
+    poly->translucent = (alpha > 0 && alpha < 31) || fmt == 1 || fmt == 6;
+    int mode = attr >> 4 & 3;
+    if (mode == 3) { if ((attr >> 24 & 63) == 0) poly->shadowMask = 1; else poly->shadow = 1; }
+    for (int i = 0; i < 16; i++) poly->glMtx[i] = (float)sClip.m[i] / 4096.0f;
+    sStripValid = 0;
+    sPolyOutcome = 0;
+    sNumPolys++;
+    if (!poly->translucent) sNumOpaque++;
+}
+
 static void submit_polygon(void) {
     sPolyDone = 1;
     sPolySerial++;
@@ -603,6 +631,7 @@ static void submit_polygon(void) {
     if (sPolyType == 2 && (sStripPolys & 1)) { v[0] = sTemp[1]; v[1] = sTemp[0]; v[2] = sTemp[2]; }
     else if (sPolyType == 3) { v[0] = sTemp[0]; v[1] = sTemp[1]; v[2] = sTemp[3]; v[3] = sTemp[2]; }
     else memcpy(v, sTemp, nv * sizeof *v);
+    if (gG3GpuXform) { store_poly_gpu(v, nv, sCurPolyAttr); return; }
 
     s64 ax = v[1].pos[0] - v[0].pos[0], ay = v[1].pos[1] - v[0].pos[1], aw = v[1].pos[3] - v[0].pos[3];
     s64 bx = v[2].pos[0] - v[0].pos[0], by = v[2].pos[1] - v[0].pos[1], bw = v[2].pos[3] - v[0].pos[3];
@@ -742,8 +771,10 @@ static void submit_vertex(void) {
     update_clip();
     G3Vertex *v = &sTemp[sVtxInPoly];
     s64 x = sVtx[0], y = sVtx[1], z = sVtx[2];
-    for (int i = 0; i < 4; i++)
-        v->pos[i] = (s32)((x * sClip.m[i] + y * sClip.m[4 + i] + z * sClip.m[8 + i] + 0x1000 * (s64)sClip.m[12 + i]) >> 12);
+    v->raw[0] = (s32)x; v->raw[1] = (s32)y; v->raw[2] = (s32)z;   // keep model-space coords for the GPU transform
+    if (!gG3GpuXform)
+        for (int i = 0; i < 4; i++)
+            v->pos[i] = (s32)((x * sClip.m[i] + y * sClip.m[4 + i] + z * sClip.m[8 + i] + 0x1000 * (s64)sClip.m[12 + i]) >> 12);
     for (int i = 0; i < 3; i++) v->color[i] = sVtxColor[i] ? sVtxColor[i] << 4 | 0xf : 0;
     v->dbgLight = sCurLightRec;
     if ((sTexParam >> 30) == 3) {

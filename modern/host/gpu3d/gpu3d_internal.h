@@ -16,6 +16,7 @@ enum { MAX_VERTICES = 6144 * 4, MAX_POLYGONS = 2048 * 4 };
 
 typedef struct G3Vertex {
     s32 pos[4];
+    s32 raw[3];      // model-space vertex (pre-transform) for the GPU-side transform path (gG3GpuXform)
     s32 color[3];
     s16 tex[2];
     u8 clipped;
@@ -43,6 +44,7 @@ typedef struct G3Polygon {
     s16 yofs;
     G3Vertex orig[4];
     int norig;
+    float glMtx[16];   // DS clip matrix (proj*pos) as float/4096, for the GPU-side transform path (gG3GpuXform)
 } G3Polygon;
 
 typedef struct G3RenderState {

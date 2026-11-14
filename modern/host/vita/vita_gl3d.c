@@ -96,8 +96,12 @@ static void lazy_init(void) {
 int g3w_init(void *device, void *queue, int scale) {
     (void)device; (void)queue; (void)scale;
     sEnabled = 1;      // GL objects are created lazily on first render, once the vitaGL context exists
-    extern int gG3ClipSpaceOut;
+    extern int gG3ClipSpaceOut, gG3GpuXform;
     gG3ClipSpaceOut = 1;   // this backend consumes clip-space pos[] directly; skip software screen/z setup
+    // GPU-side transform/clip/cull: the hardware transforms raw model-space verts by the DS matrix, clips and
+    // culls - removing the CPU vertex transform, clip and facing math. Default on; ACWW_GPUXFORM=0 falls back to
+    // the CPU transform (clip-space pos feed) without a rebuild, in case the GPU path has a regression.
+    { const char *e = getenv("ACWW_GPUXFORM"); gG3GpuXform = !(e && e[0] == '0'); }
     return 1;
 }
 void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no shared picture
@@ -112,10 +116,19 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     if (!sEnabled || !out) return;
     lazy_init();
 
+    extern int gG3GpuXform;
+    int gpuXform = gG3GpuXform;
+    // DS front-facing winding -> GL. Exposed so it can be flipped on-device (ACWW_FRONTFACE=cw|ccw) if the
+    // GPU-transform path culls the wrong faces (models inside-out / holes), without needing a rebuild.
+    static GLenum sFrontFace = 0;
+    if (!sFrontFace) { const char *e = getenv("ACWW_FRONTFACE"); sFrontFace = (e && (e[0]=='c'&&e[1]=='w')) ? GL_CW : GL_CCW; }
+
     glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
     glViewport(0, 0, VW, VH);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    if (gpuXform) glFrontFace(sFrontFace);
+    else glDisable(GL_CULL_FACE);   // clip-space path feeds pre-culled polys
 
     u32 cc = r->clearColor;
     float cr = (cc & 31) / 31.0f, cg = (cc >> 5 & 31) / 31.0f, cb = (cc >> 10 & 31) / 31.0f;
@@ -144,6 +157,13 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
         for (int i = 0; i < p->nv; i++) {
             const G3Vertex *v = p->v[i];
+            if (gpuXform) {
+                // GPU does the transform: feed raw model-space coords (w=1); the DS clip matrix (set below as the
+                // projection) and GL's divide/viewport reproduce the DS mapping. Scale by 1/4096 (DS verts are
+                // 4.12 fixed) so products stay in float's precise range.
+                sVPos[i][0] = (float)v->raw[0] / 4096.0f; sVPos[i][1] = (float)v->raw[1] / 4096.0f;
+                sVPos[i][2] = (float)v->raw[2] / 4096.0f; sVPos[i][3] = 1.0f;
+            } else {
             // Feed the DS clip-space position straight to GL and let the GPU do the perspective divide, viewport
             // map and depth. This is algebraically identical to reconstructing (NDC*w) from the software screen
             // coords (hx/hy) and poly z - pos[0]=NDC_x*w, pos[1]=NDC_y*w, pos[2]=NDC_z*w, pos[3]=w - but it means
@@ -152,6 +172,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             // geometry pipeline to skip that software screen/z setup for this backend.
             sVPos[i][0] = (float)v->pos[0]; sVPos[i][1] = (float)v->pos[1];
             sVPos[i][2] = (float)v->pos[2]; sVPos[i][3] = (float)v->pos[3];
+            }
             // v->color is the DS's 9-bit interpolation value (5-bit vertex colour expanded as c<<4|0xf). The
             // software rasterizer takes the 6-bit channel as (color >> 3), so normalise by that, not /63 directly
             // (dividing the raw 0..511 value by 63 made everything ~8x too bright and clamp to white).
@@ -159,6 +180,14 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             sVCol[i][2] = (v->color[2] >> 3) / 63.0f; sVCol[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
             sVUv[i][0] = tw ? (float)v->tex[0] / 16.0f / tw : 0.0f;
             sVUv[i][1] = th ? (float)v->tex[1] / 16.0f / th : 0.0f;
+        }
+        if (gpuXform) {
+            // The polygon carries its DS clip matrix (proj*pos, /4096); load it as the GL projection so the GPU
+            // transforms the raw verts. Cull per the DS polygon attribute: bit 7 renders front faces, bit 6 back.
+            glMatrixMode(GL_PROJECTION); glLoadMatrixf(p->glMtx);
+            int front = p->attr & 0x80, back = p->attr & 0x40;
+            if (front && back) glDisable(GL_CULL_FACE);
+            else { glEnable(GL_CULL_FACE); glCullFace(front ? GL_BACK : GL_FRONT); }
         }
         GLuint tex = tex_for(p->texparam, p->texpal);
         if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
