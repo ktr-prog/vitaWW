@@ -752,6 +752,18 @@ unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
 }
 unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long long v) {
     u32 a = (u32)addr;
+    // GX command/FIFO firehose fast path. The native game submits 3D geometry as a torrent of 32-bit writes to
+    // 0x04000400-0x040005ff; forward_display() handles that whole range identically (store the word, feed the GX
+    // pipeline via render_write32). Short-circuit it here so each of those tens-of-thousands-per-frame writes skips
+    // io_note's bookkeeping (counter, ring buffer, return-address capture), io_trace, io_spin_check and the
+    // is_display range classification. Behaviour is identical to the slow path for this range; only diagnostics are
+    // dropped. IRQ delivery still happens (GX writes raise none, and the next ordinary access flushes any pending).
+    if (size == 4 && a >= 0x04000400 && a < 0x04000600) {
+        *(u32 *)host_io(a) = (u32)v;
+        sGxWrites++;
+        render_write32(a, (u32)v);
+        return v;
+    }
     int traced = sHBlankLine < 0;
     if (traced) io_note(addr, 1, __builtin_return_address(0));
     if (traced && sIoTrace > 0) io_trace_value(a, 1, v);
