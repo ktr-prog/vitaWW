@@ -42,13 +42,18 @@ int vita_gl_enabled(void) {
 // The on-device Cg compiler libshacccg.suprx is needed to compile shaders at runtime (for the upcoming GPU 3D
 // rasterizer). The current present path (glBlitFramebuffer/glClear) uses precompiled shaders and needs none, so
 // this is informational for now; the 3D path will require it. vitaGL/vitaShaRK probe these two paths.
+// Where the runtime shader compiler may live, in priority order: bundled inside the VPK (app0:), next to the
+// game (ux0:data/vitaWW/ - just a file in the game folder, no system install), then a system install (ur0:).
+const char *const kShaderCompilerPaths[] = {
+    "app0:libshacccg.suprx",
+    "ux0:data/vitaWW/libshacccg.suprx",
+    "ur0:/data/libshacccg.suprx",
+    "ur0:data/external/libshacccg.suprx",
+    0,
+};
 int vita_gl_have_shader_compiler(void) {
-    static const char *const paths[] = {
-        "ur0:/data/libshacccg.suprx",
-        "ur0:data/external/libshacccg.suprx",
-    };
-    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) {
-        FILE *f = fopen(paths[i], "rb");
+    for (int i = 0; kShaderCompilerPaths[i]; i++) {
+        FILE *f = fopen(kShaderCompilerPaths[i], "rb");
         if (f) { fclose(f); return 1; }
     }
     return 0;

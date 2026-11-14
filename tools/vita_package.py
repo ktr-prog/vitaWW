@@ -74,6 +74,16 @@ def main():
                     continue
                 dst = Path("sce_sys") / f.relative_to(assets)
                 pack += ["-a", f"{f}={dst.as_posix()}"]
+        # Bundle the runtime shader compiler if present, so the VPK is self-contained: the app loads it from
+        # app0: at startup (modern/host/vita/vita_gl3d.c) and compiles the GPU shaders itself - no user install.
+        # Sony's libshacccg.suprx can't ship in the public repo; drop it at this path, or set ACWW_SHACCCG, to
+        # include it. (Without it, the app still looks in the game folder / ur0:, else falls back to software.)
+        shacccg = os.environ.get("ACWW_SHACCCG", "modern/host/vita/libshacccg.suprx")
+        if os.path.exists(shacccg):
+            pack += ["-a", f"{shacccg}=libshacccg.suprx"]
+            print(f"vita_package.py: bundling shader compiler {shacccg} -> app0:libshacccg.suprx")
+        else:
+            print(f"vita_package.py: no shader compiler at {shacccg}; VPK will use the game-folder/system copy")
         pack.append(str(out))
         run(*pack)
     print(f"vita_package.py: wrote {out}")

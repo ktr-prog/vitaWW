@@ -54,8 +54,23 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     return sTexCache[s].tex;
 }
 
+static void load_shader_compiler(void) {
+    // Pre-load libshacccg from the bundled/game-folder/system paths. vitaShaRK caches the module on first success,
+    // so vitaGL's own lazy shark_init(NULL) then becomes a no-op and the GPU pipeline shaders compile. This is
+    // what lets a VPK that carries libshacccg (app0:) compile shaders itself, with no separate user install.
+    extern int shark_init(const char *path);
+    extern const char *const kShaderCompilerPaths[];
+    for (int i = 0; kShaderCompilerPaths[i]; i++)
+        if (shark_init(kShaderCompilerPaths[i]) >= 0) {
+            fprintf(stderr, "vita_gl3d: shader compiler loaded from %s\n", kShaderCompilerPaths[i]);
+            return;
+        }
+    fprintf(stderr, "vita_gl3d: no shader compiler found (GPU 3D will not compile shaders)\n");
+}
+
 static void lazy_init(void) {
     if (sReady) return;
+    load_shader_compiler();
     glGenFramebuffers(1, &sFbo);
     glGenTextures(1, &sColorTex);
     glBindTexture(GL_TEXTURE_2D, sColorTex);
