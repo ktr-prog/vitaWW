@@ -628,6 +628,24 @@ int g3_frame_tall(void) { return sTallShown[sShown]; }
 int g3_raster_pixel_polygon(int x, int y) { return sPoly[(y + g3_shown_yofs()) * W + x]; }
 u32 g3_raster_depth(int x, int y) { return sDepth[(y + g3_shown_yofs()) * W + x]; }
 void g3_raster_diagnostics(int on) { sDiag = on; }
+
+// Decode a whole DS texture (given its texparam/texpal) to RGBA8888 for a GPU renderer. Reuses the software
+// texel decoder g3_texel, which reads the flattened VRAM (sImgFlat/sPalFlat) set up by g3_tex_setup() - so this
+// must be called after that setup (the g3w_render path runs right after g3_render() calls g3_tex_setup()).
+void gpu3d_texture_size(uint32_t texparam, int *w, int *h) {
+    *w = 8 << (texparam >> 20 & 7);
+    *h = 8 << (texparam >> 23 & 7);
+}
+void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out) {
+    int w = 8 << (texparam >> 20 & 7), h = 8 << (texparam >> 23 & 7);
+    for (int t = 0; t < h; t++)
+        for (int s = 0; s < w; s++) {
+            u32 px = g3_texel(texparam, texpal, s, t);       // low15 = BGR555, bits16-20 = 5-bit alpha
+            u32 r = (px & 31) * 255 / 31, g = (px >> 5 & 31) * 255 / 31, b = (px >> 10 & 31) * 255 / 31;
+            u32 a = (px >> 16 & 31) * 255 / 31;
+            out[t * w + s] = r | g << 8 | b << 16 | a << 24; // RGBA8 (GL byte order R,G,B,A)
+        }
+}
 int gpu3d_pixel_polygon(int x, int y, Gpu3dPolyInfo *info) {
     int i = sPoly[(y + g3_shown_yofs()) * W + x];
     if (i < 0 || i >= gG3Render.npoly) return 0;

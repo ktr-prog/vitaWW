@@ -43,6 +43,8 @@ typedef struct Gpu3dVertexOut {
     int32_t clipped;
     int32_t clip[4];
 } Gpu3dVertexOut;
+void gpu3d_texture_size(uint32_t texparam, int *w, int *h);
+void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out);
 int gpu3d_poly_count(void);
 int gpu3d_poly_get(int i, Gpu3dVertexOut *v, uint32_t *attr, uint32_t *texparam, uint32_t *texpal, int *flags);
 
