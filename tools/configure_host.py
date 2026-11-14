@@ -233,7 +233,7 @@ LD_EMU = "elf_x86_64" if X64 else "aarch64linux" if A64 else "elf_i386"
 PIE = "" if WIN else "-fPIE" if HOST64 else "-fno-pie"
 GAME_FLAGS = " ".join([
     *([M_FLAG] if M_FLAG else []), *([PIE] if PIE else []), "-fno-short-enums", "-fsigned-char", "-fshort-wchar", "-ffreestanding", "-nostdinc",
-    "-fno-strict-aliasing", "-fno-builtin", "-O1", "-g", "-w", "-fno-omit-frame-pointer", "-falign-functions=4",
+    "-fno-strict-aliasing", "-fno-builtin", "-O2", "-g", "-w", "-fno-omit-frame-pointer", "-falign-functions=4",
     # (signed and pointer arithmetic wraps, as on the DS: the decompiled code counts pointers down to NULL and the like,
     # which clang otherwise takes for loops without end - ghiNewPost's was, on iOS)
     "-fno-strict-overflow",
@@ -395,7 +395,7 @@ elif X64:
 elif VITA:
     # VitaSDK's arm-vita-eabi GCC and newlib; no melonDS. -Wl,-q keeps the relocations vita-elf-create needs.
     # The game thread's stack switch (coro_switch.S) has an ARMv7 path. The CPU renderers draw into SDL textures.
-    HOST_FLAGS = (f"{VITA_ARCH} -O1 -g -fno-omit-frame-pointer -ffp-contract=off -Wall -std=gnu11 -DHOST "
+    HOST_FLAGS = (f"{VITA_ARCH} -O2 -fno-strict-aliasing -g -fno-omit-frame-pointer -ffp-contract=off -Wall -std=gnu11 -DHOST "
                   "-DHOST_VITA=1 -Iinclude" + FRONTEND_FLAG)
     # -Wl,-q keeps the relocations vita-elf-create needs. (The big DS memory blocks are runtime-allocated on the
     # Vita, HOST_MEM_RUNTIME_ALIGN, so the static .bss stays small and vita-elf-create can lay the velf out.)
@@ -405,7 +405,7 @@ elif VITA:
     IO_WRAPS = ("_open_r", "_close_r", "_read_r", "_write_r", "_lseek_r", "_fstat_r", "_isatty_r",
                 "rename", "remove", "unlink", "opendir", "readdir", "closedir")
     LINK_FLAGS = f"{VITA_ARCH} -Wl,-q " + " ".join(f"-Wl,--wrap={w}" for w in IO_WRAPS)
-    HOST_CXX_FLAGS = f"{VITA_ARCH} -O1 -g -ffp-contract=off -std=c++17 -DHOST -DHOST_VITA=1"
+    HOST_CXX_FLAGS = f"{VITA_ARCH} -O2 -fno-strict-aliasing -g -ffp-contract=off -std=c++17 -DHOST -DHOST_VITA=1"
     MELON_LIBS = ""
 else:
     HOST_FLAGS = (f"-m32 -fno-pie -O1 -g -fno-omit-frame-pointer -Wall -std=gnu11 --sysroot={R} -isystem {R}/usr/include "
