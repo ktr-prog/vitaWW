@@ -74,6 +74,16 @@ void render_init(void) {
         if (sGpuDisplay && !env_is("ACWW_GPU2D", "0")) sGpu2dMode = env_is("ACWW_GPU2D_CHECK", "1") ? 2 : 1;
         if (sGpuDisplay && getenv("ACWW_GPU2D_SELFTEST")) sGpu2dMode = 2;
     }
+#if HOST_VITA
+    // Vita GPU 3D rasterizer: when the vitaGL GPU path is on and the shader compiler is reachable, route the DS
+    // 3D through the g3w_* seam (vita_gl3d.c) in readback mode - the GPU rasterizes, the software 2D compositor
+    // still composites. Falls back to the software rasterizer otherwise (no crash).
+    extern int vita_gl3d_available(void);
+    if (sOwn3d && !sCompare && !sGpuDisplay && vita_gl3d_available()) {
+        if (gpu3d_use_wgpu(0, 0, 1, 1)) fprintf(stderr, "render: Vita GPU 3D rasterizer active\n");
+        else fprintf(stderr, "render: Vita GPU 3D unavailable; software rasterizer\n");
+    }
+#endif
     if (getenv("ACWW_RENDER_COMPARE_MAX")) sCompareMax = strtol(getenv("ACWW_RENDER_COMPARE_MAX"), 0, 10);
     if (getenv("ACWW_RENDER_SELFTEST") || getenv("ACWW_RENDER_SELFTEST3D")) sCompare = sCompare ? sCompare : 1;
     sGpu2d = sOwn || sCompare;

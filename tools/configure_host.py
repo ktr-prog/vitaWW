@@ -528,6 +528,8 @@ def main():
                 continue  # (the iOS frontend's parts: --os ios only)
             if "vita" in s.parts and not VITA:
                 continue  # (the Vita frontend's parts: --os vita only)
+            if s.name == "gpu3d_wgpu.c" and VITA:
+                continue  # (on Vita, modern/host/vita/vita_gl3d.c provides the g3w_* renderer seam instead)
             if WIN and s.name in ("frontend_sdl.c", "frontend_ui.c", "frontend_viewer.c", "plat_posix.c"):
                 continue  # (debug_posix.c and guards.c are empty there: HOST_DEBUG_POSIX 0, no HOST_GUARDS)
             if s.name in (("melon_none.c",) if args.oracle else ("melon.cpp", "melon_platform.cpp")):

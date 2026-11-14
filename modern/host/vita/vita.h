@@ -18,8 +18,12 @@ void vita_fatal_message(const char *text);
 // the DS 3D geometry onto the GPU.
 int vita_gl_enabled(void);
 int vita_gl_init(void);
+int vita_gl_have_shader_compiler(void);
 void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int sx, int sy, int sw, int sh);
 void vita_gl_shutdown(void);
+
+// GPU 3D rasterizer (modern/host/vita/vita_gl3d.c): implements the shared g3w_* renderer seam with vitaGL.
+int vita_gl3d_available(void);
 
 // start the file-I/O worker thread (modern/host/vita/vita_io.c). Must be called once, early, before the game
 // starts: the game runs on a custom coroutine stack, and the Vita's filesystem syscalls fault unless they run
