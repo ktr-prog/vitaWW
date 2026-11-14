@@ -404,11 +404,13 @@ elif VITA:
     # marshaled to a dedicated worker thread (the wrappers call the real __real__* on that thread's stack).
     IO_WRAPS = ("_open_r", "_close_r", "_read_r", "_write_r", "_lseek_r", "_fstat_r", "_isatty_r",
                 "rename", "remove", "unlink", "opendir", "readdir", "closedir")
-    # -Wl,-z,max-page-size=0x10000: align the RW (data) segment to a 64 KiB page so it starts well past the end of
-    # the RX (code) segment, leaving room for vita-elf-create to append its SCE import data there. The toolchain's
-    # default (and 0x1000) packs the segments too tightly for the larger vitaGL binary and vita-elf-create fails
-    # with "Cannot allocate N bytes for SCE data ... segment 1 overlaps".
-    LINK_FLAGS = (f"{VITA_ARCH} -Wl,-q -Wl,-z,max-page-size=0x10000 "
+    # Place the RW (data) segment at a fixed high address so there is a large gap after the RX (code) segment for
+    # vita-elf-create to append its SCE import data. Code loads at 0x81000000; with the larger vitaGL binary the
+    # code ends only ~2 KiB below the next page and vita-elf-create fails ("Cannot allocate N bytes for SCE data
+    # ... segment 1 overlaps") - and that gap is fixed by the code size, so page alignment can't help. Pinning
+    # .data to 0x81a00000 (code is ~5 MiB, so ~5 MiB of headroom) leaves megabytes of room; raise it if the code
+    # segment ever approaches 0x81a00000.
+    LINK_FLAGS = (f"{VITA_ARCH} -Wl,-q -Wl,-z,max-page-size=0x10000 -Wl,-Tdata=0x81a00000 "
                   + " ".join(f"-Wl,--wrap={w}" for w in IO_WRAPS))
     HOST_CXX_FLAGS = f"{VITA_ARCH} -O2 -fno-strict-aliasing -g -ffp-contract=off -std=c++17 -DHOST -DHOST_VITA=1"
     MELON_LIBS = ""
