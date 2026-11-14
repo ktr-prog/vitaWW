@@ -123,12 +123,6 @@ jobs:
             build/vitashark-patched/source/vitashark.c
           make -C build/vitashark-patched -j"$(nproc)" install
           test -f "$VITASDK/arm-vita-eabi/lib/libvitashark.a"
-          echo "=== which stub defines sceKernelLoadStartModule ==="
-          for a in "$VITASDK"/arm-vita-eabi/lib/lib*_stub*.a; do
-            if arm-vita-eabi-nm "$a" 2>/dev/null | grep -q "sceKernelLoadStartModule"; then echo "FOUND: $a"; fi
-          done
-          echo "=== module-ish stub libs present ==="
-          ls "$VITASDK"/arm-vita-eabi/lib | grep -iE "modulemgr|module|sysmodule" || true
 
       - name: PATH
         run: echo "$VITASDK/bin" >> "$GITHUB_PATH"
