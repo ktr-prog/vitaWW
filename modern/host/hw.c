@@ -249,9 +249,13 @@ static void run_events_body(void) {
             sPresentNs += host_plat_time_ns() - p0;
             sLastVb = host_plat_time_ns();
             if (++sBreakN >= 60) {
-                fprintf(stderr, "breakdown (avg/frame): cpu %llu us, render %llu us, present %llu us\n",
+                static unsigned long long lastGx, lastIo;
+                unsigned long long gx = (sGxWrites - lastGx) / 60, io = ((unsigned long long)sIoCount - lastIo) / 60;
+                lastGx = sGxWrites; lastIo = sIoCount;
+                fprintf(stderr, "breakdown (avg/frame): cpu %llu us, render %llu us, present %llu us"
+                        " | %llu gx writes, %llu mmio accesses\n",
                         (unsigned long long)(sCpuNs / 60000), (unsigned long long)(sRenderNs / 60000),
-                        (unsigned long long)(sPresentNs / 60000));
+                        (unsigned long long)(sPresentNs / 60000), gx, io);
                 sCpuNs = sRenderNs = sPresentNs = 0; sBreakN = 0;
             }
         }
