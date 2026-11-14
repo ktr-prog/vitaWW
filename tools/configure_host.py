@@ -249,6 +249,12 @@ if VITA:
     # (its static_asserts check it), as on every other target. -DHOST_VITA so the game units agree with the host
     # runtime on the Vita memory layout (host_mem.h: HOST_MEM_RUNTIME_ALIGN)
     GAME_FLAGS += " " + VITA_ARCH + " -DHOST_VITA=1"
+    # The game decomp is the dominant per-frame CPU cost on the Vita (the DS GX command generation + logic, ~67ms of
+    # an ~85ms town frame; the renderers are already -O3 and now on the GPU). -O3 lets GCC inline and auto-vectorise
+    # (NEON) that code harder than -O2. -fno-strict-aliasing is already set, so the aliasing-based -O3 miscompiles
+    # don't apply; the only real risk is code size vs the fixed .data pin at 0x81a00000, which CI's vita-elf-create
+    # step would catch before any device ever sees the build.
+    GAME_FLAGS = GAME_FLAGS.replace(" -O2", " -O3")
 if not HOST64 and not VITA:
     # small structs returned in memory, as mwcc does: kept while the i386 build is the reference (its captures were
     # taken with it); the 64-bit builds use the platform ABI (clang supports the flag only on i386). The Vita's ARM
@@ -395,7 +401,7 @@ elif X64:
 elif VITA:
     # VitaSDK's arm-vita-eabi GCC and newlib; no melonDS. -Wl,-q keeps the relocations vita-elf-create needs.
     # The game thread's stack switch (coro_switch.S) has an ARMv7 path. The CPU renderers draw into SDL textures.
-    HOST_FLAGS = (f"{VITA_ARCH} -O2 -fno-strict-aliasing -g -fno-omit-frame-pointer -ffp-contract=off -Wall -std=gnu11 -DHOST "
+    HOST_FLAGS = (f"{VITA_ARCH} -O3 -fno-strict-aliasing -g -fno-omit-frame-pointer -ffp-contract=off -Wall -std=gnu11 -DHOST "
                   "-DHOST_VITA=1 -Iinclude" + FRONTEND_FLAG)
     # -Wl,-q keeps the relocations vita-elf-create needs. (The big DS memory blocks are runtime-allocated on the
     # Vita, HOST_MEM_RUNTIME_ALIGN, so the static .bss stays small and vita-elf-create can lay the velf out.)
@@ -413,7 +419,7 @@ elif VITA:
     LINK_FLAGS = (f"{VITA_ARCH} -Wl,-q -Wl,-z,max-page-size=0x10000 -Wl,-Tdata=0x81a00000 "
                   "-Wl,--section-start=.init_array=0x819f0000 "
                   + " ".join(f"-Wl,--wrap={w}" for w in IO_WRAPS))
-    HOST_CXX_FLAGS = f"{VITA_ARCH} -O2 -fno-strict-aliasing -g -ffp-contract=off -std=c++17 -DHOST -DHOST_VITA=1"
+    HOST_CXX_FLAGS = f"{VITA_ARCH} -O3 -fno-strict-aliasing -g -ffp-contract=off -std=c++17 -DHOST -DHOST_VITA=1"
     MELON_LIBS = ""
 else:
     HOST_FLAGS = (f"-m32 -fno-pie -O1 -g -fno-omit-frame-pointer -Wall -std=gnu11 --sysroot={R} -isystem {R}/usr/include "
