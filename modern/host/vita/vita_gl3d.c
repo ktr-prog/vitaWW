@@ -148,8 +148,11 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             float z = (float)p->z[i] / 16777215.0f;
             if (z < 0) z = 0; else if (z > 1) z = 1;
             sVPos[i][0] = x * w; sVPos[i][1] = y * w; sVPos[i][2] = (2.0f * z - 1.0f) * w; sVPos[i][3] = w;
-            sVCol[i][0] = v->color[0] / 63.0f; sVCol[i][1] = v->color[1] / 63.0f;
-            sVCol[i][2] = v->color[2] / 63.0f; sVCol[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
+            // v->color is the DS's 9-bit interpolation value (5-bit vertex colour expanded as c<<4|0xf). The
+            // software rasterizer takes the 6-bit channel as (color >> 3), so normalise by that, not /63 directly
+            // (dividing the raw 0..511 value by 63 made everything ~8x too bright and clamp to white).
+            sVCol[i][0] = (v->color[0] >> 3) / 63.0f; sVCol[i][1] = (v->color[1] >> 3) / 63.0f;
+            sVCol[i][2] = (v->color[2] >> 3) / 63.0f; sVCol[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
             sVUv[i][0] = tw ? (float)v->tex[0] / 16.0f / tw : 0.0f;
             sVUv[i][1] = th ? (float)v->tex[1] / 16.0f / th : 0.0f;
         }
