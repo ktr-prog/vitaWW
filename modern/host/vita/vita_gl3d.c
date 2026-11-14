@@ -30,24 +30,29 @@ static GLuint sFbo, sColorTex, sDepthRb;
 static struct { uint32_t tp, pal; GLuint tex; int used; } sTexCache[TEXCACHE];
 static uint32_t sDecodeBuf[1024 * 1024];   // max DS texture 1024x1024
 
+static GLint ds_wrap(int repeat, int flip) {
+    return flip ? GL_MIRRORED_REPEAT : (repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+}
+
 static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
-    if ((texparam >> 26 & 7) == 0) return 0;   // no texture
+    if ((texparam >> 26 & 7) == 0) return 0;   // format 0 == no texture
     int slot = (int)((texparam * 2654435761u ^ texpal * 40503u) % TEXCACHE);
-    for (int i = 0; i < 8; i++) {              // small linear probe
+    int empty = -1;
+    for (int i = 0; i < TEXCACHE; i++) {       // probe for a match or the first free slot
         int s = (slot + i) % TEXCACHE;
-        if (sTexCache[s].used && sTexCache[s].tp == texparam && sTexCache[s].pal == texpal) return sTexCache[s].tex;
+        if (!sTexCache[s].used) { if (empty < 0) empty = s; continue; }
+        if (sTexCache[s].tp == texparam && sTexCache[s].pal == texpal) return sTexCache[s].tex;
     }
     int w, h;
     gpu3d_texture_size(texparam, &w, &h);
     if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return 0;
     gpu3d_decode_texture(texparam, texpal, sDecodeBuf);
-    int s = slot;                              // evict the hash slot (textures are long-lived; simple cache)
+    int s = empty >= 0 ? empty : slot;         // insert at a free slot; evict only if the cache is full
     if (!sTexCache[s].tex) glGenTextures(1, &sTexCache[s].tex);
     glBindTexture(GL_TEXTURE_2D, sTexCache[s].tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
-    int rptS = texparam >> 16 & 1, rptT = texparam >> 17 & 1;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, rptS ? GL_REPEAT : GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, rptT ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(texparam >> 16 & 1, texparam >> 18 & 1));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(texparam >> 17 & 1, texparam >> 19 & 1));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     sTexCache[s].tp = texparam; sTexCache[s].pal = texpal; sTexCache[s].used = 1;
