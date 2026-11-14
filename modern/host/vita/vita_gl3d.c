@@ -123,6 +123,12 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
 
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LEQUAL);
+    // Discard transparent texels so the background shows through, matching the software rasterizer (which does
+    // "if (!al) return"): alpha 0 is dropped always, and with DS alpha-test (dispcnt bit 2) anything <= alphaRef.
+    // Without this, transparent parts of textured quads (billboards, foliage) fill with the opaque clear colour.
+    float aref = (r->dispcnt & 4) ? (float)r->alphaRef / 31.0f : 0.0f;
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, aref);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
