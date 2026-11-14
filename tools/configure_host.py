@@ -411,6 +411,7 @@ elif VITA:
     # .data to 0x81a00000 (code is ~5 MiB, so ~5 MiB of headroom) leaves megabytes of room; raise it if the code
     # segment ever approaches 0x81a00000.
     LINK_FLAGS = (f"{VITA_ARCH} -Wl,-q -Wl,-z,max-page-size=0x10000 -Wl,-Tdata=0x81a00000 "
+                  "-Wl,--section-start=.init_array=0x819f0000 "
                   + " ".join(f"-Wl,--wrap={w}" for w in IO_WRAPS))
     HOST_CXX_FLAGS = f"{VITA_ARCH} -O2 -fno-strict-aliasing -g -ffp-contract=off -std=c++17 -DHOST -DHOST_VITA=1"
     MELON_LIBS = ""
