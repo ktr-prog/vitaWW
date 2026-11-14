@@ -170,6 +170,17 @@ jobs:
           # the Vita installer rejects LiveArea PNGs that were not quantized with pngquant (install error 0x8010113D)
           find modern/host/vita/sce_sys -name '*.png' -print -exec pngquant --force --ext .png 256 {} \;
 
+      # The runtime shader compiler (libshacccg.suprx) that the GPU 3D path needs, from AnimMouse/SceShaccCg (a
+      # legal, device-independent redistribution). vita_package.py bundles it into the VPK at app0: via
+      # ACWW_SHACCCG, so the GPU renderer is self-contained - the player installs only the VPK.
+      - name: Fetch shader compiler
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/AnimMouse/SceShaccCg.git build/shacccg
+          echo "188ADB8C34C3983D63244C32D981FD7B518A8DCFD200F5886233FFACE6B5FA40  build/shacccg/libshacccg.suprx" \
+            | sha256sum -c -
+          echo "ACWW_SHACCCG=$PWD/build/shacccg/libshacccg.suprx" >> "$GITHUB_ENV"
+
       - name: Package
         run: |
           python3 tools/vita_package.py build/hostvita_usa/acww build/vita/vitaWW.vpk
