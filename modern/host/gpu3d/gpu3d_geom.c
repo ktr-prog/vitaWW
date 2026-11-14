@@ -576,7 +576,19 @@ static void poly_screen(G3Polygon *poly, int n) {
     poly->sortKey = (u32)(ybot << 10 | ytop) | (poly->translucent ? 1u << 21 : 0);
 }
 
+// --- geometry profiling: how much of the per-frame CPU time is polygon clip/cull/setup vs the rest -----------
+extern unsigned long long host_plat_time_ns(void);
+static unsigned long long sProfPolyNs;
+static unsigned sProfPolys, sProfVerts, sProfSwaps;
+
+static void submit_polygon_impl(void);
 static void submit_polygon(void) {
+    unsigned long long t = host_plat_time_ns();
+    submit_polygon_impl();
+    sProfPolyNs += host_plat_time_ns() - t;
+    sProfPolys++;
+}
+static void submit_polygon_impl(void) {
     sPolyDone = 1;
     sPolySerial++;
     int nv = sPolyType & 1 ? 4 : 3;
@@ -740,6 +752,7 @@ static void submit_vertex(void) {
     v->screenDone = 0;
     sVtxInPoly++;
     sVtxCount++;
+    sProfVerts++;
     switch (sPolyType) {
     case 0:
         if (sVtxInPoly == 3) { submit_polygon(); sVtxInPoly = 0; }
@@ -1021,6 +1034,11 @@ static int cmp_poly(const void *a, const void *b) {
     return p->index - q->index;
 }
 static void do_swap(void) {
+    if (++sProfSwaps >= 60) {
+        fprintf(stderr, "geom (avg/frame): %u verts, %u polys submitted, poly clip/cull/setup %llu us\n",
+                sProfVerts / 60, sProfPolys / 60, sProfPolyNs / 60000);
+        sProfVerts = sProfPolys = 0; sProfPolyNs = 0; sProfSwaps = 0;
+    }
     G3RenderState *r = &gG3Render;
     r->npoly = sNumPolys;
     r->wbuffer = sFlushParam >> 1 & 1;
