@@ -232,10 +232,29 @@ static void run_events_body(void) {
         if (st & 8) host_irq_raise(1);
         if (st & 16) host_irq_raise(2);
         dma_on_vblank();
-        render_frame();
-        host_pace_frame();
-        extern void frontend_frame(void);
-        frontend_frame();
+        // Per-phase frame breakdown so we can see where the time goes (CPU vs software render vs GPU present).
+        // render_frame() already reports its 2d/3d software-render time separately ("render: 2d .. 3d ..").
+        {
+            static u64 sCpuNs, sRenderNs, sPresentNs, sLastVb; static int sBreakN;
+            u64 vb = host_plat_time_ns();
+            if (sLastVb) sCpuNs += vb - sLastVb;       // wall time since last vblank point == this DS frame's CPU
+            u64 r0 = host_plat_time_ns();
+            render_frame();
+            u64 r1 = host_plat_time_ns();
+            sRenderNs += r1 - r0;
+            host_pace_frame();
+            extern void frontend_frame(void);
+            u64 p0 = host_plat_time_ns();
+            frontend_frame();
+            sPresentNs += host_plat_time_ns() - p0;
+            sLastVb = host_plat_time_ns();
+            if (++sBreakN >= 60) {
+                fprintf(stderr, "breakdown (avg/frame): cpu %llu us, render %llu us, present %llu us\n",
+                        (unsigned long long)(sCpuNs / 60000), (unsigned long long)(sRenderNs / 60000),
+                        (unsigned long long)(sPresentNs / 60000));
+                sCpuNs = sRenderNs = sPresentNs = 0; sBreakN = 0;
+            }
+        }
         extern void host_heap_check(void);
         host_heap_check();
         host_guards_frame();

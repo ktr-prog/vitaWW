@@ -89,7 +89,9 @@ void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, sFbo);
-    glBlitFramebuffer(sx, sy, sx + sw, sy + sh,
+    // vitaGL flips V when reading an FBO as a texture, which would show the canvas upside-down; invert the source
+    // Y range (srcY0=bottom, srcY1=top) to cancel that flip so row 0 of the canvas lands at the top of the screen.
+    glBlitFramebuffer(sx, sy + sh, sx + sw, sy,
                       dx, dy, dx + dw, dy + dh,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
