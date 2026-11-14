@@ -39,11 +39,28 @@ int vita_gl_enabled(void) {
     return sOn;
 }
 
+// The on-device Cg compiler libshacccg.suprx is needed to compile shaders at runtime (for the upcoming GPU 3D
+// rasterizer). The current present path (glBlitFramebuffer/glClear) uses precompiled shaders and needs none, so
+// this is informational for now; the 3D path will require it. vitaGL/vitaShaRK probe these two paths.
+int vita_gl_have_shader_compiler(void) {
+    static const char *const paths[] = {
+        "ur0:/data/libshacccg.suprx",
+        "ur0:data/external/libshacccg.suprx",
+    };
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) {
+        FILE *f = fopen(paths[i], "rb");
+        if (f) { fclose(f); return 1; }
+    }
+    return 0;
+}
+
 // Bring up the GPU context. Returns 1 on success (the frontend falls back to the SDL renderer on 0).
 int vita_gl_init(void) {
     if (!vita_gl_enabled()) return 0;
     // No immediate-mode/legacy pool needed: we only use glClear + glBlitFramebuffer (precompiled shaders).
     vglInitExtended(0, SCREEN_W, SCREEN_H, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    fprintf(stderr, "vita_gl: shader compiler (libshacccg.suprx) %s - needed for the GPU 3D path\n",
+            vita_gl_have_shader_compiler() ? "found" : "NOT found; install it to ur0:/data/");
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     glGenTextures(1, &sTex);
     glGenFramebuffers(1, &sFbo);

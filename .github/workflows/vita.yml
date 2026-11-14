@@ -109,6 +109,21 @@ jobs:
           path: ${{ env.VITASDK }}
           key: vitasdk-${{ runner.os }}-${{ env.SDL_TAG }}-vgl5shark-v2
 
+      # Rebuild vitaShaRK with its SceShaccCgExt/taiHEN coupling patched out, installed over the cached copy. Its
+      # only use of SceShaccCgExt is sceShaccCgExt(En|Dis)ableExtensions(), which pulls in taiHEN (whose user stub
+      # the minimal toolchain can't produce). Dropping those 3 lines leaves plain shark_* that compile shaders via
+      # libshacccg.suprx loaded with sceKernelLoadStartModule - no taiHEN, no SceShaccCgExt at link. Cheap (~15s),
+      # so it runs every build (the cached SDK still has the unpatched build).
+      - name: Patch + rebuild vitaShaRK (no SceShaccCgExt/taiHEN)
+        run: |
+          set -eux
+          export PATH="$VITASDK/bin:$PATH"
+          git clone --depth 1 https://github.com/Rinnegatamante/vitaShaRK.git build/vitashark-patched
+          sed -i '/#include <shacccg_ext.h>/d; /sceShaccCgExtEnableExtensions();/d; /sceShaccCgExtDisableExtensions();/d' \
+            build/vitashark-patched/source/vitashark.c
+          make -C build/vitashark-patched -j"$(nproc)" install
+          test -f "$VITASDK/arm-vita-eabi/lib/libvitashark.a"
+
       - name: PATH
         run: echo "$VITASDK/bin" >> "$GITHUB_PATH"
 
