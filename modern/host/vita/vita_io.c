@@ -52,12 +52,14 @@ extern void *host_get_sp(void);
 extern long host_call_on_stack(void *new_sp, void *fn, void *arg);
 
 static uintptr_t g_main_lo, g_main_hi;  // the main thread's registered stack bounds
+static SceUID g_main_tid;               // the main OS thread (the only one that runs the game coroutine)
 
 void vita_io_init(void) {
     SceKernelThreadInfo info;
     memset(&info, 0, sizeof info);
     info.size = sizeof info;
-    if (sceKernelGetThreadInfo(sceKernelGetThreadId(), &info) == 0 && info.stack && info.stackSize > 0) {
+    g_main_tid = sceKernelGetThreadId();
+    if (sceKernelGetThreadInfo(g_main_tid, &info) == 0 && info.stack && info.stackSize > 0) {
         g_main_lo = (uintptr_t)info.stack;
         g_main_hi = g_main_lo + (uintptr_t)info.stackSize;
     }
@@ -81,6 +83,13 @@ struct iojob {
 static void dispatch(struct iojob *j) {
     uintptr_t cur = (uintptr_t)host_get_sp();
     if (!gHostMainSp || (g_main_lo && cur >= g_main_lo && cur < g_main_hi)) {
+        j->run(j);
+        return;
+    }
+    // Worker threads (GX worker, render thread, 2D bands) run on their own kernel-registered stacks: call
+    // directly. Moving them onto the scratch area would put their sp inside the main thread's stack, which the
+    // kernel rejects (and which the main thread is using).
+    if (g_main_tid && sceKernelGetThreadId() != g_main_tid) {
         j->run(j);
         return;
     }

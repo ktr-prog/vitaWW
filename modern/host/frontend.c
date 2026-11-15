@@ -610,7 +610,8 @@ void frontend_frame(void) {
     u16 keyinput = 0x3ff;
     u16 xy = 0x2c00;
     if (sShm) {
-        if (!wdisp_presenting()) {
+        extern int render_owns_present(void);
+        if (!wdisp_presenting() && !render_owns_present()) {
             extern const uint32_t *gpu2d_canvas(int *rows);
             int rows = 0;
             const uint32_t *c = gpu2d_canvas(&rows);

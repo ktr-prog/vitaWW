@@ -244,9 +244,9 @@ static void run_events_body(void) {
             u64 r1 = host_plat_time_ns();
             sRenderNs += r1 - r0;
             host_pace_frame();
-            // When the render thread took this frame, it presents itself on the worker (reading the canvas it just
-            // produced), overlapping the next frame's CPU; the main thread must not also present here.
-            if (!render_owns_present()) {
+            // The frontend (input, UI) always runs here on the main thread. When the render thread took this frame
+            // the frontend skips its own present (render_owns_present()): the worker presents the canvas itself.
+            {
                 extern void frontend_frame(void);
                 u64 p0 = host_plat_time_ns();
                 frontend_frame();

@@ -935,7 +935,9 @@ static void show(void) {
         // Screenshots are skipped here (they read the SDL renderer).
         extern int vita_gl_enabled(void);
         extern void vita_gl_present_canvas(const void *, int, int, int, int, int, int);
+        extern int render_owns_present(void);
         if (vita_gl_enabled()) {
+            if (render_owns_present()) return;   // the render thread presents; no GL on this thread
             int rows = (sShm->rows >= 192 && sShm->rows <= 640) ? (int)sShm->rows : 0;
             if (rows) vita_gl_present_canvas(sShm->pixels, 256, rows, 0, 0, 256, rows);
             else      vita_gl_present_canvas(sShm->pixels, 256, 384, 0, 192, 256, 192);

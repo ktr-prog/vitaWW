@@ -568,7 +568,17 @@ static void render_worker_phase(void) {
         gpu3d_render_committed();
         sRender3dNs += host_plat_time_ns() - t3d;
     }
-    frontend_frame();   // present (reads the canvas this worker just produced); pacing stays on the main thread
+    // Present the canvas this worker just produced. Only the GL present happens here: the frontend body (input
+    // polling, UI) is a coroutine on the main thread's stack and keeps running there every DS frame.
+#if HOST_VITA
+    {
+        extern const uint32_t *gpu2d_canvas(int *rows);
+        extern void vita_gl_present_canvas(const void *, int, int, int, int, int, int);
+        int rows = 0;
+        const uint32_t *c = gpu2d_canvas(&rows);
+        if (c && rows >= 192 && rows <= 640) vita_gl_present_canvas(c, 256, rows, 0, 0, 256, rows);
+    }
+#endif
     { static int lag = -1; if (lag < 0) lag = getenv("ACWW_RT_LAG") ? atoi(getenv("ACWW_RT_LAG")) : 0; if (lag) usleep(lag * 1000); }   // stress knob
     __atomic_fetch_add(&sWorkerNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
 }
@@ -616,8 +626,16 @@ static void render_worker_kick(void) {
 int render_owns_present(void) { return sLastMt; }
 
 static int render_thread_applicable(void) {
-    return sRenderThreadOn && sOwn && sOwn3d && sGpu3d && !sGpuDisplay && !sGpu2dMode && !sMelon && !sCompare &&
-           !sSelftest;
+    if (!(sRenderThreadOn && sOwn && sOwn3d && sGpu3d && !sGpuDisplay && !sGpu2dMode && !sMelon && !sCompare &&
+          !sSelftest))
+        return 0;
+#if HOST_VITA
+    {
+        extern int vita_gl_enabled(void);
+        if (!vita_gl_enabled()) return 0;   // the worker presents through vitaGL only
+    }
+#endif
+    return 1;
 }
 
 static void render_frame_sync(void);
