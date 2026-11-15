@@ -132,6 +132,7 @@ HOST_STATE_KEEP(sShotSpec)
 static void host_screenshot(void) {
     if (!sShotSpec) sShotSpec = getenv("ACWW_SHOT") ? getenv("ACWW_SHOT") : "";
     const char *spec = sShotSpec;
+    if (*spec) render_thread_sync();   // the render thread may still be producing this frame's canvas
     u32 f = (u32)host_frame();
     for (const char *p = spec; *p;) {
         unsigned fr; char path[512];

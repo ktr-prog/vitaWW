@@ -146,7 +146,7 @@ void render_init(void) {
         render_selftest3d(strtol(getenv("ACWW_RENDER_SELFTEST3D"), 0, 10));
     }
 #if HOST_VITA
-    sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // not validated yet: opt-in
+    sRenderThreadOn = !env_is("ACWW_RENDERTHREAD", "0");   // on by default on the Vita; ACWW_RENDERTHREAD=0 to disable
 #else
     sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // host validation only
 #endif
@@ -552,7 +552,9 @@ static int sRenderFrames;
 
 // The worker's half of a frame: pure compute over the snapshot (no game code). Produces the 2D canvas, rasterizes
 // the committed 3D, then paces + presents. All GPU/GL work lives here so the GL context stays on one thread.
+static uint64_t sWorkerNs;
 static void render_worker_phase(void) {
+    uint64_t tw = host_plat_time_ns();
     gpu2d_render_finish();                 // 2D bands + canvas from the per-line/VRAM snapshots
     if (sGpu3d) {
         uint64_t t3d = host_plat_time_ns();
@@ -560,6 +562,7 @@ static void render_worker_phase(void) {
         sRender3dNs += host_plat_time_ns() - t3d;
     }
     frontend_frame();   // present (reads the canvas this worker just produced); pacing stays on the main thread
+    __atomic_fetch_add(&sWorkerNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
 }
 
 static void *render_worker_main(void *a) {
@@ -588,7 +591,13 @@ void render_thread_sync(void) {
 }
 
 static void render_worker_kick(void) {
-    if (!sWorkerSpawned) { pthread_create(&sWorker, 0, render_worker_main, 0); sWorkerSpawned = 1; }
+    if (!sWorkerSpawned) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 2 << 20);
+        pthread_create(&sWorker, &at, render_worker_main, 0);
+        sWorkerSpawned = 1;
+    }
     pthread_mutex_lock(&sWMx);
     sWDone = 0; sWReady = 1;
     pthread_cond_signal(&sWCvWork);
@@ -641,8 +650,9 @@ static void render_frame_mt(void) {
     gpu3d_commit(sSnapBank);                // swap geometry + bind snapshot texture banks (no rasterization)
     render_worker_kick();
     if (++sRenderFrames >= 60) {
-        fprintf(stderr, "render: 2d %llu us, 3d %llu us (avg/frame)\n",
-                (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sRender3dNs / 60000));
+        fprintf(stderr, "render: 2d prepass %llu us, 3d %llu us, render worker total %llu us (avg/frame)\n",
+                (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sRender3dNs / 60000),
+                (unsigned long long)(__atomic_exchange_n(&sWorkerNs, 0, __ATOMIC_RELAXED) / 60000));
         sRender2dNs = sRender3dNs = 0;
         sRenderFrames = 0;
     }
