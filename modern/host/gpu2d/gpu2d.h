@@ -32,6 +32,8 @@ void gpu2d_write32(uint32_t addr, uint32_t value);
 uint32_t gpu2d_read32(uint32_t addr);
 
 void gpu2d_render_frame(const Gpu2dFrameInput *in);
+void gpu2d_render_finish(void);     // run the deferred engine-0 bands + canvas on the render thread
+void gpu2d_set_defer_bands(int on); // when on, gpu2d_render_frame does only the main-thread prepass
 const uint32_t *gpu2d_screen(int screen);
 
 const uint32_t *gpu2d_deferred(int screen);

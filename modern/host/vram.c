@@ -21,6 +21,13 @@ static u8 sCnt[9];
 u8 *host_vram_bank(int i) { return sBanks + sOffset[i]; }
 u32 host_vram_bank_size(int i) { return kSize[i]; }
 
+// Snapshot the whole VRAM bank block (for the render thread: the worker reads this stable copy while the main
+// thread runs the next frame's VRAM writes). dst must hold host_vram_total() bytes; per-bank pointers into the
+// copy are at the same offsets as the live banks, so host_vram_bank_offset(i) maps bank i within dst.
+u32 host_vram_total(void) { return BANK_TOTAL; }
+u32 host_vram_bank_offset(int i) { return sOffset[i]; }
+void host_vram_snapshot(u8 *dst) { memcpy(dst, sBanks, BANK_TOTAL); }
+
 static const struct { u32 base, size, align; } kWindows[] = {
     {0x06000000, 0x80000, 0x80000},
     {0x06200000, 0x20000, 0x20000},

@@ -2,6 +2,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 
 #include "gpu3d_internal.h"
 #include "../savestate.h"
@@ -19,6 +22,13 @@ static Mtx sProj, sPos, sVec, sTex, sClip;
 static Mtx sProjStack, sTexStack, sPosStack[32], sVecStack[32];
 static int sProjSP, sTexSP, sPosSP;
 static int sClipDirty = 1;
+// GX worker thread (see "GX worker" below). When sMT is on, the game thread keeps only the matrix stack (so GXSTAT,
+// matrix reads and POS/VEC tests are answered locally) and every other command executes on a worker thread, which
+// reads its matrices from the snapshots the game thread sends (wClip/wVec/wTex) instead of the live ones.
+static int sMT;
+static Mtx wClip, wVec, wTex;
+static const Mtx *gClipM = &sClip, *gVecM = &sVec, *gTexM = &sTex;
+static void mt_entry(u8 cmd, u32 param);
 
 static s16 sVtx[3];
 static u8 sVtxColor[3];
@@ -80,6 +90,7 @@ static int is_command(u8 c) {
 }
 
 static void fifo_put(u8 cmd, u32 param) {
+    if (sMT) { mt_entry(cmd, param); return; }
     Entry e = {cmd, param};
     if (cmd == 0x11 || cmd == 0x12) sPushPopQueued++;
     if (cmd >= 0x70 && cmd <= 0x72) sTestQueued++;
@@ -342,10 +353,12 @@ static void light_vector(u32 p) {
     int l = p >> 30;
     s32 d[3] = {sx10(p), sx10(p >> 10), sx10(p >> 20)};
     for (int i = 0; i < 3; i++)
-        sLightDir[l][i] = (s16)((((s64)d[0] * sVec.m[i] + (s64)d[1] * sVec.m[4 + i] + (s64)d[2] * sVec.m[8 + i]) >> 12) >> 3);
+        sLightDir[l][i] = (s16)((((s64)d[0] * gVecM->m[i] + (s64)d[1] * gVecM->m[4 + i] + (s64)d[2] * gVecM->m[8 + i]) >> 12) >> 3);
     sLightParam[l] = p;
-    for (int i = 0; i < 9; i++) sLightVec[l][i] = sVec.m[(i / 3) * 4 + i % 3];
-    if (getenv("ACWW_GPU3D_LIGHTLOG"))
+    for (int i = 0; i < 9; i++) sLightVec[l][i] = gVecM->m[(i / 3) * 4 + i % 3];
+    static int sLightLog = -1;
+    if (sLightLog < 0) sLightLog = getenv("ACWW_GPU3D_LIGHTLOG") != 0;
+    if (sLightLog)
         fprintf(stderr, "light %d param %08x dir %d %d %d vec %d %d %d / %d %d %d / %d %d %d -> %d %d %d\n", l, p, d[0], d[1],
                 d[2], sVec.m[0], sVec.m[1], sVec.m[2], sVec.m[4], sVec.m[5], sVec.m[6], sVec.m[8], sVec.m[9], sVec.m[10],
                 sLightDir[l][0], sLightDir[l][1], sLightDir[l][2]);
@@ -370,7 +383,7 @@ void gpu3d_debug_light(int id) {
 static void lighting(void) {
     s32 n[3];
     for (int i = 0; i < 3; i++)
-        n[i] = (s32)(((s64)sNormal[0] * sVec.m[i] + (s64)sNormal[1] * sVec.m[4 + i] + (s64)sNormal[2] * sVec.m[8 + i]) >> 12);
+        n[i] = (s32)(((s64)sNormal[0] * gVecM->m[i] + (s64)sNormal[1] * gVecM->m[4 + i] + (s64)sNormal[2] * gVecM->m[8 + i]) >> 12);
     if (sFeaturesOn > 1) {
         if (!sLightRecs) sLightRecs = calloc(65536, sizeof *sLightRecs);
         LightRec *r = &sLightRecs[sLightRecN & 0xffff];
@@ -385,7 +398,7 @@ static void lighting(void) {
         memcpy(r->spe, sSpecular, 3);
         memcpy(r->emi, sEmission, 3);
         r->table = sShininessOn;
-        for (int i = 0; i < 9; i++) r->vec[i] = sVec.m[(i / 3) * 4 + i % 3];
+        for (int i = 0; i < 9; i++) r->vec[i] = gVecM->m[(i / 3) * 4 + i % 3];
         memcpy(r->lparam, sLightParam, sizeof r->lparam);
         memcpy(r->lvec, sLightVec, sizeof r->lvec);
     }
@@ -524,7 +537,7 @@ static int clip_polygon(G3Vertex *in, int n, G3Vertex **out, int farClip, int *c
     static int kPlanes[6][2] = {{2, 1}, {2, -1}, {1, 1}, {1, -1}, {0, 1}, {0, -1}};
     {
         static int init;
-        const char *o = getenv("ACWW_GPU3D_CLIPORDER");
+        const char *o = init ? 0 : getenv("ACWW_GPU3D_CLIPORDER");
         if (!init++ && o && strlen(o) == 6)
             for (int i = 0; i < 6; i++) {
                 char c = o[i];
@@ -794,18 +807,19 @@ static void submit_polygon(void) {
 
 static void submit_vertex(void) {
     if (!sInBegin) return;
-    update_clip();
+    if (!sMT) update_clip();
+    const s32 *cm = gClipM->m, *tm = gTexM->m;
     G3Vertex *v = &sTemp[sVtxInPoly];
     s64 x = sVtx[0], y = sVtx[1], z = sVtx[2];
     v->raw[0] = (s32)x; v->raw[1] = (s32)y; v->raw[2] = (s32)z;   // keep model-space coords for the GPU transform
     if (!gG3GpuXform)
         for (int i = 0; i < 4; i++)
-            v->pos[i] = (s32)((x * sClip.m[i] + y * sClip.m[4 + i] + z * sClip.m[8 + i] + 0x1000 * (s64)sClip.m[12 + i]) >> 12);
+            v->pos[i] = (s32)((x * cm[i] + y * cm[4 + i] + z * cm[8 + i] + 0x1000 * (s64)cm[12 + i]) >> 12);
     for (int i = 0; i < 3; i++) v->color[i] = sVtxColor[i] ? sVtxColor[i] << 4 | 0xf : 0;
     v->dbgLight = sCurLightRec;
     if ((sTexParam >> 30) == 3) {
         for (int i = 0; i < 2; i++)
-            v->tex[i] = (s16)(((x * sTex.m[i] + y * sTex.m[4 + i] + z * sTex.m[8 + i]) >> 24) + sTexRaw[i]);
+            v->tex[i] = (s16)(((x * tm[i] + y * tm[4 + i] + z * tm[8 + i]) >> 24) + sTexRaw[i]);
     } else {
         v->tex[0] = sTexCoord[0];
         v->tex[1] = sTexCoord[1];
@@ -958,8 +972,8 @@ static void execute(u8 cmd, const u32 *p) {
         sNormal[2] = sx10(p[0] >> 20);
         if ((sTexParam >> 30) == 2) {
             for (int i = 0; i < 2; i++)
-                sTexCoord[i] = (s16)((((s64)sNormal[0] * sTex.m[i] + (s64)sNormal[1] * sTex.m[4 + i] +
-                                       (s64)sNormal[2] * sTex.m[8 + i]) >> 24) + sTexRaw[i]);
+                sTexCoord[i] = (s16)((((s64)sNormal[0] * gTexM->m[i] + (s64)sNormal[1] * gTexM->m[4 + i] +
+                                       (s64)sNormal[2] * gTexM->m[8 + i]) >> 24) + sTexRaw[i]);
         }
         lighting();
         break;
@@ -968,8 +982,8 @@ static void execute(u8 cmd, const u32 *p) {
         sTexRaw[1] = (s16)(p[0] >> 16);
         if ((sTexParam >> 30) == 1) {
             for (int i = 0; i < 2; i++)
-                sTexCoord[i] = (s16)(((s64)sTexRaw[0] * sTex.m[i] + (s64)sTexRaw[1] * sTex.m[4 + i] + sTex.m[8 + i] +
-                                      sTex.m[12 + i]) >> 12);
+                sTexCoord[i] = (s16)(((s64)sTexRaw[0] * gTexM->m[i] + (s64)sTexRaw[1] * gTexM->m[4 + i] + gTexM->m[8 + i] +
+                                      gTexM->m[12 + i]) >> 12);
         } else {
             sTexCoord[0] = sTexRaw[0];
             sTexCoord[1] = sTexRaw[1];
@@ -1049,7 +1063,6 @@ static void execute(u8 cmd, const u32 *p) {
         sFlushParam = p[0] & 3;
         break;
     case 0x60:
-        { static u32 last = 1; if (p[0] != last && getenv("ACWW_GPU3D_VPLOG")) fprintf(stderr, "viewport %08x frame %llu\n", p[0], (unsigned long long)sFrame); last = p[0]; }
         sViewport[0] = p[0] & 0xff;
         sViewport[1] = p[0] >> 8 & 0xff;
         sViewport[2] = p[0] >> 16 & 0xff;
@@ -1069,6 +1082,165 @@ static void execute(u8 cmd, const u32 *p) {
     default: break;
     }
 }
+
+
+// ---- GX worker ------------------------------------------------------------------------------------------------
+// Profiling the town showed ~3/4 of the frame's CPU phase is GX command processing (FIFO emulation, vertex
+// transform, lighting, polygon build) running serially on the game's core. With the worker on, the game thread
+// only decodes the command stream and keeps the matrix stack; complete commands go into a single-producer /
+// single-consumer ring and execute on another core, with no FIFO/pipe/cycle-timing emulation at all.
+//
+// What the game can read back is all answered on the game thread without waiting for the worker: GXSTAT (stack
+// levels / error bit; the FIFO always reads empty and idle), the clip/vector matrices, and POS_TEST / VEC_TEST
+// (pure functions of the matrices). BOX_TEST and the RAM-count register first wait for the worker to catch up.
+//
+// SWAP_BUFFERS parks the worker until the game thread's vblank commit swaps the polygon RAM. In async mode the
+// commit does not wait for the worker, so geometry runs one frame pipelined and overlaps the render phase too.
+enum { MTQ_N = 1 << 19, MTQ_M = MTQ_N - 1 };   // ring size in words (~16 heavy frames)
+static u32 *sMtQ;
+// Free-running word positions. The game thread fills up to sMtWLocal and publishes sMtW in batches (MTQ_BATCH
+// words, or at any sync/commit) so the two cores do not trade a cache line on every command; the worker likewise
+// publishes sMtR per batch. Each published index sits on its own cache line.
+enum { MTQ_BATCH = 512 };
+static u32 sMtWLocal;
+static u32 sMtW __attribute__((aligned(64)));
+static u32 sMtR __attribute__((aligned(64)));
+static int sMtPad __attribute__((aligned(64)));
+static int sMtParked;             // worker executed SWAP_BUFFERS and waits for the commit
+static int sMtAsync, sMtStarted;
+static u32 sMtSwapsQueued, sMtSwapsDone;
+static int sMtCvDirty, sMtTexDirty;
+static unsigned long long sMtBusyNs;
+static pthread_t sMtThread;
+HOST_STATE_KEEP(sMtQ) HOST_STATE_KEEP(sMtW) HOST_STATE_KEEP(sMtR) HOST_STATE_KEEP(sMtWLocal) HOST_STATE_KEEP(sMtParked)
+HOST_STATE_KEEP(sMtStarted) HOST_STATE_KEEP(sMtThread) HOST_STATE_KEEP(sMT) HOST_STATE_KEEP(sMtAsync)
+HOST_STATE_KEEP(gClipM) HOST_STATE_KEEP(gVecM) HOST_STATE_KEEP(gTexM)
+extern uint64_t host_plat_time_ns(void);
+
+static void mt_pause(int *spins) {
+    if (++*spins < 256) sched_yield();
+    else usleep(50);
+}
+static void gpu3d_write16_now(uint32_t addr, uint16_t v);
+static void *mt_worker(void *arg) {
+    (void)arg;
+    u32 tmp[64];
+    int spins = 0;
+    u32 r = 0;
+    for (;;) {
+        u32 w = __atomic_load_n(&sMtW, __ATOMIC_ACQUIRE);
+        if (r == w) { mt_pause(&spins); continue; }
+        spins = 0;
+        uint64_t t0 = host_plat_time_ns();
+        int park = 0;
+        while (r != w && !park) {
+            u32 h = sMtQ[r & MTQ_M], c = h & 0xff, n = h >> 8;
+            const u32 *p = &sMtQ[(r + 1) & MTQ_M];
+            if (((r + 1) & MTQ_M) + n > MTQ_N) {
+                for (u32 i = 0; i < n; i++) tmp[i] = sMtQ[(r + 1 + i) & MTQ_M];
+                p = tmp;
+            }
+            switch (c) {
+            case 0xf0: gpu3d_write16_now(p[0], (u16)p[1]); break;
+            case 0xf1: memcpy(wClip.m, p, sizeof wClip.m); memcpy(wVec.m, p + 16, sizeof wVec.m); break;
+            case 0xf2: memcpy(wTex.m, p, sizeof wTex.m); break;
+            case 0x71: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); sVtx[2] = (s16)p[1]; break;   // result: game thread
+            default: execute((u8)c, p); break;
+            }
+            r += 1 + n;
+            park = sFlushPending;
+        }
+        __atomic_fetch_add(&sMtBusyNs, host_plat_time_ns() - t0, __ATOMIC_RELAXED);
+        // Park before publishing R so a game thread that sees the queue drained also sees the pending swap.
+        if (park) __atomic_store_n(&sMtParked, 1, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&sMtR, r, __ATOMIC_RELEASE);
+        if (park) {
+            { static int lag = -1; if (lag < 0) lag = getenv("ACWW_GX_LAG") ? atoi(getenv("ACWW_GX_LAG")) : 0; if (lag) usleep(lag * 1000); }
+            int s = 0;
+            while (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
+        }
+    }
+    return 0;
+}
+// Game thread: wait until the worker has executed everything queued (or is parked on a swap).
+static inline void mt_publish(void) {
+    if (sMtW != sMtWLocal) __atomic_store_n(&sMtW, sMtWLocal, __ATOMIC_RELEASE);
+}
+static void mt_sync(void) {
+    int s = 0;
+    mt_publish();
+    while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWLocal && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
+}
+static void mt_push(u32 c, const u32 *p, u32 n) {
+    u32 w = sMtWLocal;
+    static u32 rSeen;   // last R this thread read: only re-read (touching the worker's cache line) when it looks full
+    if (w - rSeen + n + 1 > MTQ_N) {
+        int s = 0;
+        mt_publish();
+        while (w - (rSeen = __atomic_load_n(&sMtR, __ATOMIC_ACQUIRE)) + n + 1 > MTQ_N) {
+            if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) return;   // full behind a pending swap: drop, as a full FIFO would
+            mt_pause(&s);
+        }
+    }
+    sMtQ[w & MTQ_M] = c | n << 8;
+    for (u32 i = 0; i < n; i++) sMtQ[(w + 1 + i) & MTQ_M] = p[i];
+    sMtWLocal = w += n + 1;
+    if (w - sMtW >= MTQ_BATCH || c == 0x50) __atomic_store_n(&sMtW, w, __ATOMIC_RELEASE);
+}
+static void mt_dispatch(u8 c, const u32 *p, int n) {
+    if (c >= 0x10 && c <= 0x1c) {                 // matrix commands: game thread only
+        execute(c, p);
+        if (c == 0x12 || c >= 0x14) { if (sMtxMode == 3) sMtTexDirty = 1; else sMtCvDirty = 1; }
+        return;
+    }
+    if (c == 0x70) { mt_sync(); box_test(p); return; }
+    if (c == 0x72) { vec_test(p[0]); return; }
+    if (!is_command(c)) return;
+    if (c == 0x71) {                              // result here; the worker only latches the vertex registers
+        update_clip();
+        s64 x = (s16)p[0], y = (s16)(p[0] >> 16), z = (s16)p[1];
+        for (int i = 0; i < 4; i++)
+            sPosResult[i] = (s32)((x * sClip.m[i] + y * sClip.m[4 + i] + z * sClip.m[8 + i] + 0x1000 * (s64)sClip.m[12 + i]) >> 12);
+    }
+    if (sMtCvDirty) {
+        u32 b[32];
+        update_clip();
+        memcpy(b, sClip.m, sizeof sClip.m);
+        memcpy(b + 16, sVec.m, sizeof sVec.m);
+        mt_push(0xf1, b, 32);
+        sMtCvDirty = 0;
+    }
+    if (sMtTexDirty) { mt_push(0xf2, (const u32 *)sTex.m, 16); sMtTexDirty = 0; }
+    if (c == 0x50) sMtSwapsQueued++;
+    mt_push(c, p, (u32)n);
+}
+static void mt_entry(u8 cmd, u32 param) {
+    if (sExecCmd < 0) { sExecCmd = cmd; sExecCount = 0; }
+    int need = kParams[(u8)sExecCmd];
+    if (need) sExecParams[sExecCount++] = param;
+    if (sExecCount >= need) {
+        u8 c = (u8)sExecCmd;
+        sExecCmd = -1;
+        mt_dispatch(c, sExecParams, need);
+    }
+}
+// Called once at start-up, before any command. async: the vblank commit does not wait for the worker.
+void gpu3d_mt_enable(int on, int async) {
+    if (!on || sMtStarted) return;
+    sMtQ = malloc(sizeof(u32) * MTQ_N);
+    if (!sMtQ) return;
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setstacksize(&at, 1 << 20);
+    if (pthread_create(&sMtThread, &at, mt_worker, 0) != 0) { free(sMtQ); sMtQ = 0; return; }
+    sMtStarted = 1;
+    sMtAsync = async;
+    gClipM = &wClip; gVecM = &wVec; gTexM = &wTex;
+    sMtCvDirty = sMtTexDirty = 1;
+    sMT = 1;
+    fprintf(stderr, "gpu3d: GX worker thread on (%s commit)\n", async ? "pipelined" : "synchronous");
+}
+unsigned long long gpu3d_mt_busy_ns(void) { return __atomic_exchange_n(&sMtBusyNs, 0, __ATOMIC_RELAXED); }
 
 static void exec_entry(Entry e) {
     if (sExecCmd < 0) {
@@ -1157,6 +1329,17 @@ void gpu3d_write8(uint32_t addr, uint8_t v) {
     }
 }
 void gpu3d_write16(uint32_t addr, uint16_t v) {
+    // With the GX worker, registers the swap latches travel in-stream so they stay ordered with the geometry.
+    if (sMT && addr != 0x04000304) {
+        if (addr == 0x04000060 || (addr >= 0x04000320 && addr < 0x040003c0) || addr == 0x04000610) {
+            u32 b[2] = {addr, v};
+            mt_push(0xf0, b, 2);
+        }
+        return;
+    }
+    gpu3d_write16_now(addr, v);
+}
+static void gpu3d_write16_now(uint32_t addr, uint16_t v) {
     if (addr == 0x04000060)
         sDispCnt = (sDispCnt & 0x3000u & ~(u32)(v & 0x3000)) | (v & 0x4fff);
     else if (addr == 0x04000304) { sRenderOn = v >> 2 & 1; sGeomOn = v >> 3 & 1; drain(); }
@@ -1199,7 +1382,8 @@ static u32 gxstat(void) {
 }
 
 uint32_t gpu3d_read32(uint32_t addr) {
-    drain();
+    if (sMT) { if (addr == 0x04000604) mt_sync(); }
+    else drain();
     if (addr == 0x04000600) return gxstat();
     if (addr == 0x04000604) { g3_feature(F_READ_RAMCOUNT); return (u32)sNumPolys | (u32)sNumVerts << 16; }
     if (addr == 0x04000320) { g3_feature(F_READ_RDLINES); return 46; }
@@ -1219,7 +1403,10 @@ uint32_t gpu3d_read32(uint32_t addr) {
     return 0;
 }
 
-void gpu3d_frame(const uint8_t *const bank[9]) {
+// Commit the frame's geometry (main thread): bind the texture banks, run feature flags, and swap the double-
+// buffered polygon RAM so gG3Render points at the finished bank. Executes no rasterization, so it can run on the
+// main thread at the frame boundary while the render thread rasterizes the previously-committed geometry.
+void gpu3d_commit(const uint8_t *const bank[9]) {
     gG3Banks = bank;
     sFrame++;
     sVtxPipe = sNrmPipe = sPolyPipe = sSlotCtr = 0;
@@ -1233,12 +1420,30 @@ void gpu3d_frame(const uint8_t *const bank[9]) {
     if (sDispCnt & 64) g3_feature(F_FOG_ALPHA_ONLY);
     if (sDispCnt & 128) g3_feature(F_FOG);
     if (sDispCnt & 0x4000) g3_feature(F_REAR_BITMAP);
+    if (sMT) {
+        // Synchronous: wait for the worker, exactly like the single-threaded path. Pipelined: only wait when the
+        // worker is a whole frame behind (back-pressure), otherwise swap whatever it has finished.
+        mt_publish();
+        if (!sMtAsync || sMtSwapsQueued - sMtSwapsDone >= 2) mt_sync();
+        if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) {
+            do_swap();
+            sMtSwapsDone++;
+            __atomic_store_n(&sMtParked, 0, __ATOMIC_RELEASE);
+        }
+        return;
+    }
     if (sFlushPending) {
         do_swap();
         drain();
     }
-    if (sDispCnt & 1) {}
-    g3_render();
+}
+
+// Rasterize the committed geometry (render thread). Reads gG3Render + the texture banks bound in gpu3d_commit().
+void gpu3d_render_committed(void) { g3_render(); }
+
+void gpu3d_frame(const uint8_t *const bank[9]) {
+    gpu3d_commit(bank);
+    gpu3d_render_committed();
 }
 
 const uint32_t *gpu3d_lines(void) { return g3_frame_lines() + 256 * g3_shown_yofs(); }
@@ -1246,6 +1451,7 @@ int gpu3d_top_rows(void) { return g3_shown_yofs(); }
 const uint32_t *gpu3d_lines_top(void) { return g3_tall_supported() && g3_frame_tall() ? g3_frame_lines() : 0; }
 
 void gpu3d_state(Gpu3dState *s) {
+    if (sMT) mt_sync();
     s->pipe = (u32)sPipeN;
     s->fifo = (u32)sFifoN;
     s->flush = (u32)sFlushPending;

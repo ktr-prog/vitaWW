@@ -243,19 +243,24 @@ static void run_events_body(void) {
             u64 r1 = host_plat_time_ns();
             sRenderNs += r1 - r0;
             host_pace_frame();
-            extern void frontend_frame(void);
-            u64 p0 = host_plat_time_ns();
-            frontend_frame();
-            sPresentNs += host_plat_time_ns() - p0;
+            // When the render thread took this frame, it presents itself on the worker (reading the canvas it just
+            // produced), overlapping the next frame's CPU; the main thread must not also present here.
+            if (!render_owns_present()) {
+                extern void frontend_frame(void);
+                u64 p0 = host_plat_time_ns();
+                frontend_frame();
+                sPresentNs += host_plat_time_ns() - p0;
+            }
             sLastVb = host_plat_time_ns();
             if (++sBreakN >= 60) {
                 static unsigned long long lastGx, lastIo;
                 unsigned long long gx = (sGxWrites - lastGx) / 60, io = ((unsigned long long)sIoCount - lastIo) / 60;
                 lastGx = sGxWrites; lastIo = sIoCount;
-                fprintf(stderr, "breakdown (avg/frame): cpu %llu us, render %llu us, present %llu us"
+                extern unsigned long long gpu3d_mt_busy_ns(void);
+                fprintf(stderr, "breakdown (avg/frame): cpu %llu us, render %llu us, present %llu us, gx worker %llu us"
                         " | %llu gx writes, %llu mmio accesses\n",
                         (unsigned long long)(sCpuNs / 60000), (unsigned long long)(sRenderNs / 60000),
-                        (unsigned long long)(sPresentNs / 60000), gx, io);
+                        (unsigned long long)(sPresentNs / 60000), gpu3d_mt_busy_ns() / 60000, gx, io);
                 sCpuNs = sRenderNs = sPresentNs = 0; sBreakN = 0;
             }
         }
@@ -422,6 +427,7 @@ void HostDma_Addresses(unsigned int ch, uintptr_t src, uintptr_t dst) {
 static uintptr_t dma_address(u32 reg, uintptr_t full) { return (u32)full == reg ? full : reg; }
 static int dma_is_io(uintptr_t a) { return a <= 0xffffffffu && is_io((u32)a); }
 void gx_fifo_write(u32 addr, u32 value);
+void gpu3d_write32(u32 addr, u32 value);
 static void dma_run(int ch) {
     u32 base = 0x040000b0 + ch * 12, cnt = R32(base + 8);
     uintptr_t src = dma_address(R32(base), sDmaSrc[ch]), dst = dma_address(R32(base + 4), sDmaDst[ch]);
@@ -433,6 +439,19 @@ static void dma_run(int ch) {
         // (logging here is file I/O, which is exactly what faults from the game coroutine - keep this path quiet)
         R32(base + 8) = cnt & ~0x80000000u;
         return;
+    }
+    // Display lists reach the geometry engine as 32-bit DMA into the GX FIFO/command ports. Feed those words
+    // straight to gpu3d (as HostIo_Write's fast path does for direct stores) instead of through the generic
+    // per-word I/O dispatch.
+    if (w == 4 && dst >= 0x04000400 && dst < 0x04000600 && (dc == 2 || dst + (uintptr_t)n * 4 <= 0x04000600) &&
+        dc != 1 && sc != 3 && !dma_is_io(src) && src != IO1 + 0x10) {
+        for (u32 i = 0; i < n; i++) {
+            gpu3d_write32((u32)dst, *(volatile u32 *)src);
+            if (sc == 0) src += 4; else if (sc == 1) src -= 4;
+            if (dc == 0 || dc == 3) dst += 4;
+        }
+        sGxWrites += n;
+        n = 0;
     }
     for (u32 i = 0; i < n; i++) {
         u32 v;

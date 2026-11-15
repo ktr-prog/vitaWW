@@ -10,12 +10,16 @@ extern "C" {
 #endif
 
 void gpu3d_reset(void);
+void gpu3d_mt_enable(int on, int async);     // run GX command processing on a worker thread
+unsigned long long gpu3d_mt_busy_ns(void);  // worker busy time since the last call
 void gpu3d_write8(uint32_t addr, uint8_t value);
 void gpu3d_write16(uint32_t addr, uint16_t value);
 void gpu3d_write32(uint32_t addr, uint32_t value);
 uint32_t gpu3d_read32(uint32_t addr);
 
 void gpu3d_frame(const uint8_t *const bank[9]);
+void gpu3d_commit(const uint8_t *const bank[9]);  // main thread: swap geometry, bind banks (no rasterization)
+void gpu3d_render_committed(void);                // render thread: rasterize the committed geometry
 const uint32_t *gpu3d_lines(void);
 const uint32_t *gpu3d_lines_top(void);
 int gpu3d_top_rows(void);

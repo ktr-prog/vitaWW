@@ -917,16 +917,21 @@ static void *band2d_worker(void *arg) {
     return 0;
 }
 
-// Returns 1 if it rendered engine 0's lines multi-threaded; 0 to fall back to the sequential loop.
-static int render_engine0_mt(const Gpu2dFrameInput *in) {
+// Engine-0 multi-threaded render, split into a main-thread prepass and a worker-thread bands pass so the bands
+// (pure compute over the snapshotted VRAM/registers) can overlap the next frame's CPU on a render thread.
+// The prepass runs game code (the hblank IRQ replay) and must stay on the main thread; the bands run no game
+// code and read only the per-line snapshots (s2dRegSnap/s2dPalSnap) plus the engine's VRAM pointers.
+static Band2d sMtW[N2DBANDS];
+static int sMtBnd[N2DBANDS + 1];
+static int sMtPending;   // a prepass ran in deferred mode and is waiting for its bands to be run by the worker
+
+static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
-    int bnd[N2DBANDS + 1];
-    for (int b = 0; b <= N2DBANDS; b++) bnd[b] = b * SCREEN_H / N2DBANDS;
-    Band2d w[N2DBANDS];
+    for (int b = 0; b <= N2DBANDS; b++) sMtBnd[b] = b * SCREEN_H / N2DBANDS;
     int bi = 0;
     for (int line = 0; line < SCREEN_H; line++) {
-        while (bi < N2DBANDS && line == bnd[bi]) {
-            Snap2d *s = &w[bi].snap;
+        while (bi < N2DBANDS && line == sMtBnd[bi]) {
+            Snap2d *s = &sMtW[bi].snap;
             s->refX[0] = e->refX[0]; s->refX[1] = e->refX[1]; s->refY[0] = e->refY[0]; s->refY[1] = e->refY[1];
             s->refLine = e->refLine; s->refWritten[0] = e->refWritten[0]; s->refWritten[1] = e->refWritten[1];
             s->winActive[0] = e->winActive[0]; s->winActive[1] = e->winActive[1];
@@ -941,17 +946,53 @@ static int render_engine0_mt(const Gpu2dFrameInput *in) {
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
     }
-    pthread_t th[N2DBANDS];
     for (int b = 0; b < N2DBANDS; b++) {
-        w[b].in = in; w[b].src = e; w[b].be = &s2dBandEng[b]; w[b].lo = bnd[b]; w[b].hi = bnd[b + 1];
-        pthread_create(&th[b], 0, band2d_worker, &w[b]);
+        sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
     }
+}
+
+static void render_engine0_mt_bands(void) {
+    Engine *e = &sEngine[0];
+    pthread_t th[N2DBANDS];
+    for (int b = 0; b < N2DBANDS; b++) pthread_create(&th[b], 0, band2d_worker, &sMtW[b]);
     for (int b = 0; b < N2DBANDS; b++) {
         pthread_join(th[b], 0);
-        int lo = bnd[b], n = bnd[b + 1] - lo;
+        int lo = sMtBnd[b], n = sMtBnd[b + 1] - lo;
         memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
         if (sDefer3d) memcpy(e->defer + lo * SCREEN_W, s2dBandEng[b].defer + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
     }
+}
+
+static int sDeferBands;   // render thread active: prepass on main, bands+canvas tail on the worker
+void gpu2d_set_defer_bands(int on) { sDeferBands = on; }
+
+// Validation hook: hash the finished engine-0 canvas so a threaded run can be byte-compared with a sync run.
+static void canvas_hash(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("ACWW_CANVHASH") ? 1 : 0;
+    if (!on) return;
+    unsigned long long h = 1469598103934665603ull;
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) { h ^= sCanvas[i]; h *= 1099511628211ull; }
+    fprintf(stderr, "canvhash frame %llu = %016llx\n", (unsigned long long)sFrame, h);
+}
+
+// Worker half: run the deferred bands and finish engine-0's canvas (mirrors the mainOnly tail below). No game code.
+void gpu2d_render_finish(void) {
+    if (!sMtPending) return;
+    sMtPending = 0;
+    render_engine0_mt_bands();
+    for (int n = 0; n < 2; n++) window_vertical(&sEngine[n], SCREEN_H);
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) sCanvas[i] = argb(sEngine[0].out[i]);
+    sCanvasRows = SCREEN_H;
+    sFrame++;
+    canvas_hash();
+}
+
+// Returns 1 if it rendered engine 0's lines multi-threaded; 0 to fall back to the sequential loop.
+static int render_engine0_mt(const Gpu2dFrameInput *in) {
+    render_engine0_mt_prepass(in);
+    if (sDeferBands) { sMtPending = 1; return 1; }   // worker will run the bands + tail via gpu2d_render_finish()
+    render_engine0_mt_bands();
     return 1;
 }
 
@@ -963,7 +1004,9 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
 #if HOST_VITA
     const int mainOnly = 1;  // the Vita shows only the main screen: never render the top screen (engine 1)
 #else
-    const int mainOnly = 0;
+    static int forceMain = -1;
+    if (forceMain < 0) forceMain = getenv("ACWW_FORCEMAIN") ? atoi(getenv("ACWW_FORCEMAIN")) : 0;
+    const int mainOnly = forceMain;   // host validation of the Vita engine-0 render-thread path
 #endif
     {
         static int hold, swapped;
@@ -1013,7 +1056,10 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         if (sGpu)
             for (int x = 0; x < SCREEN_W; x++) sGpuFrame.obj0[n][x] = pack_obj(&e->objNextLine0, x);
     }
-    if (mainOnly && !sGpu && !sDiagnostics && render_engine0_mt(in)) goto after_lines;
+    if (mainOnly && !sGpu && !sDiagnostics && render_engine0_mt(in)) {
+        if (sMtPending) return;   // deferred: the render worker runs the bands + canvas tail via gpu2d_render_finish()
+        goto after_lines;
+    }
     for (int line = 0; line < SCREEN_H; line++) {
         for (int n = 0; n < (mainOnly ? 1 : 2); n++) {
             Engine *e = &sEngine[n];
@@ -1059,6 +1105,7 @@ after_lines:
         for (int i = 0; i < SCREEN_W * SCREEN_H; i++) sCanvas[i] = argb(sEngine[0].out[i]);
         sCanvasRows = SCREEN_H;
         sFrame++;
+        canvas_hash();
         return;
     }
     if (sSingle) single_compose(in, sSingleBlank);

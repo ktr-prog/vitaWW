@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "gpu2d/gpu2d.h"
 #include "gpu3d/gpu3d.h"
@@ -25,6 +26,28 @@ int melon_3d_poly_get(int i, Gpu3dVertexOut *v, u32 *attr, u32 *texparam, u32 *t
 void host_hblank(int line);
 u8 *host_vram_bank(int i);
 void host_vram_flush(void);
+u32 host_vram_total(void);
+u32 host_vram_bank_offset(int i);
+void host_vram_snapshot(u8 *dst);
+extern unsigned char gHostPltt[0x800];
+extern unsigned char gHostOam[0x800];
+extern void frontend_frame(void);
+
+// ---- render thread: run the 2D bands + 3D rasterize + present on a worker, overlapping the next frame's CPU ----
+// The main thread, at the frame boundary, runs all game code (the 2D hblank-IRQ prepass and the 3D geometry
+// commit) and snapshots VRAM/palette/OAM; the worker then rasterizes from that stable snapshot while the main
+// thread races ahead into the next frame. This hides the ~38ms render under the ~68ms CPU (frame ~108 -> ~75ms).
+static int sRenderThreadOn;
+static int sWorkerSpawned;
+static int sLastMt;                       // the previous render_frame() dispatched to the worker (present is the worker's)
+static pthread_t sWorker;
+static pthread_mutex_t sWMx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sWCvWork = PTHREAD_COND_INITIALIZER, sWCvDone = PTHREAD_COND_INITIALIZER;
+static int sWReady, sWDone = 1;           // handshake: work posted / work finished
+static u8 *sSnapBankMem;                  // VRAM snapshot (host_vram_total() bytes)
+static u8 sSnapPal[0x800], sSnapOam[0x800];
+static const u8 *sSnapBank[9];
+static Gpu2dFrameInput sWorkIn;
 
 static int sOwn;
 static int sOwn3d;
@@ -94,6 +117,17 @@ void render_init(void) {
     gpu2d_set_diagnostics(sCompare || sGpu2dMode == 2);
     gpu3d_reset();
     gpu3d_set_diagnostics(sCompare);
+    {
+        // GX command processing on its own core. Off for the comparison/self-test harnesses, which single-step
+        // the pipeline; ACWW_GXMT=0 turns it off, ACWW_GX_ASYNC picks the pipelined commit (the Vita default).
+        int on = sOwn3d && !sCompare && !sMelon && !(getenv("ACWW_GXMT") && !atoi(getenv("ACWW_GXMT")));
+        int async = 0;
+#if HOST_VITA
+        async = 1;
+#endif
+        if (getenv("ACWW_GX_ASYNC")) async = atoi(getenv("ACWW_GX_ASYNC"));
+        gpu3d_mt_enable(on, async);
+    }
     if (getenv("ACWW_GPU2D_SELFTEST")) {
         if (sGpu2dMode != 2) {
             fprintf(stderr, "render: ACWW_GPU2D_SELFTEST needs ACWW_RENDERER3D=wgpu (and WebGPU)\n");
@@ -111,6 +145,12 @@ void render_init(void) {
         sGpu2d = sGpu3d = sSelftest = sMelon = 1;
         render_selftest3d(strtol(getenv("ACWW_RENDER_SELFTEST3D"), 0, 10));
     }
+#if HOST_VITA
+    sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // not validated yet: opt-in
+#else
+    sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // host validation only
+#endif
+    if (sRenderThreadOn) fprintf(stderr, "render: render thread active (overlaps 2D bands + 3D with the next frame's CPU)\n");
 }
 
 static int is_3d(u32 addr) {
@@ -509,7 +549,114 @@ static void render_hblank(int line, void *context) {
 }
 static uint64_t sRender2dNs, sRender3dNs;
 static int sRenderFrames;
+
+// The worker's half of a frame: pure compute over the snapshot (no game code). Produces the 2D canvas, rasterizes
+// the committed 3D, then paces + presents. All GPU/GL work lives here so the GL context stays on one thread.
+static void render_worker_phase(void) {
+    gpu2d_render_finish();                 // 2D bands + canvas from the per-line/VRAM snapshots
+    if (sGpu3d) {
+        uint64_t t3d = host_plat_time_ns();
+        gpu3d_render_committed();
+        sRender3dNs += host_plat_time_ns() - t3d;
+    }
+    frontend_frame();   // present (reads the canvas this worker just produced); pacing stays on the main thread
+}
+
+static void *render_worker_main(void *a) {
+    (void)a;
+    for (;;) {
+        pthread_mutex_lock(&sWMx);
+        while (!sWReady) pthread_cond_wait(&sWCvWork, &sWMx);
+        sWReady = 0;
+        pthread_mutex_unlock(&sWMx);
+        render_worker_phase();
+        pthread_mutex_lock(&sWMx);
+        sWDone = 1;
+        pthread_cond_signal(&sWCvDone);
+        pthread_mutex_unlock(&sWMx);
+    }
+    return 0;
+}
+
+// Barrier: block until the worker has finished the in-flight frame (it reads the snapshot buffers we are about to
+// overwrite, and the 2D/3D engine state we are about to mutate).
+void render_thread_sync(void) {
+    if (!sWorkerSpawned) return;
+    pthread_mutex_lock(&sWMx);
+    while (!sWDone) pthread_cond_wait(&sWCvDone, &sWMx);
+    pthread_mutex_unlock(&sWMx);
+}
+
+static void render_worker_kick(void) {
+    if (!sWorkerSpawned) { pthread_create(&sWorker, 0, render_worker_main, 0); sWorkerSpawned = 1; }
+    pthread_mutex_lock(&sWMx);
+    sWDone = 0; sWReady = 1;
+    pthread_cond_signal(&sWCvWork);
+    pthread_mutex_unlock(&sWMx);
+}
+
+// hw.c calls this after render_frame(); when the worker owns this frame's present/pace, hw.c must not do its own.
+int render_owns_present(void) { return sLastMt; }
+
+static int render_thread_applicable(void) {
+    return sRenderThreadOn && sOwn && sOwn3d && sGpu3d && !sGpuDisplay && !sGpu2dMode && !sMelon && !sCompare &&
+           !sSelftest;
+}
+
+static void render_frame_sync(void);
+
+// Main-thread half: wait for the previous frame's worker, snapshot inputs, run the game-code prepass + geometry
+// commit, then hand the frame to the worker and return so the main thread can start the next frame's CPU.
+static void render_frame_mt(void) {
+    render_thread_sync();
+    host_vram_flush();
+    if (!sSnapBankMem) sSnapBankMem = malloc(host_vram_total());
+    host_vram_snapshot(sSnapBankMem);
+    for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
+    memcpy(sSnapPal, gHostPltt, sizeof sSnapPal);
+    memcpy(sSnapOam, gHostOam, sizeof sSnapOam);
+    const u32 *lines3d = sOwn3d ? gpu3d_lines() : s3d;
+    Gpu2dFrameInput *in = &sWorkIn;
+    for (int i = 0; i < 9; i++) in->bank[i] = sSnapBank[i];
+    in->palette = sSnapPal;
+    in->oam = sSnapOam;
+    in->lines3d = lines3d;
+    in->lines3dTop = sOwn3d && lines3d ? gpu3d_lines_top() : NULL;
+    in->topRows = sOwn3d ? gpu3d_top_rows() : 192;
+    in->hblank = sOwn ? render_hblank : 0;
+    in->hblankContext = 0;
+    in->defer3d = 0;
+    in->gpu = 0;
+    uint64_t t2d = host_plat_time_ns();
+    gpu2d_set_defer_bands(1);
+    gpu2d_render_frame(in);                 // main-thread prepass only (bands deferred to the worker)
+    sRender2dNs += host_plat_time_ns() - t2d;
+    {
+        extern int gHostCanvasRows;
+        int aBottom = gpu2d_main_on_bottom();
+        int above = gHostCanvasRows - (aBottom ? 192 : 384);
+        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0 && !(getenv("ACWW_SINGLE") && atoi(getenv("ACWW_SINGLE")) == 0),
+                       above);
+    }
+    gpu3d_commit(sSnapBank);                // swap geometry + bind snapshot texture banks (no rasterization)
+    render_worker_kick();
+    if (++sRenderFrames >= 60) {
+        fprintf(stderr, "render: 2d %llu us, 3d %llu us (avg/frame)\n",
+                (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sRender3dNs / 60000));
+        sRender2dNs = sRender3dNs = 0;
+        sRenderFrames = 0;
+    }
+}
+
 void render_frame(void) {
+    if (render_thread_applicable()) { sLastMt = 1; render_frame_mt(); return; }
+    render_thread_sync();                   // a worker frame may still be in flight; finish it before a sync frame
+    gpu2d_set_defer_bands(0);
+    sLastMt = 0;
+    render_frame_sync();
+}
+
+static void render_frame_sync(void) {
     const u32 *lines3d = s3d;
     if (sGpu2d) {
         if (sGpuDisplay) lines3d = NULL;

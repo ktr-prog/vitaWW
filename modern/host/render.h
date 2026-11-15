@@ -9,6 +9,8 @@ void render_write16(u32 addr, u16 v);
 void render_write32(u32 addr, u32 v);
 u32 render_read32(u32 addr);
 void render_frame(void);
+int render_owns_present(void);   // 1 if render_frame() handed this frame's pace+present to the render thread
+void render_thread_sync(void);   // block until the render thread has finished the in-flight frame
 const u32 *render_screen(int screen);
 int render_on_gpu(void);
 int render_gx_fifo_irq_level(void);
