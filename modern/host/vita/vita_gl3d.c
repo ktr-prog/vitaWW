@@ -109,6 +109,14 @@ void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no s
 
 #define BATCH_V 65536   // capacity of the batched 3D vertex buffers (~2400 polys expanded to triangles/frame)
 
+static const G3RenderState *sSortR;
+static int cmp_tex(const void *a, const void *b) {
+    const G3Polygon *pa = sSortR->poly[*(const int *)a], *pb = sSortR->poly[*(const int *)b];
+    if (pa->texparam != pb->texparam) return pa->texparam < pb->texparam ? -1 : 1;
+    if (pa->texpal != pb->texpal) return pa->texpal < pb->texpal ? -1 : 1;
+    return 0;
+}
+
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     (void)img; (void)pal;   // textures decoded on demand via gpu3d_decode_texture (reads the same flat VRAM)
     if (!sEnabled || !out) return;
@@ -148,7 +156,17 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     GLuint curTex = 0;
 #define GL3D_FLUSH() do { if (bn) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_FLOAT, 0, bCol); \
         glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawArrays(GL_TRIANGLES, 0, bn); bn = 0; } } while (0)
-    for (int k = 0; k < r->npoly; k++) {
+    // Render opaque polygons sorted by texture (same texture batches into one draw, cutting GXM texture-bind
+    // flushes - the dominant 3D render cost when the scene interleaves many textures). Depth test resolves the
+    // opaque image regardless of draw order. Translucent polygons follow in submission order (order matters).
+    static int sOrder[8192];
+    int nOrd = 0;
+    for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && !r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
+    sSortR = r;
+    qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
+    for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
+    for (int oi = 0; oi < nOrd; oi++) {
+        int k = sOrder[oi];
         const G3Polygon *p = r->poly[k];
         if (p->nv < 3) continue;
         GLuint tex = tex_for(p->texparam, p->texpal);
