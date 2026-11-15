@@ -45,6 +45,7 @@ typedef struct G3Polygon {
     G3Vertex orig[4];
     int norig;
     float glMtx[16];   // DS clip matrix (proj*pos) as float/4096, for the GPU-side transform path (gG3GpuXform)
+    u32 glMtxId;       // identity of that matrix (clip serial) so the renderer can batch by matrix cheaply
 } G3Polygon;
 
 typedef struct G3RenderState {

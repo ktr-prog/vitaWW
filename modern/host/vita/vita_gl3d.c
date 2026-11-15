@@ -98,9 +98,9 @@ int g3w_init(void *device, void *queue, int scale) {
     sEnabled = 1;      // GL objects are created lazily on first render, once the vitaGL context exists
     extern int gG3ClipSpaceOut, gG3GpuXform;
     gG3ClipSpaceOut = 1;   // consume clip-space pos[] directly; skip the software screen/z divides in poly_screen
-    gG3GpuXform = 0;        // CPU transforms + clips; GPU rasterizes batched clip-space triangles. The per-poly
-                           // GPU matrix transform was a net loss (per-poly glLoadMatrixf + 2400 draw calls cost
-                           // ~21ms of GXM render for a ~1ms CPU saving); batched clip-space draws are far cheaper.
+    gG3GpuXform = 1;        // GPU does the vertex transform/clip/cull from raw verts + the DS matrix (~13ms CPU
+                           // saved). The earlier regression was per-poly glLoadMatrixf + 2400 draw calls; now
+                           // draws are batched per matrix+texture+blend run, so matrix loads collapse to a handful.
     return 1;
 }
 void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no shared picture
@@ -136,14 +136,15 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     glEnableClientState(GL_COLOR_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
 
-    // Batched drawing. The DS re-emits ~2400 polygons/frame; one glDrawArrays per polygon is ~2400 GXM draw-call
-    // flushes - the dominant 3D render cost. Instead, expand each polygon's triangle fan and append it to big
-    // arrays, issuing one glDrawArrays(GL_TRIANGLES) per run of polygons that share GL state (texture + blend).
-    // Vertices are DS clip space fed under an identity projection, so there is no per-poly matrix and runs batch
-    // freely. State is changed only at a flush, between runs.
+    // Batched GPU transform. The DS re-emits ~2400 polygons/frame; the GPU transforms raw model-space verts by
+    // each polygon's DS clip matrix (loaded as the projection), and draws are batched: one glDrawArrays per run
+    // of polygons sharing matrix + texture + blend + cull. Because the game draws object-by-object, consecutive
+    // polygons share all four, so the ~2400 matrix loads and draw calls collapse to a handful. Raw verts are
+    // scaled 1/4096 (DS 4.12 fixed) so matrix*vertex products stay in float's precise range.
+    glFrontFace(GL_CCW);
     static float bPos[BATCH_V][4], bCol[BATCH_V][4], bUv[BATCH_V][2];
-    int bn = 0, haveState = 0, curBlend = -1;
-    GLuint curTex = 0;
+    int bn = 0, haveState = 0, curBlend = -1, curCull = -2;
+    GLuint curTex = 0; u32 curMtxId = ~0u;
 #define GL3D_FLUSH() do { if (bn) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_FLOAT, 0, bCol); \
         glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawArrays(GL_TRIANGLES, 0, bn); bn = 0; } } while (0)
     for (int k = 0; k < r->npoly; k++) {
@@ -151,21 +152,27 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         if (p->nv < 3) continue;
         GLuint tex = tex_for(p->texparam, p->texpal);
         int blend = p->translucent ? 1 : 0;
-        if (!haveState || tex != curTex || blend != curBlend || bn + (p->nv - 2) * 3 > BATCH_V) {
+        int front = p->attr & 0x80, back = p->attr & 0x40;
+        int cull = (front && back) ? 0 : front ? 1 : 2;   // 0=both, 1=cull back, 2=cull front
+        if (!haveState || p->glMtxId != curMtxId || tex != curTex || blend != curBlend || cull != curCull ||
+            bn + (p->nv - 2) * 3 > BATCH_V) {
             GL3D_FLUSH();
+            if (p->glMtxId != curMtxId) { glMatrixMode(GL_PROJECTION); glLoadMatrixf(p->glMtx); curMtxId = p->glMtxId; }
             if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); } else glDisable(GL_TEXTURE_2D);
             if (blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
             else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
-            curTex = tex; curBlend = blend; haveState = 1;
+            if (!cull) glDisable(GL_CULL_FACE);
+            else { glEnable(GL_CULL_FACE); glCullFace(cull == 1 ? GL_BACK : GL_FRONT); }
+            curTex = tex; curBlend = blend; curCull = cull; haveState = 1;
         }
         int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
         float vp[16][4], vc[16][4], vu[16][2];
         for (int i = 0; i < p->nv; i++) {
             const G3Vertex *v = p->v[i];
-            // DS clip-space position (pos[]=NDC*w); GL does the perspective divide, viewport and depth. v->color
-            // is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel (dividing by 63 directly
-            // was ~8x too bright).
-            vp[i][0] = (float)v->pos[0]; vp[i][1] = (float)v->pos[1]; vp[i][2] = (float)v->pos[2]; vp[i][3] = (float)v->pos[3];
+            // Raw model-space vertex (w=1); the loaded DS clip matrix + GL's divide/viewport reproduce the DS
+            // mapping. v->color is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel.
+            vp[i][0] = (float)v->raw[0] / 4096.0f; vp[i][1] = (float)v->raw[1] / 4096.0f;
+            vp[i][2] = (float)v->raw[2] / 4096.0f; vp[i][3] = 1.0f;
             vc[i][0] = (v->color[0] >> 3) / 63.0f; vc[i][1] = (v->color[1] >> 3) / 63.0f; vc[i][2] = (v->color[2] >> 3) / 63.0f;
             vc[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
             vu[i][0] = tw ? (float)v->tex[0] / 16.0f / tw : 0.0f;

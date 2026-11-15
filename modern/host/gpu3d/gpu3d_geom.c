@@ -246,11 +246,13 @@ static void mtx_trans(Mtx *cur, const s32 *p) {
     for (int j = 0; j < 4; j++)
         cur->m[12 + j] += (s32)(((s64)p[0] * cur->m[j] + (s64)p[1] * cur->m[4 + j] + (s64)p[2] * cur->m[8 + j]) >> 12);
 }
+static u32 sClipSerial;   // bumped whenever the clip matrix is recomputed, so consumers can cache by identity
 static void update_clip(void) {
     if (!sClipDirty) return;
     sClip = sProj;
     mtx_mult(&sClip, &sPos);
     sClipDirty = 0;
+    sClipSerial++;
 }
 
 static void apply_mult(const Mtx *a) {
@@ -616,7 +618,13 @@ static void store_poly_gpu(const G3Vertex *v, int nv, u32 attr) {
     poly->translucent = (alpha > 0 && alpha < 31) || fmt == 1 || fmt == 6;
     int mode = attr >> 4 & 3;
     if (mode == 3) { if ((attr >> 24 & 63) == 0) poly->shadowMask = 1; else poly->shadow = 1; }
-    for (int i = 0; i < 16; i++) poly->glMtx[i] = (float)sClip.m[i] / 4096.0f;
+    // Convert the clip matrix to float only when it actually changed (per object, not per poly) - the int->float
+    // divides are slow on the A9 VFP and were eating the GPU-transform win. Cache by clip serial.
+    static u32 sStoreSerial = ~0u;
+    static float sStoreMtx[16];
+    if (sClipSerial != sStoreSerial) { for (int i = 0; i < 16; i++) sStoreMtx[i] = (float)sClip.m[i] / 4096.0f; sStoreSerial = sClipSerial; }
+    memcpy(poly->glMtx, sStoreMtx, sizeof sStoreMtx);
+    poly->glMtxId = sClipSerial;
     sStripValid = 0;
     sPolyOutcome = 0;
     sNumPolys++;
