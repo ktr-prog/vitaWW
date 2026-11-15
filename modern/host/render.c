@@ -1,5 +1,6 @@
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
@@ -38,6 +39,8 @@ extern void frontend_frame(void);
 // commit) and snapshots VRAM/palette/OAM; the worker then rasterizes from that stable snapshot while the main
 // thread races ahead into the next frame. This hides the ~38ms render under the ~68ms CPU (frame ~108 -> ~75ms).
 static int sRenderThreadOn;
+static unsigned sRenderSkipped;
+static int sFrameSkip;                     // never wait for the render thread: undrawn frames are skipped
 static int sWorkerSpawned;
 static int sLastMt;                       // the previous render_frame() dispatched to the worker (present is the worker's)
 static pthread_t sWorker;
@@ -149,6 +152,10 @@ void render_init(void) {
     sRenderThreadOn = !env_is("ACWW_RENDERTHREAD", "0");   // on by default on the Vita; ACWW_RENDERTHREAD=0 to disable
 #else
     sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // host validation only
+#endif
+    sFrameSkip = sRenderThreadOn && !env_is("ACWW_FRAMESKIP", "0");
+#if !HOST_VITA
+    sFrameSkip = sRenderThreadOn && getenv("ACWW_FRAMESKIP") && atoi(getenv("ACWW_FRAMESKIP"));
 #endif
     if (sRenderThreadOn) fprintf(stderr, "render: render thread active (overlaps 2D bands + 3D with the next frame's CPU)\n");
 }
@@ -562,6 +569,7 @@ static void render_worker_phase(void) {
         sRender3dNs += host_plat_time_ns() - t3d;
     }
     frontend_frame();   // present (reads the canvas this worker just produced); pacing stays on the main thread
+    { static int lag = -1; if (lag < 0) lag = getenv("ACWW_RT_LAG") ? atoi(getenv("ACWW_RT_LAG")) : 0; if (lag) usleep(lag * 1000); }   // stress knob
     __atomic_fetch_add(&sWorkerNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
 }
 
@@ -627,7 +635,7 @@ static void render_frame_mt(void) {
     const u32 *lines3d = sOwn3d ? gpu3d_lines() : s3d;
     Gpu2dFrameInput *in = &sWorkIn;
     for (int i = 0; i < 9; i++) in->bank[i] = sSnapBank[i];
-    in->palette = sSnapPal;
+    in->palette = gHostPltt;   // live: the hblank prepass rewrites it per line; the bands only read the per-line copies
     in->oam = sSnapOam;
     in->lines3d = lines3d;
     in->lines3dTop = sOwn3d && lines3d ? gpu3d_lines_top() : NULL;
@@ -650,16 +658,41 @@ static void render_frame_mt(void) {
     gpu3d_commit(sSnapBank);                // swap geometry + bind snapshot texture banks (no rasterization)
     render_worker_kick();
     if (++sRenderFrames >= 60) {
-        fprintf(stderr, "render: 2d prepass %llu us, 3d %llu us, render worker total %llu us (avg/frame)\n",
+        extern unsigned long long gpu3d_mt_skipped(void);
+        // 60 drawn frames: times are per drawn frame; "skipped" = DS frames that ran without being drawn
+        fprintf(stderr, "render: 2d prepass %llu us, 3d %llu us, render worker total %llu us (avg/drawn frame);"
+                " %u frames not drawn, %llu geometry frames not built\n",
                 (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sRender3dNs / 60000),
-                (unsigned long long)(__atomic_exchange_n(&sWorkerNs, 0, __ATOMIC_RELAXED) / 60000));
+                (unsigned long long)(__atomic_exchange_n(&sWorkerNs, 0, __ATOMIC_RELAXED) / 60000),
+                sRenderSkipped, gpu3d_mt_skipped());
+        sRenderSkipped = 0;
         sRender2dNs = sRender3dNs = 0;
         sRenderFrames = 0;
     }
 }
 
+// Frameskip: the render thread is still drawing the previous frame. Do not wait for it - run only the game's
+// per-line HBlank handlers (game-visible side effects) and let the game thread start the next frame. The geometry
+// is not committed either (the render thread is reading the current polygon list).
+static int render_worker_busy(void) {
+    if (!sWorkerSpawned) return 0;
+    pthread_mutex_lock(&sWMx);
+    int busy = !sWDone;
+    pthread_mutex_unlock(&sWMx);
+    return busy;
+}
+static void render_frame_skip(void) {
+    if (sOwn) for (int line = 0; line < 192; line++) host_hblank(line);
+    sRenderSkipped++;
+}
+
 void render_frame(void) {
-    if (render_thread_applicable()) { sLastMt = 1; render_frame_mt(); return; }
+    if (render_thread_applicable()) {
+        sLastMt = 1;
+        if (sFrameSkip && render_worker_busy()) render_frame_skip();
+        else render_frame_mt();
+        return;
+    }
     render_thread_sync();                   // a worker frame may still be in flight; finish it before a sync frame
     gpu2d_set_defer_bands(0);
     sLastMt = 0;

@@ -898,7 +898,8 @@ static void ref_advance(Engine *e, int line) {
 static void *band2d_worker(void *arg) {
     Band2d *w = arg;
     Engine *e = w->be;
-    memcpy(e, w->src, offsetof(Engine, out));   // copy inputs (regs, VRAM/palette/oam ptrs, objNextLine0 ...), not the big output arrays which render_line overwrites
+    // e already holds a copy of the engine's inputs (regs, VRAM/palette/oam ptrs, objNextLine0 ...), taken on the
+    // main thread at the end of the prepass - the live engine may be written by the game while this band runs.
     e->refX[0] = w->snap.refX[0]; e->refX[1] = w->snap.refX[1];
     e->refY[0] = w->snap.refY[0]; e->refY[1] = w->snap.refY[1];
     e->refLine = w->snap.refLine; e->refWritten[0] = w->snap.refWritten[0]; e->refWritten[1] = w->snap.refWritten[1];
@@ -948,6 +949,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     }
     for (int b = 0; b < N2DBANDS; b++) {
         sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
+        memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays
     }
 }
 

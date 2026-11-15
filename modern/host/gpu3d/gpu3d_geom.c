@@ -1105,11 +1105,15 @@ enum { MTQ_BATCH = 512 };
 static u32 sMtWLocal;
 static u32 sMtW __attribute__((aligned(64)));
 static u32 sMtR __attribute__((aligned(64)));
-static int sMtPad __attribute__((aligned(64)));
+static int sMtPad __attribute__((aligned(64), unused));
 static int sMtParked;             // worker executed SWAP_BUFFERS and waits for the commit
 static int sMtAsync, sMtStarted;
 static u32 sMtSwapsQueued, sMtSwapsDone;
 static int sMtCvDirty, sMtTexDirty;
+// Frameskip (pipelined mode): when two built frames are already waiting to be shown, the next frame's vertices
+// and swap are not sent to the worker at all - the game runs on, state commands still apply, nothing is built.
+static int sMtSkip;
+static unsigned long long sMtSkipped;
 static unsigned long long sMtBusyNs;
 static pthread_t sMtThread;
 HOST_STATE_KEEP(sMtQ) HOST_STATE_KEEP(sMtW) HOST_STATE_KEEP(sMtR) HOST_STATE_KEEP(sMtWLocal) HOST_STATE_KEEP(sMtParked)
@@ -1196,6 +1200,7 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
     if (c == 0x70) { mt_sync(); box_test(p); return; }
     if (c == 0x72) { vec_test(p[0]); return; }
     if (!is_command(c)) return;
+    if (sMtSkip && c >= 0x23 && c <= 0x28) return;
     if (c == 0x71) {                              // result here; the worker only latches the vertex registers
         update_clip();
         s64 x = (s16)p[0], y = (s16)(p[0] >> 16), z = (s16)p[1];
@@ -1211,7 +1216,12 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
         sMtCvDirty = 0;
     }
     if (sMtTexDirty) { mt_push(0xf2, (const u32 *)sTex.m, 16); sMtTexDirty = 0; }
-    if (c == 0x50) sMtSwapsQueued++;
+    if (c == 0x50) {
+        if (sMtSkip) sMtSkipped++;
+        else { sMtSwapsQueued++; mt_push(c, p, (u32)n); }
+        sMtSkip = sMtAsync && sMtSwapsQueued - sMtSwapsDone >= 3;
+        return;
+    }
     mt_push(c, p, (u32)n);
 }
 static void mt_entry(u8 cmd, u32 param) {
@@ -1240,6 +1250,7 @@ void gpu3d_mt_enable(int on, int async) {
     sMT = 1;
     fprintf(stderr, "gpu3d: GX worker thread on (%s commit)\n", async ? "pipelined" : "synchronous");
 }
+unsigned long long gpu3d_mt_skipped(void) { unsigned long long n = sMtSkipped; sMtSkipped = 0; return n; }
 unsigned long long gpu3d_mt_busy_ns(void) { return __atomic_exchange_n(&sMtBusyNs, 0, __ATOMIC_RELAXED); }
 
 static void exec_entry(Entry e) {
@@ -1421,10 +1432,11 @@ void gpu3d_commit(const uint8_t *const bank[9]) {
     if (sDispCnt & 128) g3_feature(F_FOG);
     if (sDispCnt & 0x4000) g3_feature(F_REAR_BITMAP);
     if (sMT) {
-        // Synchronous: wait for the worker, exactly like the single-threaded path. Pipelined: only wait when the
-        // worker is a whole frame behind (back-pressure), otherwise swap whatever it has finished.
+        // Synchronous: wait for the worker, exactly like the single-threaded path. Pipelined: never wait - swap
+        // if the worker has a finished frame parked, otherwise keep showing the previous one (frameskip above
+        // keeps the backlog bounded).
         mt_publish();
-        if (!sMtAsync || sMtSwapsQueued - sMtSwapsDone >= 2) mt_sync();
+        if (!sMtAsync) mt_sync();
         if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) {
             do_swap();
             sMtSwapsDone++;

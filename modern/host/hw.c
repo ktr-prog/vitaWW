@@ -132,11 +132,11 @@ HOST_STATE_KEEP(sShotSpec)
 static void host_screenshot(void) {
     if (!sShotSpec) sShotSpec = getenv("ACWW_SHOT") ? getenv("ACWW_SHOT") : "";
     const char *spec = sShotSpec;
-    if (*spec) render_thread_sync();   // the render thread may still be producing this frame's canvas
     u32 f = (u32)host_frame();
     for (const char *p = spec; *p;) {
         unsigned fr; char path[512];
         if (sscanf(p, "%u:%511[^;]", &fr, path) == 2 && fr == f) {
+            render_thread_sync();   // the render thread may still be producing the canvas
             FILE *o = fopen(path, "wb");
             if (o) {
                 extern const uint32_t *gpu2d_canvas(int *rows);
