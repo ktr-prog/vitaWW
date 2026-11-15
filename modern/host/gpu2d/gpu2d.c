@@ -866,6 +866,98 @@ static void classic_compose(const Gpu2dFrameInput *in) {
     sCanvasRows = rows;
 }
 
+// ---- Multi-threaded engine-0 line rendering ------------------------------------------------------------------
+// The per-pixel 2D compositing (compose_line) is the dominant 2D cost and runs single-threaded per scanline. The
+// 3D raster worker cores are now idle (3D moved to the GPU), so render engine-0's scanlines across threads.
+// The only cross-line state is cumulative: the affine ref points (refX/refY), the vertical-window toggles
+// (winActive) and the object-mosaic counters. A cheap sequential pre-pass advances exactly that state (no pixel
+// work) and snapshots it at band boundaries; each band then renders its line range from its snapshot into a
+// private Engine copy, and the lines are gathered back. hblank callbacks and both-engine ref advance stay in the
+// sequential pre-pass. Gated by ACWW_2DMT (default on); the sequential path remains for sGpu/diagnostics/engine-1.
+#include <pthread.h>
+#include <stddef.h>
+#define N2DBANDS 3
+static Engine s2dBandEng[N2DBANDS];
+static u8 s2dRegSnap[SCREEN_H][REG_SIZE];   // per-line register state (hblank can change scroll/etc. per scanline)
+static u8 s2dPalSnap[SCREEN_H][0x400];       // per-line palette (hblank can write palette per scanline: sky/water)
+typedef struct { s32 refX[2], refY[2]; int refLine; u8 refWritten[2], winActive[2]; int objMosaicLine, objMosaicCount; } Snap2d;
+typedef struct { const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; } Band2d;
+
+static void ref_advance(Engine *e, int line) {
+    for (int i = 0; i < 2; i++) {
+        u32 r = REG_BG2PA + 0x10 * (u32)i;
+        e->refX[i] = e->refWritten[i] & 1 ? ref28(e, 0x28 + 0x10 * (u32)i)
+                                          : e->refX[i] + (s16)reg16(e, r + 2) * (line + 1 - e->refLine);
+        e->refY[i] = e->refWritten[i] & 2 ? ref28(e, 0x2c + 0x10 * (u32)i)
+                                          : e->refY[i] + (s16)reg16(e, r + 6) * (line + 1 - e->refLine);
+        e->refWritten[i] = 0;
+    }
+    e->refLine = line + 1;
+}
+
+static void *band2d_worker(void *arg) {
+    Band2d *w = arg;
+    Engine *e = w->be;
+    memcpy(e, w->src, offsetof(Engine, out));   // copy inputs (regs, VRAM/palette/oam ptrs, objNextLine0 ...), not the big output arrays which render_line overwrites
+    e->refX[0] = w->snap.refX[0]; e->refX[1] = w->snap.refX[1];
+    e->refY[0] = w->snap.refY[0]; e->refY[1] = w->snap.refY[1];
+    e->refLine = w->snap.refLine; e->refWritten[0] = w->snap.refWritten[0]; e->refWritten[1] = w->snap.refWritten[1];
+    e->winActive[0] = w->snap.winActive[0]; e->winActive[1] = w->snap.winActive[1];
+    e->objMosaicLine = w->snap.objMosaicLine; e->objMosaicCount = w->snap.objMosaicCount;
+    for (int line = w->lo; line < w->hi; line++) {
+        memcpy(e->regs, s2dRegSnap[line], REG_SIZE);   // per-line registers (as they were when this line rendered)
+        e->palette = s2dPalSnap[line];                 // per-line palette
+        window_vertical(e, line);
+        if (line == 0 && e->haveNextLine0) e->obj = e->objNextLine0;
+        else if (line == 0) memset(&e->obj, 0, sizeof e->obj);
+        else gpu2d_render_obj_line(e, line, &e->obj);
+        render_line(e, w->in, line);     // writes e->out[line] (+defer/side effects), advances obj mosaic
+        ref_advance(e, line);
+    }
+    return 0;
+}
+
+// Returns 1 if it rendered engine 0's lines multi-threaded; 0 to fall back to the sequential loop.
+static int render_engine0_mt(const Gpu2dFrameInput *in) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("ACWW_2DMT"); on = (e && e[0] == '0') ? 0 : 1; }
+    if (!on) return 0;
+    Engine *e = &sEngine[0];
+    int bnd[N2DBANDS + 1];
+    for (int b = 0; b <= N2DBANDS; b++) bnd[b] = b * SCREEN_H / N2DBANDS;
+    Band2d w[N2DBANDS];
+    int bi = 0;
+    for (int line = 0; line < SCREEN_H; line++) {
+        while (bi < N2DBANDS && line == bnd[bi]) {
+            Snap2d *s = &w[bi].snap;
+            s->refX[0] = e->refX[0]; s->refX[1] = e->refX[1]; s->refY[0] = e->refY[0]; s->refY[1] = e->refY[1];
+            s->refLine = e->refLine; s->refWritten[0] = e->refWritten[0]; s->refWritten[1] = e->refWritten[1];
+            s->winActive[0] = e->winActive[0]; s->winActive[1] = e->winActive[1];
+            s->objMosaicLine = e->objMosaicLine; s->objMosaicCount = e->objMosaicCount;
+            bi++;
+        }
+        memcpy(s2dRegSnap[line], e->regs, REG_SIZE);   // capture registers for this line before hblank mutates them
+        memcpy(s2dPalSnap[line], e->palette, 0x400);   // capture palette for this line (hblank sky/water gradients)
+        window_vertical(e, line);
+        if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
+        obj_mosaic_y(e, line);
+        if (in->hblank) in->hblank(line, in->hblankContext);
+        for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
+    }
+    pthread_t th[N2DBANDS];
+    for (int b = 0; b < N2DBANDS; b++) {
+        w[b].in = in; w[b].src = e; w[b].be = &s2dBandEng[b]; w[b].lo = bnd[b]; w[b].hi = bnd[b + 1];
+        pthread_create(&th[b], 0, band2d_worker, &w[b]);
+    }
+    for (int b = 0; b < N2DBANDS; b++) {
+        pthread_join(th[b], 0);
+        int lo = bnd[b], n = bnd[b + 1] - lo;
+        memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
+        if (sDefer3d) memcpy(e->defer + lo * SCREEN_W, s2dBandEng[b].defer + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
+    }
+    return 1;
+}
+
 void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     sGpu = in->gpu;
     sDefer3d = in->defer3d || sGpu;
@@ -924,6 +1016,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         if (sGpu)
             for (int x = 0; x < SCREEN_W; x++) sGpuFrame.obj0[n][x] = pack_obj(&e->objNextLine0, x);
     }
+    if (mainOnly && !sGpu && !sDiagnostics && render_engine0_mt(in)) goto after_lines;
     for (int line = 0; line < SCREEN_H; line++) {
         for (int n = 0; n < (mainOnly ? 1 : 2); n++) {
             Engine *e = &sEngine[n];
@@ -956,6 +1049,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
             e->refLine = line + 1;
         }
     }
+after_lines:
     for (int n = 0; n < 2; n++) {
         Engine *e = &sEngine[n];
         window_vertical(e, SCREEN_H);
