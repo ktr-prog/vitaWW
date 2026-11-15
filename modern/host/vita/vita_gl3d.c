@@ -97,38 +97,26 @@ int g3w_init(void *device, void *queue, int scale) {
     (void)device; (void)queue; (void)scale;
     sEnabled = 1;      // GL objects are created lazily on first render, once the vitaGL context exists
     extern int gG3ClipSpaceOut, gG3GpuXform;
-    gG3ClipSpaceOut = 1;   // this backend consumes clip-space pos[] directly; skip software screen/z setup
-    // GPU-side transform/clip/cull: the hardware transforms raw model-space verts by the DS matrix, clips and
-    // culls - removing the CPU vertex transform, clip and facing math. Default on; ACWW_GPUXFORM=0 falls back to
-    // the CPU transform (clip-space pos feed) without a rebuild, in case the GPU path has a regression.
-    { const char *e = getenv("ACWW_GPUXFORM"); gG3GpuXform = !(e && e[0] == '0'); }
+    gG3ClipSpaceOut = 1;   // consume clip-space pos[] directly; skip the software screen/z divides in poly_screen
+    gG3GpuXform = 0;        // CPU transforms + clips; GPU rasterizes batched clip-space triangles. The per-poly
+                           // GPU matrix transform was a net loss (per-poly glLoadMatrixf + 2400 draw calls cost
+                           // ~21ms of GXM render for a ~1ms CPU saving); batched clip-space draws are far cheaper.
     return 1;
 }
 void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no shared picture
 
-// one polygon's vertices at a time (DS polygons have at most 10 verts), re-filled and drawn per polygon
-static float sVPos[16][4];
-static float sVCol[16][4];
-static float sVUv[16][2];
+#define BATCH_V 65536   // capacity of the batched 3D vertex buffers (~2400 polys expanded to triangles/frame)
 
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     (void)img; (void)pal;   // textures decoded on demand via gpu3d_decode_texture (reads the same flat VRAM)
     if (!sEnabled || !out) return;
     lazy_init();
 
-    extern int gG3GpuXform;
-    int gpuXform = gG3GpuXform;
-    // DS front-facing winding -> GL. Exposed so it can be flipped on-device (ACWW_FRONTFACE=cw|ccw) if the
-    // GPU-transform path culls the wrong faces (models inside-out / holes), without needing a rebuild.
-    static GLenum sFrontFace = 0;
-    if (!sFrontFace) { const char *e = getenv("ACWW_FRONTFACE"); sFrontFace = (e && (e[0]=='c'&&e[1]=='w')) ? GL_CW : GL_CCW; }
-
     glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
     glViewport(0, 0, VW, VH);
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    if (gpuXform) glFrontFace(sFrontFace);
-    else glDisable(GL_CULL_FACE);   // clip-space path feeds pre-culled polys
+    glDisable(GL_CULL_FACE);   // polys arrive pre-culled and pre-clipped from the CPU geometry pipeline
 
     u32 cc = r->clearColor;
     float cr = (cc & 31) / 31.0f, cg = (cc >> 5 & 31) / 31.0f, cb = (cc >> 10 & 31) / 31.0f;
@@ -147,76 +135,54 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
     glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glVertexPointer(4, GL_FLOAT, 0, sVPos);
-    glColorPointer(4, GL_FLOAT, 0, sVCol);
-    glTexCoordPointer(2, GL_FLOAT, 0, sVUv);
 
-    // Lazy GL state: the game draws object-by-object, so consecutive polys almost always share matrix/texture/
-    // cull/blend. On GXM every state change flushes the pipeline, so pushing them per-poly (2400x/frame) is what
-    // made the GPU-transform path's render time balloon. Only touch GL state when it actually changes.
-    float lastMtx[16]; int haveMtx = 0;
-    GLuint lastTex = 0xffffffffu;
-    int lastCull = -2, lastBlend = -1;
+    // Batched drawing. The DS re-emits ~2400 polygons/frame; one glDrawArrays per polygon is ~2400 GXM draw-call
+    // flushes - the dominant 3D render cost. Instead, expand each polygon's triangle fan and append it to big
+    // arrays, issuing one glDrawArrays(GL_TRIANGLES) per run of polygons that share GL state (texture + blend).
+    // Vertices are DS clip space fed under an identity projection, so there is no per-poly matrix and runs batch
+    // freely. State is changed only at a flush, between runs.
+    static float bPos[BATCH_V][4], bCol[BATCH_V][4], bUv[BATCH_V][2];
+    int bn = 0, haveState = 0, curBlend = -1;
+    GLuint curTex = 0;
+#define GL3D_FLUSH() do { if (bn) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_FLOAT, 0, bCol); \
+        glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawArrays(GL_TRIANGLES, 0, bn); bn = 0; } } while (0)
     for (int k = 0; k < r->npoly; k++) {
         const G3Polygon *p = r->poly[k];
         if (p->nv < 3) continue;
-        int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
-        for (int i = 0; i < p->nv; i++) {
-            const G3Vertex *v = p->v[i];
-            if (gpuXform) {
-                // GPU does the transform: feed raw model-space coords (w=1); the DS clip matrix (set below as the
-                // projection) and GL's divide/viewport reproduce the DS mapping. Scale by 1/4096 (DS verts are
-                // 4.12 fixed) so products stay in float's precise range.
-                sVPos[i][0] = (float)v->raw[0] / 4096.0f; sVPos[i][1] = (float)v->raw[1] / 4096.0f;
-                sVPos[i][2] = (float)v->raw[2] / 4096.0f; sVPos[i][3] = 1.0f;
-            } else {
-            // Feed the DS clip-space position straight to GL and let the GPU do the perspective divide, viewport
-            // map and depth. This is algebraically identical to reconstructing (NDC*w) from the software screen
-            // coords (hx/hy) and poly z - pos[0]=NDC_x*w, pos[1]=NDC_y*w, pos[2]=NDC_z*w, pos[3]=w - but it means
-            // the CPU no longer has to run screen_position() (4 integer divides/vertex) or the per-vertex z divide
-            // in submit_polygon, which are costly on the Cortex-A9 (no hardware divide). gG3ClipSpaceOut tells the
-            // geometry pipeline to skip that software screen/z setup for this backend.
-            sVPos[i][0] = (float)v->pos[0]; sVPos[i][1] = (float)v->pos[1];
-            sVPos[i][2] = (float)v->pos[2]; sVPos[i][3] = (float)v->pos[3];
-            }
-            // v->color is the DS's 9-bit interpolation value (5-bit vertex colour expanded as c<<4|0xf). The
-            // software rasterizer takes the 6-bit channel as (color >> 3), so normalise by that, not /63 directly
-            // (dividing the raw 0..511 value by 63 made everything ~8x too bright and clamp to white).
-            sVCol[i][0] = (v->color[0] >> 3) / 63.0f; sVCol[i][1] = (v->color[1] >> 3) / 63.0f;
-            sVCol[i][2] = (v->color[2] >> 3) / 63.0f; sVCol[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
-            sVUv[i][0] = tw ? (float)v->tex[0] / 16.0f / tw : 0.0f;
-            sVUv[i][1] = th ? (float)v->tex[1] / 16.0f / th : 0.0f;
-        }
-        if (gpuXform) {
-            // The polygon carries its DS clip matrix (proj*pos, /4096); load it as the GL projection so the GPU
-            // transforms the raw verts - but only when it differs from the last loaded one.
-            if (!haveMtx || memcmp(lastMtx, p->glMtx, sizeof lastMtx)) {
-                glMatrixMode(GL_PROJECTION); glLoadMatrixf(p->glMtx);
-                memcpy(lastMtx, p->glMtx, sizeof lastMtx); haveMtx = 1;
-            }
-            // Cull per the DS polygon attribute: bit 7 renders front faces, bit 6 back. 0=both, 1=cull back, 2=cull front.
-            int front = p->attr & 0x80, back = p->attr & 0x40;
-            int cull = (front && back) ? 0 : front ? 1 : 2;
-            if (cull != lastCull) {
-                if (!cull) glDisable(GL_CULL_FACE);
-                else { glEnable(GL_CULL_FACE); glCullFace(cull == 1 ? GL_BACK : GL_FRONT); }
-                lastCull = cull;
-            }
-        }
         GLuint tex = tex_for(p->texparam, p->texpal);
-        if (tex != lastTex) {
-            if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
-            else glDisable(GL_TEXTURE_2D);
-            lastTex = tex;
-        }
         int blend = p->translucent ? 1 : 0;
-        if (blend != lastBlend) {
+        if (!haveState || tex != curTex || blend != curBlend || bn + (p->nv - 2) * 3 > BATCH_V) {
+            GL3D_FLUSH();
+            if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); } else glDisable(GL_TEXTURE_2D);
             if (blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
             else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
-            lastBlend = blend;
+            curTex = tex; curBlend = blend; haveState = 1;
         }
-        glDrawArrays(GL_TRIANGLE_FAN, 0, p->nv);
+        int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
+        float vp[16][4], vc[16][4], vu[16][2];
+        for (int i = 0; i < p->nv; i++) {
+            const G3Vertex *v = p->v[i];
+            // DS clip-space position (pos[]=NDC*w); GL does the perspective divide, viewport and depth. v->color
+            // is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel (dividing by 63 directly
+            // was ~8x too bright).
+            vp[i][0] = (float)v->pos[0]; vp[i][1] = (float)v->pos[1]; vp[i][2] = (float)v->pos[2]; vp[i][3] = (float)v->pos[3];
+            vc[i][0] = (v->color[0] >> 3) / 63.0f; vc[i][1] = (v->color[1] >> 3) / 63.0f; vc[i][2] = (v->color[2] >> 3) / 63.0f;
+            vc[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
+            vu[i][0] = tw ? (float)v->tex[0] / 16.0f / tw : 0.0f;
+            vu[i][1] = th ? (float)v->tex[1] / 16.0f / th : 0.0f;
+        }
+        for (int i = 1; i + 1 < p->nv; i++) {   // fan -> triangles: (0, i, i+1)
+            const int idx[3] = {0, i, i + 1};
+            for (int j = 0; j < 3; j++, bn++) {
+                int s = idx[j];
+                bPos[bn][0] = vp[s][0]; bPos[bn][1] = vp[s][1]; bPos[bn][2] = vp[s][2]; bPos[bn][3] = vp[s][3];
+                bCol[bn][0] = vc[s][0]; bCol[bn][1] = vc[s][1]; bCol[bn][2] = vc[s][2]; bCol[bn][3] = vc[s][3];
+                bUv[bn][0] = vu[s][0]; bUv[bn][1] = vu[s][1];
+            }
+        }
     }
+    GL3D_FLUSH();
+#undef GL3D_FLUSH
 
     glDisableClientState(GL_VERTEX_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);

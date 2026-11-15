@@ -919,9 +919,6 @@ static void *band2d_worker(void *arg) {
 
 // Returns 1 if it rendered engine 0's lines multi-threaded; 0 to fall back to the sequential loop.
 static int render_engine0_mt(const Gpu2dFrameInput *in) {
-    static int on = -1;
-    if (on < 0) { const char *e = getenv("ACWW_2DMT"); on = (e && e[0] == '0') ? 0 : 1; }
-    if (!on) return 0;
     Engine *e = &sEngine[0];
     int bnd[N2DBANDS + 1];
     for (int b = 0; b <= N2DBANDS; b++) bnd[b] = b * SCREEN_H / N2DBANDS;
