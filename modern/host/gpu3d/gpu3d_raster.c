@@ -598,9 +598,28 @@ void g3_render(void) {
     if (timing) clock_gettime(CLOCK_MONOTONIC, &t0);
     sR = &gG3Render;
     g3_tex_setup();
-    if (sWgpu)
-        g3w_render(sR, sImgFlat, sPalFlat, sWgpuReadback ? sColor : NULL);
-    else {
+    if (sWgpu) {
+        // Frame cache: if the 3D scene is byte-identical to last frame (same polygons, vertices, colours,
+        // textures and render state - as when standing still, in a menu or a dialog), skip the GPU draws and the
+        // glReadPixels stall entirely. sColor keeps the previous render and is still copied to the frame buffer
+        // below, so the 2D compositor reads the correct (unchanged) 3D. Identical inputs -> identical pixels.
+        uint64_t h = 1469598103934665603ULL;
+#define H3D(x) do { h = (h ^ (uint64_t)(uint32_t)(x)) * 1099511628211ULL; } while (0)
+        H3D(sR->npoly); H3D(sR->dispcnt); H3D(sR->clearColor); H3D(sR->clearAttrHi); H3D(sR->alphaRef); H3D(sR->yofs);
+        for (int k = 0; k < sR->npoly; k++) {
+            const G3Polygon *p = sR->poly[k];
+            H3D(p->texparam); H3D(p->texpal); H3D(p->attr); H3D(p->nv | (p->translucent << 8));
+            for (int i = 0; i < p->nv; i++) {
+                const G3Vertex *v = p->v[i];
+                H3D(v->pos[0]); H3D(v->pos[1]); H3D(v->pos[2]); H3D(v->pos[3]);
+                H3D(v->color[0]); H3D(v->color[1]); H3D(v->color[2]); H3D(v->tex[0]); H3D(v->tex[1]);
+            }
+        }
+#undef H3D
+        static uint64_t sLast3d; static int sHave3d;
+        if (sHave3d && h == sLast3d) { /* cache hit: reuse sColor from the previous render */ }
+        else { g3w_render(sR, sImgFlat, sPalFlat, sWgpuReadback ? sColor : NULL); sLast3d = h; sHave3d = 1; }
+    } else {
         render_bands();
     }
     sShown ^= 1;
