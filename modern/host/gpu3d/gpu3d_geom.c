@@ -885,7 +885,6 @@ static void execute(u8 cmd, const u32 *p) {
         if (f == -2) f = getenv("ACWW_GPU3D_CMDLOG") ? atol(getenv("ACWW_GPU3D_CMDLOG")) : -1;
         if (f >= 0 && sFrame == (u64)f) fprintf(stderr, "cmdlog %02x %08x tex %08x vin %d\n", cmd, p[0], sTexParam, sVtxInPoly);
     }
-    sHist[sHistPos & 63].cmd = cmd; sHist[sHistPos & 63].p0 = p[0]; sHist[sHistPos & 63].mode = sMtxMode; sHist[sHistPos++ & 63].sp = sPosSP;
     g3_feature(F_CMD + (cmd & 0x7f));
     Mtx a;
     switch (cmd) {

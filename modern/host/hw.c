@@ -473,7 +473,11 @@ void host_card_dma(void) {
     }
 }
 
-void gx_fifo_write(u32 addr, u32 value) { sGxWrites++; render_write32(addr, value); }
+// The GX firehose (0x04000400-0x5ff) is 3D only: render_write32() just forwards it to gpu3d_write32() after four
+// branch checks (melon/gpu2d-range/is_3d/compare) that never fire for this range in normal play. Call gpu3d_write32
+// directly, shaving that dispatch off every one of the tens-of-thousands of GX writes per frame.
+void gpu3d_write32(u32 addr, u32 value);
+void gx_fifo_write(u32 addr, u32 value) { sGxWrites++; gpu3d_write32(addr, value); }
 
 static int sTimingLegacy = -1;
 static u32 sPollAddr = ~0u, sPollRepeat;
@@ -759,9 +763,8 @@ unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long
     // is_display range classification. Behaviour is identical to the slow path for this range; only diagnostics are
     // dropped. IRQ delivery still happens (GX writes raise none, and the next ordinary access flushes any pending).
     if (size == 4 && a >= 0x04000400 && a < 0x04000600) {
-        *(u32 *)host_io(a) = (u32)v;
         sGxWrites++;
-        render_write32(a, (u32)v);
+        gpu3d_write32(a, (u32)v);   // GX FIFO/command ports are write-only to the game; skip the host_io store too
         return v;
     }
     int traced = sHBlankLine < 0;
