@@ -23,7 +23,8 @@
 
 static int sEnabled;     // g3w_init called (gpu3d_use_wgpu succeeded)
 static int sReady;       // GL objects created (lazy, after the vitaGL context is up)
-static GLuint sFbo, sColorTex, sDepthRb;
+static GLuint sFbo[2], sColorTex[2], sDepthRb[2];
+static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-stalling) this call; -1 = none yet
 
 // --- texture cache: decode each unique DS texture (by texparam/texpal) to an RGBA GL texture once ------------
 #define TEXCACHE 256
@@ -76,18 +77,22 @@ static void load_shader_compiler(void) {
 static void lazy_init(void) {
     if (sReady) return;
     load_shader_compiler();
-    glGenFramebuffers(1, &sFbo);
-    glGenTextures(1, &sColorTex);
-    glBindTexture(GL_TEXTURE_2D, sColorTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VW, VH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glGenRenderbuffers(1, &sDepthRb);
-    glBindRenderbuffer(GL_RENDERBUFFER, sDepthRb);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, VW, VH);
-    glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sColorTex, 0);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sDepthRb);
+    // Two FBOs: draws are submitted to one while the previous one is read back. Deferring the readback by a frame
+    // lets the GPU finish this frame's draws during the CPU phase, so glReadPixels no longer stalls.
+    glGenFramebuffers(2, sFbo);
+    glGenTextures(2, sColorTex);
+    glGenRenderbuffers(2, sDepthRb);
+    for (int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, sColorTex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VW, VH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindRenderbuffer(GL_RENDERBUFFER, sDepthRb[i]);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, VW, VH);
+        glBindFramebuffer(GL_FRAMEBUFFER, sFbo[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sColorTex[i], 0);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sDepthRb[i]);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     sReady = 1;
 }
@@ -122,7 +127,28 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     if (!sEnabled || !out) return;
     lazy_init();
 
-    glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
+    // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
+    // frame. By now the GPU has long finished those draws (a whole frame has passed), so glReadPixels does not
+    // stall - the ~18ms the CPU used to spend waiting for the GPU is gone. Costs one frame of extra 3D latency.
+    if (sPrevDraw >= 0) {
+        glBindFramebuffer(GL_FRAMEBUFFER, sFbo[sPrevDraw]);
+        static u8 rb[VW * VH * 4];
+        glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, rb);
+        for (int y = 0; y < VH; y++) {
+            const u32 *src = (const u32 *)(rb + (VH - 1 - y) * VW * 4);
+            u32 *dst = out + y * VW;
+            for (int x = 0; x < VW; x++) {
+                u32 p = src[x];
+                dst[x] = ((p >> 2) & 0x3f) | (((p >> 10) & 0x3f) << 8) | (((p >> 18) & 0x3f) << 16) |
+                         ((((p >> 27) & 0x1f) | 0x80u) << 24);
+            }
+        }
+    } else {
+        for (int i = 0; i < VW * VH; i++) out[i] = 0;   // first frame: no 3D rendered yet
+    }
+
+    int draw = (sPrevDraw + 1) & 1;   // submit this frame to the other FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, sFbo[draw]);
     glViewport(0, 0, VW, VH);
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
@@ -207,22 +233,9 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_TEXTURE_COORD_ARRAY);
     glDepthMask(GL_TRUE);
-
-    // Read back the FBO and pack into the DS 3D line format the 2D compositor expects:
-    //   byte0=R6, byte1=G6, byte2=B6, byte3=(alpha5 | 0x80)   (0x80000000 marks a 3D pixel present).
-    // glReadPixels is bottom-up, so flip vertically (dst row y <- src row VH-1-y).
-    static u8 rb[VW * VH * 4];
-    glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, rb);
-    for (int y = 0; y < VH; y++) {
-        const u32 *src = (const u32 *)(rb + (VH - 1 - y) * VW * 4);   // one word/pixel instead of four byte loads
-        u32 *dst = out + y * VW;
-        for (int x = 0; x < VW; x++) {
-            u32 p = src[x];   // RGBA little-endian: R=byte0 G=byte1 B=byte2 A=byte3
-            dst[x] = ((p >> 2) & 0x3f) | (((p >> 10) & 0x3f) << 8) | (((p >> 18) & 0x3f) << 16) |
-                     ((((p >> 27) & 0x1f) | 0x80u) << 24);
-        }
-    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    // The draws are now in flight on the GPU; this FBO is read back next frame (no stall), not now.
+    sPrevDraw = draw;
 }
 
 // Enable predicate used by render_init: GPU path on, and the shader compiler reachable (else fall back to the
