@@ -151,6 +151,12 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     glColorPointer(4, GL_FLOAT, 0, sVCol);
     glTexCoordPointer(2, GL_FLOAT, 0, sVUv);
 
+    // Lazy GL state: the game draws object-by-object, so consecutive polys almost always share matrix/texture/
+    // cull/blend. On GXM every state change flushes the pipeline, so pushing them per-poly (2400x/frame) is what
+    // made the GPU-transform path's render time balloon. Only touch GL state when it actually changes.
+    float lastMtx[16]; int haveMtx = 0;
+    GLuint lastTex = 0xffffffffu;
+    int lastCull = -2, lastBlend = -1;
     for (int k = 0; k < r->npoly; k++) {
         const G3Polygon *p = r->poly[k];
         if (p->nv < 3) continue;
@@ -183,17 +189,32 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         }
         if (gpuXform) {
             // The polygon carries its DS clip matrix (proj*pos, /4096); load it as the GL projection so the GPU
-            // transforms the raw verts. Cull per the DS polygon attribute: bit 7 renders front faces, bit 6 back.
-            glMatrixMode(GL_PROJECTION); glLoadMatrixf(p->glMtx);
+            // transforms the raw verts - but only when it differs from the last loaded one.
+            if (!haveMtx || memcmp(lastMtx, p->glMtx, sizeof lastMtx)) {
+                glMatrixMode(GL_PROJECTION); glLoadMatrixf(p->glMtx);
+                memcpy(lastMtx, p->glMtx, sizeof lastMtx); haveMtx = 1;
+            }
+            // Cull per the DS polygon attribute: bit 7 renders front faces, bit 6 back. 0=both, 1=cull back, 2=cull front.
             int front = p->attr & 0x80, back = p->attr & 0x40;
-            if (front && back) glDisable(GL_CULL_FACE);
-            else { glEnable(GL_CULL_FACE); glCullFace(front ? GL_BACK : GL_FRONT); }
+            int cull = (front && back) ? 0 : front ? 1 : 2;
+            if (cull != lastCull) {
+                if (!cull) glDisable(GL_CULL_FACE);
+                else { glEnable(GL_CULL_FACE); glCullFace(cull == 1 ? GL_BACK : GL_FRONT); }
+                lastCull = cull;
+            }
         }
         GLuint tex = tex_for(p->texparam, p->texpal);
-        if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
-        else glDisable(GL_TEXTURE_2D);
-        if (p->translucent) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
-        else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+        if (tex != lastTex) {
+            if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); }
+            else glDisable(GL_TEXTURE_2D);
+            lastTex = tex;
+        }
+        int blend = p->translucent ? 1 : 0;
+        if (blend != lastBlend) {
+            if (blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
+            else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
+            lastBlend = blend;
+        }
         glDrawArrays(GL_TRIANGLE_FAN, 0, p->nv);
     }
 
