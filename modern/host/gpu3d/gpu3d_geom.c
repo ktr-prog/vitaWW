@@ -28,6 +28,10 @@ static s16 sLightDir[4][3];
 static u32 sLightParam[4]; static s32 sLightVec[4][9];
 static u8 sLightColor[4][3];
 static u8 sDiffuse[3], sAmbient[3], sSpecular[3], sEmission[3];
+// Per-light-per-channel colour coefficients (material*lightColour), recomputed only when the light state
+// changes (per object), not per vertex - hoisting those multiplies out of the per-vertex lighting loop.
+static s32 sPSpec[4][3], sPDif[4][3], sPAmb[4][3];
+static int sLightCoefDirty = 1;
 static int sShininessOn;
 static u8 sShininess[128];
 static u32 sPolyAttr, sCurPolyAttr, sTexParam, sTexPal;
@@ -388,6 +392,16 @@ static void lighting(void) {
     s32 n9[3] = {n[0] >> 3, n[1] >> 3, n[2] >> 3};
     s32 c[3] = {sEmission[0] << 14, sEmission[1] << 14, sEmission[2] << 14};
     g3_feature(F_LIGHT);
+    if (sLightCoefDirty) {
+        for (int l = 0; l < 4; l++)
+            for (int k = 0; k < 3; k++) {
+                s32 lc = sLightColor[l][k];
+                sPSpec[l][k] = sSpecular[k] * lc;
+                sPDif[l][k] = sDiffuse[k] * lc;
+                sPAmb[l][k] = (sAmbient[k] * lc) << 9;
+            }
+        sLightCoefDirty = 0;
+    }
     for (int l = 0; l < 4; l++) {
         if (!(sCurPolyAttr & (1u << l))) continue;
         const s16 *L = sLightDir[l];
@@ -399,10 +413,9 @@ static void lighting(void) {
         shine = (shine * shine) >> 8;
         if (sShininessOn) { shine = sShininess[shine >> 1]; g3_feature(F_SHININESS_TABLE); }
         for (int k = 0; k < 3; k++) {
-            s32 lc = sLightColor[l][k];
-            c[k] += sSpecular[k] * lc * shine << 1;
-            c[k] += sDiffuse[k] * lc * diffuse;
-            c[k] += sAmbient[k] * lc << 9;
+            c[k] += sPSpec[l][k] * shine << 1;
+            c[k] += sPDif[l][k] * diffuse;
+            c[k] += sPAmb[l][k];
         }
     }
     for (int k = 0; k < 3; k++) c[k] >>= 14;
@@ -993,6 +1006,7 @@ static void execute(u8 cmd, const u32 *p) {
         sAmbient[0] = p[0] >> 16 & 31;
         sAmbient[1] = p[0] >> 21 & 31;
         sAmbient[2] = p[0] >> 26 & 31;
+        sLightCoefDirty = 1;
         if (p[0] & 0x8000) {
             for (int i = 0; i < 3; i++) sVtxColor[i] = sDiffuse[i];
             sCurLightRec = -1;
@@ -1002,6 +1016,7 @@ static void execute(u8 cmd, const u32 *p) {
         sSpecular[0] = p[0] & 31;
         sSpecular[1] = p[0] >> 5 & 31;
         sSpecular[2] = p[0] >> 10 & 31;
+        sLightCoefDirty = 1;
         sEmission[0] = p[0] >> 16 & 31;
         sEmission[1] = p[0] >> 21 & 31;
         sEmission[2] = p[0] >> 26 & 31;
@@ -1013,6 +1028,7 @@ static void execute(u8 cmd, const u32 *p) {
         sLightColor[l][0] = p[0] & 31;
         sLightColor[l][1] = p[0] >> 5 & 31;
         sLightColor[l][2] = p[0] >> 10 & 31;
+        sLightCoefDirty = 1;
         break;
     }
     case 0x34:
