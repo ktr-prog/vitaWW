@@ -664,7 +664,12 @@ static void submit_polygon(void) {
     int clipk = sTall && sViewport[0] == 0 && sViewport[3] == 0 && sViewport[4] == 256 && sViewport[5] == 192 ? 96 + gG3Yofs : 96;
     sClipK = clipk;
     sScreenYofs = G3_YOFS;
-    int n = clip_polygon(v, nv, &cv, attr >> 12 & 1, &clipped);
+    // When a GPU backend consumes clip-space pos[] and clips in hardware (gG3ClipSpaceOut), skip the CPU
+    // Sutherland-Hodgman clip entirely (~11ms on the A9) and hand the GPU the unclipped polygon - GL clips it to
+    // the frustum (including w<=0 near-plane verts) before the perspective divide.
+    int n;
+    if (gG3ClipSpaceOut && !gG3GpuXform) { cv = v; n = nv; clipped = 0; }
+    else n = clip_polygon(v, nv, &cv, attr >> 12 & 1, &clipped);
     sClipK = 96;
     sPolyOutcome = n == 0 ? (sFarHidden ? 3 : 2) : 0;
     debug_tex_poly(n ? "kept" : "clipped away", v, nv, n);
