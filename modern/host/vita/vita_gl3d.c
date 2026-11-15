@@ -214,11 +214,12 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     static u8 rb[VW * VH * 4];
     glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, rb);
     for (int y = 0; y < VH; y++) {
-        const u8 *src = rb + (VH - 1 - y) * VW * 4;
+        const u32 *src = (const u32 *)(rb + (VH - 1 - y) * VW * 4);   // one word/pixel instead of four byte loads
         u32 *dst = out + y * VW;
         for (int x = 0; x < VW; x++) {
-            u32 R = src[x * 4 + 0] >> 2, G = src[x * 4 + 1] >> 2, B = src[x * 4 + 2] >> 2, A = src[x * 4 + 3] >> 3;
-            dst[x] = R | G << 8 | B << 16 | ((A | 0x80u) << 24);
+            u32 p = src[x];   // RGBA little-endian: R=byte0 G=byte1 B=byte2 A=byte3
+            dst[x] = ((p >> 2) & 0x3f) | (((p >> 10) & 0x3f) << 8) | (((p >> 18) & 0x3f) << 16) |
+                     ((((p >> 27) & 0x1f) | 0x80u) << 24);
         }
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
