@@ -269,7 +269,17 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     int nOrd = 0;
     for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && !r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
     sSortR = r;
-    if (nOrd > 1) qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
+    if (nOrd > 1) {
+        int sorted = 1;
+        uint64_t prev = ((uint64_t)r->poly[sOrder[0]]->texparam << 32) | r->poly[sOrder[0]]->texpal;
+        for (int i = 1; i < nOrd; i++) {
+            const G3Polygon *p = r->poly[sOrder[i]];
+            uint64_t key = ((uint64_t)p->texparam << 32) | p->texpal;
+            if (key < prev) { sorted = 0; break; }
+            prev = key;
+        }
+        if (!sorted) qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
+    }
     for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
