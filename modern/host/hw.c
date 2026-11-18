@@ -446,10 +446,22 @@ static void dma_run(int ch) {
     // per-word I/O dispatch.
     if (w == 4 && dst >= 0x04000400 && dst < 0x04000600 && (dc == 2 || dst + (uintptr_t)n * 4 <= 0x04000600) &&
         dc != 1 && sc != 3 && !dma_is_io(src) && src != IO1 + 0x10) {
-        for (u32 i = 0; i < n; i++) {
-            gpu3d_write32((u32)dst, *(volatile u32 *)src);
-            if (sc == 0) src += 4; else if (sc == 1) src -= 4;
-            if (dc == 0 || dc == 3) dst += 4;
+        // The common display-list transfer is incrementing source -> fixed GX FIFO destination.
+        // Hoist both DMA mode checks out of the per-word loop; keep the generic path for every other mode.
+        if (sc == 0 && dc == 2) {
+            u32 fifo = (u32)dst;
+            for (u32 i = 0; i < n; i++, src += 4)
+                gpu3d_write32(fifo, *(volatile u32 *)src);
+        } else if (sc == 0 && (dc == 0 || dc == 3)) {
+            u32 fifo = (u32)dst;
+            for (u32 i = 0; i < n; i++, src += 4, fifo += 4)
+                gpu3d_write32(fifo, *(volatile u32 *)src);
+        } else {
+            for (u32 i = 0; i < n; i++) {
+                gpu3d_write32((u32)dst, *(volatile u32 *)src);
+                if (sc == 1) src -= 4;
+                if (dc == 0 || dc == 3) dst += 4;
+            }
         }
         sGxWrites += n;
         n = 0;
