@@ -34,6 +34,25 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 #define TEXCACHE 256
 static struct { uint32_t tp, pal; GLuint tex; int used; } sTexCache[TEXCACHE];
 static uint32_t sDecodeBuf[1024 * 1024];   // max DS texture 1024x1024
+// The flattened DS texture/palette windows are rebuilt from VRAM every frame. Keep a
+// snapshot so edits or bank remaps invalidate decoded GL textures instead of showing stale data.
+#define IMG_BYTES (4 * 0x20000)
+#define PAL_BYTES (8 * 0x4000)
+static u8 sImgSnapshot[IMG_BYTES], sPalSnapshot[PAL_BYTES];
+static int sVramSnapshotValid;
+static int sLastTexSlot = -1;
+
+static void sync_texture_cache(const u8 *img, const u8 *pal) {
+    if (!img || !pal) return;
+    if (!sVramSnapshotValid || memcmp(img, sImgSnapshot, IMG_BYTES) ||
+        memcmp(pal, sPalSnapshot, PAL_BYTES)) {
+        memcpy(sImgSnapshot, img, IMG_BYTES);
+        memcpy(sPalSnapshot, pal, PAL_BYTES);
+        for (int i = 0; i < TEXCACHE; i++) sTexCache[i].used = 0;
+        sLastTexSlot = -1;
+        sVramSnapshotValid = 1;
+    }
+}
 
 static GLint ds_wrap(int repeat, int flip) {
     return flip ? GL_MIRRORED_REPEAT : (repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
@@ -41,12 +60,18 @@ static GLint ds_wrap(int repeat, int flip) {
 
 static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     if ((texparam >> 26 & 7) == 0) return 0;   // format 0 == no texture
-    int slot = (int)((texparam * 2654435761u ^ texpal * 40503u) % TEXCACHE);
+    if (sLastTexSlot >= 0 && sTexCache[sLastTexSlot].used &&
+        sTexCache[sLastTexSlot].tp == texparam && sTexCache[sLastTexSlot].pal == texpal)
+        return sTexCache[sLastTexSlot].tex;
+    int slot = (int)((texparam * 2654435761u ^ texpal * 40503u) & (TEXCACHE - 1));
     int empty = -1;
     for (int i = 0; i < TEXCACHE; i++) {       // probe for a match or the first free slot
-        int s = (slot + i) % TEXCACHE;
+        int s = (slot + i) & (TEXCACHE - 1);
         if (!sTexCache[s].used) { if (empty < 0) empty = s; continue; }
-        if (sTexCache[s].tp == texparam && sTexCache[s].pal == texpal) return sTexCache[s].tex;
+        if (sTexCache[s].tp == texparam && sTexCache[s].pal == texpal) {
+            sLastTexSlot = s;
+            return sTexCache[s].tex;
+        }
     }
     int w, h;
     gpu3d_texture_size(texparam, &w, &h);
@@ -61,6 +86,7 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     sTexCache[s].tp = texparam; sTexCache[s].pal = texpal; sTexCache[s].used = 1;
+    sLastTexSlot = s;
     return sTexCache[s].tex;
 }
 
@@ -121,15 +147,16 @@ void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no s
 static const G3RenderState *sSortR;
 static int cmp_tex(const void *a, const void *b) {
     const G3Polygon *pa = sSortR->poly[*(const int *)a], *pb = sSortR->poly[*(const int *)b];
-    if (pa->texparam != pb->texparam) return pa->texparam < pb->texparam ? -1 : 1;
-    if (pa->texpal != pb->texpal) return pa->texpal < pb->texpal ? -1 : 1;
+    uint64_t ka = (uint64_t)pa->texparam << 32 | pa->texpal;
+    uint64_t kb = (uint64_t)pb->texparam << 32 | pb->texpal;
+    if (ka != kb) return ka < kb ? -1 : 1;
     return 0;
 }
 
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
-    (void)img; (void)pal;   // textures decoded on demand via gpu3d_decode_texture (reads the same flat VRAM)
     if (!sEnabled || !out) return;
     lazy_init();
+    sync_texture_cache(img, pal);
 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
     // frame. By now the GPU has long finished those draws (a whole frame has passed), so glReadPixels does not
@@ -217,7 +244,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     int nOrd = 0;
     for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && !r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
     sSortR = r;
-    qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
+    if (nOrd > 1) qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
     for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
