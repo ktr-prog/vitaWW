@@ -67,7 +67,7 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     int empty = -1;
     for (int i = 0; i < TEXCACHE; i++) {       // probe for a match or the first free slot
         int s = (slot + i) & (TEXCACHE - 1);
-        if (!sTexCache[s].used) { if (empty < 0) empty = s; continue; }
+        if (!sTexCache[s].used) { empty = s; break; }
         if (sTexCache[s].tp == texparam && sTexCache[s].pal == texpal) {
             sLastTexSlot = s;
             return sTexCache[s].tex;
