@@ -42,15 +42,36 @@ static u8 sImgSnapshot[IMG_BYTES], sPalSnapshot[PAL_BYTES];
 static int sVramSnapshotValid;
 static int sLastTexSlot = -1;
 
+static int sync_snapshot_window(u8 *snapshot, const u8 *source, int size) {
+    enum { CHUNK = 4096 };
+    int changed = 0;
+    for (int ofs = 0; ofs < size; ofs += CHUNK) {
+        int n = size - ofs < CHUNK ? size - ofs : CHUNK;
+        if (memcmp(source + ofs, snapshot + ofs, (size_t)n)) {
+            memcpy(snapshot + ofs, source + ofs, (size_t)n);
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
 static void sync_texture_cache(const u8 *img, const u8 *pal) {
     if (!img || !pal) return;
-    if (!sVramSnapshotValid || memcmp(img, sImgSnapshot, IMG_BYTES) ||
-        memcmp(pal, sPalSnapshot, PAL_BYTES)) {
+    int changed;
+    if (!sVramSnapshotValid) {
         memcpy(sImgSnapshot, img, IMG_BYTES);
         memcpy(sPalSnapshot, pal, PAL_BYTES);
+        changed = 1;
+        sVramSnapshotValid = 1;
+    } else {
+        // VRAM writes are usually sparse. Copy only changed pages rather than
+        // copying the complete 640 KiB texture/palette window on every update.
+        changed = sync_snapshot_window(sImgSnapshot, img, IMG_BYTES);
+        changed |= sync_snapshot_window(sPalSnapshot, pal, PAL_BYTES);
+    }
+    if (changed) {
         for (int i = 0; i < TEXCACHE; i++) sTexCache[i].used = 0;
         sLastTexSlot = -1;
-        sVramSnapshotValid = 1;
     }
 }
 
