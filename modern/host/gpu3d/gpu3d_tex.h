@@ -6,7 +6,23 @@
 
 #include "gpu3d_internal.h"
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 enum { IMG_SLOT = 0x20000, PAL_SLOT = 0x4000 };
+
+static void g3_tex_or(u8 *dst, const u8 *src, u32 n) {
+    u32 i = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    for (; i + 16 <= n; i += 16) {
+        uint8x16_t a = vld1q_u8(dst + i);
+        uint8x16_t b = vld1q_u8(src + i);
+        vst1q_u8(dst + i, vorrq_u8(a, b));
+    }
+#endif
+    for (; i < n; i++) dst[i] |= src[i];
+}
 static const u8 *sImg[4][4];
 static int sNImg[4];
 static const u8 *sPal[8][3];
@@ -42,8 +58,7 @@ static void g3_tex_setup(void) {
         }
         sImgWasActive[s] = 1;
         memcpy(d, sImg[s][0], IMG_SLOT);
-        for (int i = 1; i < sNImg[s]; i++)
-            for (u32 k = 0; k < IMG_SLOT; k++) d[k] |= sImg[s][i][k];
+        for (int i = 1; i < sNImg[s]; i++) g3_tex_or(d, sImg[s][i], IMG_SLOT);
     }
     for (int s = 0; s < 8; s++) {
         u8 *d = sPalFlat + s * PAL_SLOT;
@@ -54,8 +69,7 @@ static void g3_tex_setup(void) {
         }
         sPalWasActive[s] = 1;
         memcpy(d, sPal[s][0], PAL_SLOT);
-        for (int i = 1; i < sNPal[s]; i++)
-            for (u32 k = 0; k < PAL_SLOT; k++) d[k] |= sPal[s][i][k];
+        for (int i = 1; i < sNPal[s]; i++) g3_tex_or(d, sPal[s][i], PAL_SLOT);
     }
     (void)kBankSize;
 }
