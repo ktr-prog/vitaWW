@@ -14,6 +14,10 @@
 
 #include <vitaGL.h>
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+
 #include "../gpu3d/gpu3d_internal.h"
 #include "../gpu3d/gpu3d.h"
 #include "vita.h"
@@ -137,11 +141,35 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         for (int y = 0; y < VH; y++) {
             const u32 *src = (const u32 *)(rb + (VH - 1 - y) * VW * 4);
             u32 *dst = out + y * VW;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+            // Convert four RGBA pixels at a time. The readback buffer is tightly packed RGBA8;
+            // the DS compositor wants 6-bit RGB plus the opaque 5-bit alpha marker.
+            const uint32x4_t rgbMask = vdupq_n_u32(0x3f);
+            const uint32x4_t alphaMask = vdupq_n_u32(0x1f);
+            const uint32x4_t alphaOpaque = vdupq_n_u32(0x80);
+            int x = 0;
+            for (; x + 4 <= VW; x += 4) {
+                uint32x4_t p = vld1q_u32(src + x);
+                uint32x4_t red = vandq_u32(vshrq_n_u32(p, 2), rgbMask);
+                uint32x4_t green = vandq_u32(vshrq_n_u32(p, 10), rgbMask);
+                uint32x4_t blue = vandq_u32(vshrq_n_u32(p, 18), rgbMask);
+                uint32x4_t alpha = vorrq_u32(vandq_u32(vshrq_n_u32(p, 27), alphaMask), alphaOpaque);
+                uint32x4_t packed = vorrq_u32(red, vorrq_u32(vshlq_n_u32(green, 8),
+                    vorrq_u32(vshlq_n_u32(blue, 16), vshlq_n_u32(alpha, 24))));
+                vst1q_u32(dst + x, packed);
+            }
+            for (; x < VW; x++) {
+                u32 p = src[x];
+                dst[x] = ((p >> 2) & 0x3f) | (((p >> 10) & 0x3f) << 8) | (((p >> 18) & 0x3f) << 16) |
+                         ((((p >> 27) & 0x1f) | 0x80u) << 24);
+            }
+#else
             for (int x = 0; x < VW; x++) {
                 u32 p = src[x];
                 dst[x] = ((p >> 2) & 0x3f) | (((p >> 10) & 0x3f) << 8) | (((p >> 18) & 0x3f) << 16) |
                          ((((p >> 27) & 0x1f) | 0x80u) << 24);
             }
+#endif
         }
     } else {
         for (int i = 0; i < VW * VH; i++) out[i] = 0;   // first frame: no 3D rendered yet
