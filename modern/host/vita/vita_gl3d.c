@@ -80,10 +80,10 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     int s = empty >= 0 ? empty : slot;         // insert at a free slot; evict only if the cache is full
     if (!sTexCache[s].tex) glGenTextures(1, &sTexCache[s].tex);
     glBindTexture(GL_TEXTURE_2D, sTexCache[s].tex);
-    if (sTexCache[s].w == w && sTexCache[s].h == h)
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
-    else
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
+    // vitaGL/GXM can still be sampling this texture from the previous queued frame.
+    // Re-specifying the image gives the driver a fresh backing store; glTexSubImage2D
+    // on the reused storage caused alternating stale/new texture contents on hardware.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
     sTexCache[s].w = w; sTexCache[s].h = h;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(texparam >> 16 & 1, texparam >> 18 & 1));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(texparam >> 17 & 1, texparam >> 19 & 1));
