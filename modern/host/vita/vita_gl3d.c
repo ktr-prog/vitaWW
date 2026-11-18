@@ -32,7 +32,7 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 
 // --- texture cache: decode each unique DS texture (by texparam/texpal) to an RGBA GL texture once ------------
 #define TEXCACHE 256
-static struct { uint32_t tp, pal; GLuint tex; int used; } sTexCache[TEXCACHE];
+static struct { uint32_t tp, pal; GLuint tex; int used, w, h; } sTexCache[TEXCACHE];
 static uint32_t sDecodeBuf[1024 * 1024];   // max DS texture 1024x1024
 // The flattened DS texture/palette windows are rebuilt from VRAM every frame. Keep a
 // snapshot so edits or bank remaps invalidate decoded GL textures instead of showing stale data.
@@ -80,7 +80,11 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     int s = empty >= 0 ? empty : slot;         // insert at a free slot; evict only if the cache is full
     if (!sTexCache[s].tex) glGenTextures(1, &sTexCache[s].tex);
     glBindTexture(GL_TEXTURE_2D, sTexCache[s].tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
+    if (sTexCache[s].w == w && sTexCache[s].h == h)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
+    else
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
+    sTexCache[s].w = w; sTexCache[s].h = h;
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(texparam >> 16 & 1, texparam >> 18 & 1));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(texparam >> 17 & 1, texparam >> 19 & 1));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
