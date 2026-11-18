@@ -15,6 +15,7 @@ static const u32 kBankSize[9] = {0x20000, 0x20000, 0x20000, 0x20000, 0x10000, 0x
 
 static u8 sImgFlat[4 * IMG_SLOT];
 static u8 sPalFlat[8 * PAL_SLOT];
+static u8 sImgWasActive[4], sPalWasActive[8];
 
 static void g3_tex_setup(void) {
     memset(sNImg, 0, sizeof sNImg);
@@ -34,14 +35,24 @@ static void g3_tex_setup(void) {
         }
     for (int s = 0; s < 4; s++) {
         u8 *d = sImgFlat + s * IMG_SLOT;
-        if (!sNImg[s]) { memset(d, 0, IMG_SLOT); continue; }
+        if (!sNImg[s]) {
+            if (sImgWasActive[s]) memset(d, 0, IMG_SLOT);
+            sImgWasActive[s] = 0;
+            continue;
+        }
+        sImgWasActive[s] = 1;
         memcpy(d, sImg[s][0], IMG_SLOT);
         for (int i = 1; i < sNImg[s]; i++)
             for (u32 k = 0; k < IMG_SLOT; k++) d[k] |= sImg[s][i][k];
     }
     for (int s = 0; s < 8; s++) {
         u8 *d = sPalFlat + s * PAL_SLOT;
-        if (!sNPal[s]) { memset(d, 0, PAL_SLOT); continue; }
+        if (!sNPal[s]) {
+            if (sPalWasActive[s]) memset(d, 0, PAL_SLOT);
+            sPalWasActive[s] = 0;
+            continue;
+        }
+        sPalWasActive[s] = 1;
         memcpy(d, sPal[s][0], PAL_SLOT);
         for (int i = 1; i < sNPal[s]; i++)
             for (u32 k = 0; k < PAL_SLOT; k++) d[k] |= sPal[s][i][k];
