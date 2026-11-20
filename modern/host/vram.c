@@ -173,7 +173,7 @@ void host_vram_control(u32 addr, u8 value) {
     if (i < 0 || i > 8 || addr == 0x04000247) return;
     if (sCnt[i] == value) return;
     sCnt[i] = value;
-    remap();
+    HOST_PHASE(PH_VRAM, remap());
 }
 
 static u8 sScratch[0x80000];

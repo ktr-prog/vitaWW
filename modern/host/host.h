@@ -48,6 +48,10 @@ void host_irq_raise(u32 mask);
 void host_irq_call(int bit);
 void host_advance_to_next_event(void);
 u64 host_frame(void);
+// Game-thread phase marks for the sampled breakdown (hw.c). Nested marks restore the outer phase.
+enum { PH_GAME, PH_GX, PH_IO, PH_VRAM, PH_AUDIO, PH_RENDER, PH_WAIT, PH_PACE, PH_FRONTEND, HOST_PHASES };
+extern volatile unsigned char gHostPhase;
+#define HOST_PHASE(ph, stmt) do { unsigned char _hp = gHostPhase; gHostPhase = (ph); stmt; gHostPhase = _hp; } while (0)
 u64 host_cycles(void);
 void host_spend_cycles(u64 n);
 

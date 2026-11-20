@@ -338,11 +338,19 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         if (!sorted) qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
     }
     for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
+    // Resolve every polygon's texture before drawing anything. A cache miss or refresh uploads a texture, which
+    // rebinds GL_TEXTURE_2D; doing that inside the draw loop made the batch still pending for the previous
+    // texture draw with the newly uploaded one (wrong textures for a frame whenever a texture was uploaded).
+    static GLuint sPolyTex[8192];
+    for (int oi = 0; oi < nOrd; oi++) {
+        const G3Polygon *p = r->poly[sOrder[oi]];
+        sPolyTex[oi] = tex_for(p->texparam, p->texpal);
+    }
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
         const G3Polygon *p = r->poly[k];
         if (p->nv < 3) continue;
-        GLuint tex = tex_for(p->texparam, p->texpal);
+        GLuint tex = sPolyTex[oi];
         int blend = p->translucent ? 1 : 0;
         if (!haveState || tex != curTex || blend != curBlend || bn + (p->nv - 2) * 3 > BATCH_V) {
             GL3D_FLUSH();

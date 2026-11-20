@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
 #endif
 
 #include "host.h"
@@ -73,6 +74,44 @@ static u64 tm_next_overflow(Timer *t) {
     return t->start + (done + 1) * p;
 }
 
+// Game-thread phase sampling (device-side profile): the game thread records what it is doing in gHostPhase and a
+// sampler thread on another core reads it every ~250 us. Reported per 60 frames on the "game thread" line.
+volatile unsigned char gHostPhase;
+_Static_assert(PH_AUDIO == 4 && PH_WAIT == 6, "spu.c / gpu3d_geom.c / render.c use these numbers");
+static unsigned long long sPhaseCount[HOST_PHASES];
+static void *phase_sampler(void *arg) {
+    (void)arg;
+#if HOST_VITA
+    extern int sceKernelChangeThreadCpuAffinityMask(int, int);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);
+#endif
+    for (;;) {
+        __atomic_fetch_add(&sPhaseCount[gHostPhase % HOST_PHASES], 1, __ATOMIC_RELAXED);
+        usleep(250);
+    }
+    return 0;
+}
+static void phase_report(void) {
+    static int started;
+    if (!started) {
+        started = 1;
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 64 << 10);
+        pthread_create(&t, &at, phase_sampler, 0);
+        return;
+    }
+    unsigned long long c[HOST_PHASES], tot = 0;
+    for (int i = 0; i < HOST_PHASES; i++) { c[i] = __atomic_exchange_n(&sPhaseCount[i], 0, __ATOMIC_RELAXED); tot += c[i]; }
+    if (!tot) return;
+#define PCT(i) (unsigned)(c[i] * 100 / tot)
+    fprintf(stderr, "game thread (sampled, %% of wall time): game code %u, GX writes %u, other I/O %u, VRAM remap %u, "
+            "audio %u, render hand-off %u, waiting %u, pacing sleep %u, frontend %u\n",
+            PCT(PH_GAME), PCT(PH_GX), PCT(PH_IO), PCT(PH_VRAM), PCT(PH_AUDIO), PCT(PH_RENDER), PCT(PH_WAIT),
+            PCT(PH_PACE), PCT(PH_FRONTEND));
+#undef PCT
+}
 static int sFast = -1;
 static u64 sNextFrame;
 static int sPaused;
@@ -95,7 +134,7 @@ static void host_pace_frame(void) {
     if (sNextFrame == 0) sNextFrame = now;
     sNextFrame += 16715000;
     if (now > sNextFrame + 1000000000u) sNextFrame = now;
-    host_plat_sleep_until_ns(sNextFrame);
+    HOST_PHASE(PH_PACE, host_plat_sleep_until_ns(sNextFrame));
 }
 
 static u32 sHeartbeat, sHeartbeatFrame;
@@ -240,7 +279,7 @@ static void run_events_body(void) {
             u64 vb = host_plat_time_ns();
             if (sLastVb) sCpuNs += vb - sLastVb;       // wall time since last vblank point == this DS frame's CPU
             u64 r0 = host_plat_time_ns();
-            render_frame();
+            HOST_PHASE(PH_RENDER, render_frame());
             u64 r1 = host_plat_time_ns();
             sRenderNs += r1 - r0;
             host_pace_frame();
@@ -249,11 +288,12 @@ static void run_events_body(void) {
             {
                 extern void frontend_frame(void);
                 u64 p0 = host_plat_time_ns();
-                frontend_frame();
+                HOST_PHASE(PH_FRONTEND, frontend_frame());
                 sPresentNs += host_plat_time_ns() - p0;
             }
             sLastVb = host_plat_time_ns();
             if (++sBreakN >= 60) {
+                phase_report();
                 static unsigned long long lastGx, lastIo;
                 unsigned long long gx = (sGxWrites - lastGx) / 60, io = ((unsigned long long)sIoCount - lastIo) / 60;
                 lastGx = sGxWrites; lastIo = sIoCount;
@@ -781,10 +821,13 @@ unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
     u32 a = (u32)addr;
     if (sHBlankLine >= 0)
         return size == 8 ? io_load(a, 4) | (unsigned long long)io_load(a + 4, 4) << 32 : io_load(a, size);
+    unsigned char ph = gHostPhase;
+    if (ph == PH_GAME) gHostPhase = PH_IO;
     io_note(addr, 0, __builtin_return_address(0));
     unsigned long long v = size == 8 ? io_load(a, 4) | (unsigned long long)io_load(a + 4, 4) << 32 : io_load(a, size);
     if (sIoTrace > 0) io_trace_value(a, 0, v);
     io_access_done();
+    gHostPhase = ph;
     return v;
 }
 unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long long v) {
@@ -797,15 +840,23 @@ unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long
     // dropped. IRQ delivery still happens (GX writes raise none, and the next ordinary access flushes any pending).
     if (size == 4 && a >= 0x04000400 && a < 0x04000600) {
         sGxWrites++;
+        unsigned char ph = gHostPhase;
+        gHostPhase = PH_GX;
         gpu3d_write32(a, (u32)v);   // GX FIFO/command ports are write-only to the game; skip the host_io store too
+        gHostPhase = ph;
         return v;
     }
     if (size == 8 && a >= 0x04000400 && a + 8 <= 0x04000600) {   // the game stores GX words in pairs as often
         sGxWrites += 2;
+        unsigned char ph = gHostPhase;
+        gHostPhase = PH_GX;
         gpu3d_write32(a, (u32)v);
         gpu3d_write32(a + 4, (u32)(v >> 32));
+        gHostPhase = ph;
         return v;
     }
+    unsigned char phw = gHostPhase;
+    if (phw == PH_GAME) gHostPhase = PH_IO;
     int traced = sHBlankLine < 0;
     if (traced) io_note(addr, 1, __builtin_return_address(0));
     if (traced && sIoTrace > 0) io_trace_value(a, 1, v);
@@ -816,6 +867,7 @@ unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long
         io_store(a, size, (u32)v);
     }
     if (traced) io_access_done();
+    gHostPhase = phw;
     return v;
 }
 

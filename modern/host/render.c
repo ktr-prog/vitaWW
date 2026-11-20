@@ -560,7 +560,51 @@ static int sRenderFrames;
 // The worker's half of a frame: pure compute over the snapshot (no game code). Produces the 2D canvas, rasterizes
 // the committed 3D, then paces + presents. All GPU/GL work lives here so the GL context stays on one thread.
 static uint64_t sWorkerNs;
-static uint64_t sWBandsNs, sWPresentNs;   // render-thread split: 2D bands / present (3D is sRender3dNs)
+static uint64_t sWBandsNs, sWPresentNs;
+// --- FPS overlay (Vita, while testing; ACWW_FPS=0 hides it) ---------------------------------------------------------
+// Top-left: frames shown per second, and game speed (DS frames run per second / 60, so 100% = full speed).
+static unsigned sVblankCount;   // DS frames run (render_frame calls, game thread)
+static const unsigned short kGlyph[128] = {   // 3x5, bit 14 = top-left
+    ['0'] = 0x7b6f, ['1'] = 0x2c97, ['2'] = 0x73e7, ['3'] = 0x73cf, ['4'] = 0x5bc9, ['5'] = 0x79cf, ['6'] = 0x79ef,
+    ['7'] = 0x7249, ['8'] = 0x7bef, ['9'] = 0x7bcf, ['F'] = 0x79a4, ['P'] = 0x7be4, ['S'] = 0x79cf, ['%'] = 0x52a5,
+    ['G'] = 0x796f, ['A'] = 0x2bed, ['M'] = 0x5fed, ['E'] = 0x79e7,
+};
+static void overlay_text(uint32_t *c, int x0, int y0, const char *s) {
+    int n = (int)strlen(s), w = n * 8 + 2, h = 14;
+    for (int y = y0; y < y0 + h && y < 192; y++)
+        for (int x = x0; x < x0 + w && x < 256; x++) c[y * 256 + x] = 0x000000;
+    for (int i = 0; i < n; i++) {
+        unsigned g = kGlyph[(unsigned char)s[i] & 127];
+        for (int r = 0; r < 5; r++)
+            for (int col = 0; col < 3; col++)
+                if (g >> (14 - (r * 3 + col)) & 1)
+                    for (int dy = 0; dy < 2; dy++)
+                        for (int dx = 0; dx < 2; dx++) {
+                            int x = x0 + 2 + i * 8 + col * 2 + dx, y = y0 + 2 + r * 2 + dy;
+                            if (x < 256 && y < 192) c[y * 256 + x] = 0xffffff;
+                        }
+    }
+}
+static void overlay_fps(uint32_t *canvas) {
+    static int on = -1;
+    if (on < 0) on = !(getenv("ACWW_FPS") && atoi(getenv("ACWW_FPS")) == 0);
+    if (!on || !canvas) return;
+    static uint64_t t0;
+    static unsigned frames, vb0, fps, speed;
+    uint64_t now = host_plat_time_ns();
+    frames++;
+    if (!t0) { t0 = now; vb0 = __atomic_load_n(&sVblankCount, __ATOMIC_RELAXED); }
+    if (now - t0 >= 500000000u) {
+        unsigned vb = __atomic_load_n(&sVblankCount, __ATOMIC_RELAXED);
+        double sec = (now - t0) / 1e9;
+        fps = (unsigned)(frames / sec + 0.5);
+        speed = (unsigned)((vb - vb0) / sec / 60.0 * 100.0 + 0.5);
+        frames = 0; t0 = now; vb0 = vb;
+    }
+    char buf[32];
+    snprintf(buf, sizeof buf, "%u FPS %u%%", fps, speed);
+    overlay_text(canvas, 0, 0, buf);
+}   // render-thread split: 2D bands / present (3D is sRender3dNs)
 static void render_worker_phase(void) {
     uint64_t tw = host_plat_time_ns();
     gpu2d_render_finish();                 // 2D bands + canvas from the per-line/VRAM snapshots
@@ -579,6 +623,7 @@ static void render_worker_phase(void) {
         extern void vita_gl_present_canvas(const void *, int, int, int, int, int, int);
         int rows = 0;
         const uint32_t *c = gpu2d_canvas(&rows);
+        if (c && rows >= 192 && rows <= 640) overlay_fps((uint32_t *)c);   // the canvas is rebuilt every frame
         if (c && rows >= 192 && rows <= 640) vita_gl_present_canvas(c, 256, rows, 0, 0, 256, rows);
         __atomic_fetch_add(&sWPresentNs, host_plat_time_ns() - tp, __ATOMIC_RELAXED);
     }
@@ -611,9 +656,13 @@ static void *render_worker_main(void *a) {
 // overwrite, and the 2D/3D engine state we are about to mutate).
 void render_thread_sync(void) {
     if (!sWorkerSpawned) return;
+    extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 6 = PH_WAIT
+    unsigned char ph = gHostPhase;
+    gHostPhase = 6;
     pthread_mutex_lock(&sWMx);
     while (!sWDone) pthread_cond_wait(&sWCvDone, &sWMx);
     pthread_mutex_unlock(&sWMx);
+    gHostPhase = ph;
 }
 
 static void render_worker_kick(void) {
@@ -733,6 +782,7 @@ static void render_frame_skip(void) {
 }
 
 void render_frame(void) {
+    __atomic_fetch_add(&sVblankCount, 1, __ATOMIC_RELAXED);
     if (render_thread_applicable()) {
         sLastMt = 1;
         if (sFrameSkip && render_worker_busy()) render_frame_skip();

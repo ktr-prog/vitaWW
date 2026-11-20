@@ -291,7 +291,15 @@ static void mix_one(s16 out[2]) {
     out[1] = (s16)clamp16((ro * mv >> 7) >> 8);
 }
 
+static void spu_mix_until_body(u64 cycles);
+extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 4 = PH_AUDIO
 void spu_mix_until(u64 cycles) {
+    unsigned char ph = gHostPhase;
+    gHostPhase = 4;
+    spu_mix_until_body(cycles);
+    gHostPhase = ph;
+}
+static void spu_mix_until_body(u64 cycles) {
     s16 buf[512 * 2];
     u32 n = 0;
     while (sMixed + SAMPLE_CYCLES <= cycles) {

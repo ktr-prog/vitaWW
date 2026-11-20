@@ -1128,6 +1128,7 @@ HOST_STATE_KEEP(sMtStarted) HOST_STATE_KEEP(sMtThread) HOST_STATE_KEEP(sMT) HOST
 HOST_STATE_KEEP(gClipM) HOST_STATE_KEEP(gVecM) HOST_STATE_KEEP(gTexM)
 extern uint64_t host_plat_time_ns(void);
 
+static void mt_sync_body(void);
 static void mt_pause(int *spins) {
     if (++*spins < 32) sched_yield();
     else usleep(100);   // idle: sleep instead of spinning so the core goes to the render thread / 2D band
@@ -1183,7 +1184,14 @@ static void *mt_worker(void *arg) {
 static inline void mt_publish(void) {
     if (sMtW != sMtWLocal) __atomic_store_n(&sMtW, sMtWLocal, __ATOMIC_RELEASE);
 }
+extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 6 = PH_WAIT
 static void mt_sync(void) {
+    unsigned char ph = gHostPhase;
+    gHostPhase = 6;
+    mt_sync_body();
+    gHostPhase = ph;
+}
+static void mt_sync_body(void) {
     int s = 0;
     mt_publish();
     while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWLocal && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
@@ -1194,6 +1202,7 @@ static void mt_push(u32 c, const u32 *p, u32 n) {
     if (w - rSeen + n + 1 > MTQ_N) {
         int s = 0;
         mt_publish();
+        gHostPhase = 6;   // ring full: waiting for the worker (restored by the caller's phase on return)
         while (w - (rSeen = __atomic_load_n(&sMtR, __ATOMIC_ACQUIRE)) + n + 1 > MTQ_N) {
             if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) return;   // full behind a pending swap: drop, as a full FIFO would
             mt_pause(&s);
