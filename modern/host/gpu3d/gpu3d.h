@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 void gpu3d_reset(void);
+void gpu3d_write_block(uint32_t addr, const uint32_t *src, uint32_t n);   // n words to one GX port
 // Before gpu3d_commit(): per bank, the 1 KB blocks that changed since the previous commit (NULL: unknown).
 void gpu3d_set_bank_dirty(const uint8_t *const dirty[9]);
 void gpu3d_mt_enable(int on, int async);     // run GX command processing on a worker thread

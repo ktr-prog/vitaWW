@@ -1113,6 +1113,8 @@ static u32 *sMtQ;
 // publishes sMtR per batch. Each published index sits on its own cache line.
 enum { MTQ_BATCH = 512 };
 static u32 sMtWLocal;
+static u32 sMtWDone;   // end of the last complete command: what gets published (never part of a command)
+static u32 sMtRSeen;   // last worker position this thread read (re-read only when the ring looks full)
 static u32 sMtW __attribute__((aligned(64)));
 static u32 sMtR __attribute__((aligned(64)));
 static int sMtPad __attribute__((aligned(64), unused));
@@ -1126,7 +1128,7 @@ static int sMtSkip;
 static unsigned long long sMtSkipped;
 static unsigned long long sMtBusyNs;
 static pthread_t sMtThread;
-HOST_STATE_KEEP(sMtQ) HOST_STATE_KEEP(sMtW) HOST_STATE_KEEP(sMtR) HOST_STATE_KEEP(sMtWLocal) HOST_STATE_KEEP(sMtParked)
+HOST_STATE_KEEP(sMtQ) HOST_STATE_KEEP(sMtW) HOST_STATE_KEEP(sMtR) HOST_STATE_KEEP(sMtWLocal) HOST_STATE_KEEP(sMtWDone) HOST_STATE_KEEP(sMtRSeen) HOST_STATE_KEEP(sMtParked)
 HOST_STATE_KEEP(sMtStarted) HOST_STATE_KEEP(sMtThread) HOST_STATE_KEEP(sMT) HOST_STATE_KEEP(sMtAsync)
 HOST_STATE_KEEP(gClipM) HOST_STATE_KEEP(gVecM) HOST_STATE_KEEP(gTexM)
 extern uint64_t host_plat_time_ns(void);
@@ -1185,7 +1187,7 @@ static void *mt_worker(void *arg) {
 }
 // Game thread: wait until the worker has executed everything queued (or is parked on a swap).
 static inline void mt_publish(void) {
-    if (sMtW != sMtWLocal) __atomic_store_n(&sMtW, sMtWLocal, __ATOMIC_RELEASE);
+    if (sMtW != sMtWDone) __atomic_store_n(&sMtW, sMtWDone, __ATOMIC_RELEASE);
 }
 extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 6 = PH_WAIT
 static void mt_sync(void) {
@@ -1197,24 +1199,35 @@ static void mt_sync(void) {
 static void mt_sync_body(void) {
     int s = 0;
     mt_publish();
-    while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWLocal && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
+    while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWDone && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
+}
+// Make room for `words` more words; 0 = the ring is full behind a pending swap (drop the command, as a full FIFO
+// would).
+static int mt_reserve(u32 words) {
+    u32 w = sMtWLocal;
+    if (w - sMtRSeen + words <= MTQ_N) return 1;
+    int s = 0;
+    unsigned char ph = gHostPhase;
+    mt_publish();
+    gHostPhase = 6;   // ring full: waiting for the worker
+    while (w - (sMtRSeen = __atomic_load_n(&sMtR, __ATOMIC_ACQUIRE)) + words > MTQ_N) {
+        if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) { gHostPhase = ph; return 0; }
+        mt_pause(&s);
+    }
+    gHostPhase = ph;
+    return 1;
+}
+static inline void mt_command_done(int publishNow) {
+    sMtWDone = sMtWLocal;
+    if (publishNow || sMtWDone - sMtW >= MTQ_BATCH) __atomic_store_n(&sMtW, sMtWDone, __ATOMIC_RELEASE);
 }
 static void mt_push(u32 c, const u32 *p, u32 n) {
+    if (!mt_reserve(n + 1)) return;
     u32 w = sMtWLocal;
-    static u32 rSeen;   // last R this thread read: only re-read (touching the worker's cache line) when it looks full
-    if (w - rSeen + n + 1 > MTQ_N) {
-        int s = 0;
-        mt_publish();
-        gHostPhase = 6;   // ring full: waiting for the worker (restored by the caller's phase on return)
-        while (w - (rSeen = __atomic_load_n(&sMtR, __ATOMIC_ACQUIRE)) + n + 1 > MTQ_N) {
-            if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) return;   // full behind a pending swap: drop, as a full FIFO would
-            mt_pause(&s);
-        }
-    }
     sMtQ[w & MTQ_M] = c | n << 8;
     for (u32 i = 0; i < n; i++) sMtQ[(w + 1 + i) & MTQ_M] = p[i];
-    sMtWLocal = w += n + 1;
-    if (w - sMtW >= MTQ_BATCH || c == 0x50) __atomic_store_n(&sMtW, w, __ATOMIC_RELEASE);
+    sMtWLocal = w + n + 1;
+    mt_command_done(c == 0x50);
 }
 static void mt_dispatch(u8 c, const u32 *p, int n) {
     if (c >= 0x10 && c <= 0x1c) {                 // matrix commands: game thread only
@@ -1249,14 +1262,85 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
     }
     mt_push(c, p, (u32)n);
 }
+// Pass-through commands (everything the game thread does not execute itself) are streamed straight into the ring:
+// the header when the command starts, then one store per parameter word, instead of collecting the parameters
+// and copying them again. The command is published only once complete (sMtWDone).
+static u32 sStrLeft;   // parameters still to come for the command being streamed
+static int sStrMode;   // 0: none, 1: streaming into the ring, 2: dropping (ring full behind a pending swap)
+static inline int mt_streamable(u8 c) {
+    return !sMtAsync && ((c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60);
+}
+static void mt_stream_begin(u8 c, u32 n) {
+    if (sMtCvDirty) {   // the worker needs the matrices current before this command (as mt_dispatch does)
+        u32 b[32];
+        update_clip();
+        memcpy(b, sClip.m, sizeof sClip.m);
+        memcpy(b + 16, sVec.m, sizeof sVec.m);
+        mt_push(0xf1, b, 32);
+        sMtCvDirty = 0;
+    }
+    if (sMtTexDirty) { mt_push(0xf2, (const u32 *)sTex.m, 16); sMtTexDirty = 0; }
+    sStrLeft = n;
+    if (!mt_reserve(n + 1)) { sStrMode = 2; return; }
+    sMtQ[sMtWLocal++ & MTQ_M] = c | n << 8;
+    sStrMode = 1;
+}
+static inline __attribute__((always_inline)) void mt_stream_param(u32 param) {
+    if (sStrMode == 1) sMtQ[sMtWLocal++ & MTQ_M] = param;
+    if (--sStrLeft == 0) {
+        if (sStrMode == 1) mt_command_done(0);
+        sStrMode = 0;
+        sExecCmd = -1;
+    }
+}
 static void mt_entry(u8 cmd, u32 param) {
-    if (sExecCmd < 0) { sExecCmd = cmd; sExecCount = 0; }
+    if (sStrMode) { mt_stream_param(param); return; }
+    if (sExecCmd < 0) {
+        int need = kParams[cmd];
+        if (need && mt_streamable(cmd)) {
+            sExecCmd = cmd;
+            mt_stream_begin(cmd, (u32)need);
+            mt_stream_param(param);   // this entry carries the first parameter
+            return;
+        }
+        sExecCmd = cmd;
+        sExecCount = 0;
+    }
     int need = kParams[(u8)sExecCmd];
     if (need) sExecParams[sExecCount++] = param;
     if (sExecCount >= need) {
         u8 c = (u8)sExecCmd;
         sExecCmd = -1;
         mt_dispatch(c, sExecParams, need);
+    }
+}
+
+// Worker mode: the GX FIFO decoder (gxfifo_write/pack_advance) calling mt_entry directly, so the whole per-word
+// path inlines. Same logic: a word with no parameters pending holds up to four packed commands.
+static inline __attribute__((always_inline)) void pack_advance_mt(void) {
+    while (sPackLeft > 0) {
+        u8 c = sPackCmds & 0xff;
+        if (sPackCmds == 0) { sPackLeft = 0; break; }
+        if (kParams[c]) { sPackParamsLeft = kParams[c]; return; }
+        if (c) mt_entry(c, 0);
+        sPackCmds >>= 8;
+        sPackLeft--;
+    }
+    sPackParamsLeft = 0;
+}
+static inline __attribute__((always_inline)) void gxfifo_write_mt(u32 v) {
+    if (sPackParamsLeft == 0) {
+        if (v == 0) { mt_entry(0, 0); return; }
+        sPackCmds = v;
+        sPackLeft = 4;
+        pack_advance_mt();
+    } else {
+        mt_entry(sPackCmds & 0xff, v);
+        if (--sPackParamsLeft == 0) {
+            sPackCmds >>= 8;
+            sPackLeft--;
+            pack_advance_mt();
+        }
     }
 }
 // Called once at start-up, before any command. async: the vblank commit does not wait for the worker.
@@ -1393,6 +1477,7 @@ static void gpu3d_write16_now(uint32_t addr, uint16_t v) {
     else if (addr >= 0x04000400 && addr < 0x04000600) { /* (the host writes these 32-bit) */ }
 }
 void gpu3d_write32(uint32_t addr, uint32_t v) {
+    if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) { gxfifo_write_mt(v); return; }   // worker mode, GX FIFO
     if (addr >= 0x04000400 && addr < 0x04000600 && !sGeomOn) { g3_feature(F_GEOM_OFF_WRITE); return; }
     if (addr >= 0x04000400 && addr < 0x04000440) gxfifo_write(v);
     else if (addr >= 0x04000440 && addr < 0x04000600) {
@@ -1426,6 +1511,14 @@ static u32 gxstat(void) {
     return s;
 }
 
+// A block of words to one GX port (display-list DMA): the per-word loop runs here, fully inlined in worker mode.
+void gpu3d_write_block(uint32_t addr, const uint32_t *src, uint32_t n) {
+    if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) {
+        for (uint32_t i = 0; i < n; i++) gxfifo_write_mt(src[i]);
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) gpu3d_write32(addr, src[i]);
+}
 uint32_t gpu3d_read32(uint32_t addr) {
     if (sMT) { if (addr == 0x04000604) mt_sync(); }
     else drain();

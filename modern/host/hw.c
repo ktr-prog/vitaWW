@@ -466,6 +466,15 @@ static void square_root(void) {
     R32(0x040002b4) = (u32)r;
 }
 
+// The game writes the divider/square-root inputs one register at a time (~5 writes per division, ~270 divisions
+// a frame in the town); computing on every write did a 64-bit division each time (no hardware divide on the
+// Vita's CPU). The result only becomes observable when the status/result registers are read, so compute then.
+static int sDivDirty, sSqrtDirty;
+static inline void lazy_math(u32 w) {
+    if (sDivDirty && (w == 0x04000280 || (w >= 0x040002a0 && w < 0x040002b0))) { sDivDirty = 0; divide(); }
+    if (sSqrtDirty && (w == 0x040002b0 || w == 0x040002b4)) { sSqrtDirty = 0; square_root(); }
+}
+
 static void io_write(u32 a, u32 old);
 
 static uintptr_t sDmaSrc[4], sDmaDst[4];
@@ -498,9 +507,9 @@ static void dma_run_body(int ch) {
         // The common display-list transfer is incrementing source -> fixed GX FIFO destination.
         // Hoist both DMA mode checks out of the per-word loop; keep the generic path for every other mode.
         if (sc == 0 && dc == 2) {
-            u32 fifo = (u32)dst;
-            for (u32 i = 0; i < n; i++, src += 4)
-                gpu3d_write32(fifo, *(volatile u32 *)src);
+            extern void gpu3d_write_block(u32 addr, const u32 *src, u32 n);
+            gpu3d_write_block((u32)dst, (const u32 *)src, n);
+            src += (uintptr_t)n * 4;
         } else if (sc == 0 && (dc == 0 || dc == 3)) {
             u32 fifo = (u32)dst;
             for (u32 i = 0; i < n; i++, src += 4, fifo += 4)
@@ -519,7 +528,7 @@ static void dma_run_body(int ch) {
     for (u32 i = 0; i < n; i++) {
         u32 v;
         if (src == IO1 + 0x10) v = card_read_data();
-        else if (dma_is_io(src)) v = w == 4 ? R32((u32)src) : R16((u32)src);
+        else if (dma_is_io(src)) { lazy_math((u32)src & ~3u); v = w == 4 ? R32((u32)src) : R16((u32)src); }
         else v = w == 4 ? *(volatile u32 *)src : *(volatile u16 *)src;
         if (dma_is_io(dst)) {
             u32 old = R32((u32)dst & ~3u);
@@ -599,6 +608,7 @@ void host_hblank(int line) {
     R16(0x04000006) = vcount;
 }
 static void io_read(u32 a) {
+    lazy_math(a & ~3u);
     if (sHBlankLine >= 0 && (a & ~3u) == 0x04000004) {
         R16(0x04000004) = (u16)((R16(0x04000004) & ~7u) | 2);
         R16(0x04000006) = (u16)sHBlankLine;
@@ -684,8 +694,8 @@ static void io_write(u32 a, u32 old) {
     case 0x04000184: break;
     case 0x04000188: pxi7_receive(R32(w)); break;
     case 0x040001a4: card_control_written(R32(w)); break;
-    case 0x04000280: case 0x04000290: case 0x04000294: case 0x04000298: case 0x0400029c: divide(); break;
-    case 0x040002b0: case 0x040002b8: case 0x040002bc: square_root(); break;
+    case 0x04000280: case 0x04000290: case 0x04000294: case 0x04000298: case 0x0400029c: sDivDirty = 1; break;
+    case 0x040002b0: case 0x040002b8: case 0x040002bc: sSqrtDirty = 1; break;
     default: break;
     }
 }
