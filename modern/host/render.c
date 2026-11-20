@@ -30,6 +30,7 @@ void host_vram_flush(void);
 u32 host_vram_total(void);
 u32 host_vram_bank_offset(int i);
 void host_vram_snapshot(u8 *dst);
+void host_vram_snapshot_live(u8 *dst);
 extern unsigned char gHostPltt[0x800];
 extern unsigned char gHostOam[0x800];
 extern void frontend_frame(void);
@@ -660,9 +661,8 @@ static void render_frame_mt(void) {
     }
 #endif
     render_thread_sync();
-    host_vram_flush();
     if (!sSnapBankMem) sSnapBankMem = malloc(host_vram_total());
-    host_vram_snapshot(sSnapBankMem);
+    host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
     for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
     memcpy(sSnapPal, gHostPltt, sizeof sSnapPal);
     memcpy(sSnapOam, gHostOam, sizeof sSnapOam);

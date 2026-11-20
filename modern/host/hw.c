@@ -800,6 +800,12 @@ unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long
         gpu3d_write32(a, (u32)v);   // GX FIFO/command ports are write-only to the game; skip the host_io store too
         return v;
     }
+    if (size == 8 && a >= 0x04000400 && a + 8 <= 0x04000600) {   // the game stores GX words in pairs as often
+        sGxWrites += 2;
+        gpu3d_write32(a, (u32)v);
+        gpu3d_write32(a + 4, (u32)(v >> 32));
+        return v;
+    }
     int traced = sHBlankLine < 0;
     if (traced) io_note(addr, 1, __builtin_return_address(0));
     if (traced && sIoTrace > 0) io_trace_value(a, 1, v);

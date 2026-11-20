@@ -1308,7 +1308,16 @@ static void do_swap(void) {
         if (r->manualSort && p->translucent) p->sortKey = 1u << 21;
         r->poly[i] = p;
     }
-    qsort(r->poly, (size_t)sNumPolys, sizeof r->poly[0], cmp_poly);
+    if (gG3ClipSpaceOut) {
+        // GL renderer: every sortKey is 0 (opaque) or 1 << 21 (translucent), so sorting by (sortKey, index) is a
+        // stable partition - opaque polygons, then translucent ones, each in submission order. One linear pass.
+        int n = 0;
+        for (int i = 0; i < sNumPolys; i++)
+            if (!sPolyRam[sBank][i].sortKey) r->poly[n++] = &sPolyRam[sBank][i];
+        for (int i = 0; i < sNumPolys; i++)
+            if (sPolyRam[sBank][i].sortKey) r->poly[n++] = &sPolyRam[sBank][i];
+    } else
+        qsort(r->poly, (size_t)sNumPolys, sizeof r->poly[0], cmp_poly);
     r->dispcnt = sDispCnt;
     r->clearColor = sRegs[(0x350 - 0x320) / 2];
     r->clearAttrHi = sRegs[(0x352 - 0x320) / 2];

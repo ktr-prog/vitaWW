@@ -28,6 +28,7 @@ u32 host_vram_total(void) { return BANK_TOTAL; }
 u32 host_vram_bank_offset(int i) { return sOffset[i]; }
 void host_vram_snapshot(u8 *dst) { memcpy(dst, sBanks, BANK_TOTAL); }
 
+
 static const struct { u32 base, size, align; } kWindows[] = {
     {0x06000000, 0x80000, 0x80000},
     {0x06200000, 0x20000, 0x20000},
@@ -87,6 +88,22 @@ static u32 bank_address(int i, u8 c) {
     return 0;
 }
 
+// host_vram_flush() + host_vram_snapshot() in one pass: mapped granules are copied from their windows (the live
+// data), the rest from bank storage. Bank storage itself is left as is (readers of it flush first).
+void host_vram_snapshot_live(u8 *dst) {
+    static u8 covered[BANK_TOTAL / GRANULE];
+    memset(covered, 0, sizeof covered);
+    for (int g = 0; g < NGRAN; g++)
+        if (sGran[g].bank >= 0) {
+            u32 o = sOffset[sGran[g].bank] + sGran[g].off;
+            memcpy(dst + o, sGran[g].win, GRANULE);
+            covered[o / GRANULE] = 1;
+        }
+    for (u32 o = 0; o < BANK_TOTAL; o += GRANULE)
+        if (!covered[o / GRANULE]) memcpy(dst + o, sBanks + o, GRANULE);
+}
+
+static void remap_full(void);
 static int granule(u32 a) {
     int g = 0;
     for (unsigned w = 0; w < NWIN; w++) {
@@ -101,7 +118,38 @@ void host_vram_flush(void) {
         if (sGran[g].bank >= 0) memcpy(sBanks + sOffset[sGran[g].bank] + sGran[g].off, sGran[g].win, GRANULE);
 }
 
+// Bank control changed: rebuild the granule map and move data only for granules whose mapping changed (save the
+// window to its old bank, then load it from the new bank or clear it). Granules that keep their mapping keep their
+// live window data; bank storage for them is brought up to date by host_vram_flush(), which every reader of bank
+// storage calls first. The game remaps banks several times per frame to upload textures, and copying/clearing all
+// 1.6 MB of windows each time was a quarter of the game thread.
 static void remap(void) {
+    static int inited;
+    if (!inited) { inited = 1; remap_full(); return; }
+    static struct { s32 bank; u32 off; } old[NGRAN];
+    for (int g = 0; g < NGRAN; g++) { old[g].bank = sGran[g].bank; old[g].off = sGran[g].off; sGran[g].bank = -1; }
+    for (int i = 0; i < 9; i++) {
+        u32 a = bank_address(i, sCnt[i]);
+        if (!a) continue;
+        for (u32 off = 0; off < kSize[i]; off += GRANULE) {
+            int g = granule(a + off);
+            if (g < 0) { fprintf(stderr, "vram: bank %c at %08x outside the windows\n", 'A' + i, a + off); continue; }
+            sGran[g].bank = i;
+            sGran[g].off = off;
+        }
+    }
+#define CHANGED(g) (old[g].bank != sGran[g].bank || (sGran[g].bank >= 0 && old[g].off != sGran[g].off))
+    for (int g = 0; g < NGRAN; g++)   // all saves before any load: a bank can move to other granules
+        if (CHANGED(g) && old[g].bank >= 0) memcpy(sBanks + sOffset[old[g].bank] + old[g].off, sGran[g].win, GRANULE);
+    for (int g = 0; g < NGRAN; g++) {
+        if (!CHANGED(g)) continue;
+        if (sGran[g].bank >= 0) memcpy(sGran[g].win, sBanks + sOffset[sGran[g].bank] + sGran[g].off, GRANULE);
+        else memset(sGran[g].win, 0, GRANULE);
+    }
+#undef CHANGED
+}
+
+static void remap_full(void) {
     host_vram_flush();
     for (int g = 0; g < NGRAN; g++) sGran[g].bank = -1;
     for (int i = 0; i < 9; i++) {
