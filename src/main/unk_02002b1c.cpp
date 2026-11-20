@@ -172,8 +172,8 @@ void *Actor::spawn(u32 profile, u32 param, void *pos, void *angle, void *parent)
 void Actor::setCullParams(s32 a, s32 b, s32 c) {
     cullHeight = a;
     cullRadius = b;
-#ifdef HOST
-    cullDepth = c * 2;
+#if defined(HOST) && !HOST_VITA
+    cullDepth = c * 2;   // tall view: actors stay drawn further out (the Vita shows one DS screen: game default)
 #else
     cullDepth = c;
 #endif

@@ -29,20 +29,27 @@ static const u8 *sPal[8][3];
 static int sNPal[8];
 static const u32 kBankSize[9] = {0x20000, 0x20000, 0x20000, 0x20000, 0x10000, 0x4000, 0x4000, 0x8000, 0x4000};
 
-static u8 sImgFlat[4 * IMG_SLOT];
-static u8 sPalFlat[8 * PAL_SLOT];
+static u8 sImgFlat[4 * IMG_SLOT] __attribute__((aligned(16)));
+static u8 sPalFlat[8 * PAL_SLOT] __attribute__((aligned(16)));
 static u8 sImgWasActive[4], sPalWasActive[8];
 
 // Changed 1 KB blocks of sImgFlat/sPalFlat since the previous g3_tex_setup (for the GL texture cache).
 enum { G3_TEX_BLK = 1024 };
 u8 gG3TexDirtyImg[4 * IMG_SLOT / G3_TEX_BLK], gG3TexDirtyPal[8 * PAL_SLOT / G3_TEX_BLK];
-static u8 sTexMerge[IMG_SLOT];
+static u8 sTexMerge[IMG_SLOT] __attribute__((aligned(16)));
 
 // Bring d (n bytes) up to date with src block by block: compare, copy only changed blocks, flag them. Most frames
 // only a few blocks of texture VRAM change, so this reads the data once instead of copying all of it every frame.
+// Word-wise block compare (vectorizes to NEON); the Vita C library's memcmp is far slower on 640 KB per frame.
+static int g3_blk_differs(const u8 *a, const u8 *b) {
+    const u32 *x = (const u32 *)a, *y = (const u32 *)b;
+    u32 acc = 0;
+    for (int i = 0; i < G3_TEX_BLK / 4; i++) acc |= x[i] ^ y[i];
+    return acc != 0;
+}
 static void g3_tex_sync(u8 *d, const u8 *src, u32 n, u8 *dirty) {
     for (u32 o = 0, b = 0; o < n; o += G3_TEX_BLK, b++)
-        if (memcmp(d + o, src + o, G3_TEX_BLK)) {
+        if (g3_blk_differs(d + o, src + o)) {
             memcpy(d + o, src + o, G3_TEX_BLK);
             dirty[b] = 1;
         }

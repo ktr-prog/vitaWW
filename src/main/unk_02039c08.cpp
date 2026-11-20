@@ -41,8 +41,8 @@ void ViewFrustum::calcPlanes() {
     v[9] = x;
     v[10] = -y;
     v[11] = -nearClip;
-#ifdef HOST
-    v[4] = y * 3;
+#if defined(HOST) && !HOST_VITA
+    v[4] = y * 3;   // tall view: keep objects above the DS view (the Vita shows one DS screen: game default)
     v[7] = y * 3;
 #endif
     VEC_CrossProduct(&v[3], &v[0], &leftPlane[0]);

@@ -124,10 +124,10 @@ void render_init(void) {
         // GX command processing on its own core. Off for the comparison/self-test harnesses, which single-step
         // the pipeline; ACWW_GXMT=0 turns it off, ACWW_GX_ASYNC picks the pipelined commit (the Vita default).
         int on = sOwn3d && !sCompare && !sMelon && !(getenv("ACWW_GXMT") && !atoi(getenv("ACWW_GXMT")));
+        // Synchronous commit everywhere by default: the geometry committed at a vblank is the frame the game just
+        // finished, paired with the texture/palette VRAM snapshotted at the same vblank. The pipelined commit
+        // (ACWW_GX_ASYNC=1) can draw one frame's polygons with the next frame's palettes (wrong colours).
         int async = 0;
-#if HOST_VITA
-        async = 1;
-#endif
         if (getenv("ACWW_GX_ASYNC")) async = atoi(getenv("ACWW_GX_ASYNC"));
         gpu3d_mt_enable(on, async);
     }
@@ -153,10 +153,9 @@ void render_init(void) {
 #else
     sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // host validation only
 #endif
-    sFrameSkip = sRenderThreadOn && !env_is("ACWW_FRAMESKIP", "0");
-#if !HOST_VITA
+    // Frameskip is opt-in (ACWW_FRAMESKIP=1): a skipped vblank leaves its geometry uncommitted, so the next drawn
+    // frame pairs older polygons with newer texture/palette VRAM.
     sFrameSkip = sRenderThreadOn && getenv("ACWW_FRAMESKIP") && atoi(getenv("ACWW_FRAMESKIP"));
-#endif
     if (sRenderThreadOn) fprintf(stderr, "render: render thread active (overlaps 2D bands + 3D with the next frame's CPU)\n");
 }
 
