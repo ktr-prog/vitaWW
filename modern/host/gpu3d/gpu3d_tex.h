@@ -24,6 +24,8 @@ static void g3_tex_or(u8 *dst, const u8 *src, u32 n) {
     for (; i < n; i++) dst[i] |= src[i];
 }
 static const u8 *sImg[4][4];
+static s32 sImgSrc[4][4], sPalSrc[8][3];   // bank << 20 | byte offset in the bank, per source
+static s32 sImgLast[4] = {-1, -1, -1, -1}, sPalLast[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
 static int sNImg[4];
 static const u8 *sPal[8][3];
 static int sNPal[8];
@@ -55,14 +57,29 @@ static void g3_tex_sync(u8 *d, const u8 *src, u32 n, u8 *dirty) {
         }
 }
 // One texture or palette slot: zero when no bank maps it, the bank itself, or the OR of several banks.
-static void g3_tex_slot(u8 *d, const u8 *const *src, int nsrc, u32 n, u8 *wasActive, u8 *dirty) {
+// srcId/last: which bank and offset feeds the slot now and fed it last time. When a single bank keeps feeding the
+// slot and the snapshot reported its changed blocks, only those blocks are copied (no compare pass).
+static void g3_tex_slot(u8 *d, const u8 *const *src, const s32 *srcId, int nsrc, u32 n, u8 *wasActive, s32 *last,
+                        u8 *dirty) {
     if (!nsrc) {
         if (*wasActive) { memset(d, 0, n); memset(dirty, 1, n / G3_TEX_BLK); }
         *wasActive = 0;
+        *last = -1;
         return;
     }
     *wasActive = 1;
-    if (nsrc == 1) { g3_tex_sync(d, src[0], n, dirty); return; }
+    if (nsrc == 1) {
+        const u8 *bd = gG3BankDirtyFrame ? gG3BankDirtyFrame[srcId[0] >> 20] : 0;
+        if (bd && *last == srcId[0]) {
+            const u8 *f = bd + (srcId[0] & 0xfffff) / G3_TEX_BLK;
+            for (u32 o = 0, b = 0; o < n; o += G3_TEX_BLK, b++)
+                if (f[b]) { memcpy(d + o, src[0] + o, G3_TEX_BLK); dirty[b] = 1; }
+        } else
+            g3_tex_sync(d, src[0], n, dirty);
+        *last = srcId[0];
+        return;
+    }
+    *last = -1;
     memcpy(sTexMerge, src[0], n);
     for (int i = 1; i < nsrc; i++) g3_tex_or(sTexMerge, src[i], n);
     g3_tex_sync(d, sTexMerge, n, dirty);
@@ -76,21 +93,21 @@ static void g3_tex_setup(void) {
             u8 c = gG3VramCntFrame[b];
             if (!(c & 0x80) || (c & 7) != 3 || !gG3Banks[b]) continue;
             int ofs = c >> 3 & 3;
-            if (b < 4) sImg[ofs][sNImg[ofs]++] = gG3Banks[b];
+            if (b < 4) { sImgSrc[ofs][sNImg[ofs]] = b << 20; sImg[ofs][sNImg[ofs]++] = gG3Banks[b]; }
             else if (b == 4)
-                for (int s = 0; s < 4; s++) sPal[s][sNPal[s]++] = gG3Banks[b] + s * PAL_SLOT;
+                for (int s = 0; s < 4; s++) { sPalSrc[s][sNPal[s]] = b << 20 | s * PAL_SLOT; sPal[s][sNPal[s]++] = gG3Banks[b] + s * PAL_SLOT; }
             else {
                 int s = (ofs & 1) + (ofs >> 1) * 4;
-                sPal[s][sNPal[s]++] = gG3Banks[b];
+                sPalSrc[s][sNPal[s]] = b << 20; sPal[s][sNPal[s]++] = gG3Banks[b];
             }
         }
     memset(gG3TexDirtyImg, 0, sizeof gG3TexDirtyImg);
     memset(gG3TexDirtyPal, 0, sizeof gG3TexDirtyPal);
     for (int s = 0; s < 4; s++)
-        g3_tex_slot(sImgFlat + s * IMG_SLOT, sImg[s], sNImg[s], IMG_SLOT, &sImgWasActive[s],
+        g3_tex_slot(sImgFlat + s * IMG_SLOT, sImg[s], sImgSrc[s], sNImg[s], IMG_SLOT, &sImgWasActive[s], &sImgLast[s],
                     gG3TexDirtyImg + s * (IMG_SLOT / G3_TEX_BLK));
     for (int s = 0; s < 8; s++)
-        g3_tex_slot(sPalFlat + s * PAL_SLOT, sPal[s], sNPal[s], PAL_SLOT, &sPalWasActive[s],
+        g3_tex_slot(sPalFlat + s * PAL_SLOT, sPal[s], sPalSrc[s], sNPal[s], PAL_SLOT, &sPalWasActive[s], &sPalLast[s],
                     gG3TexDirtyPal + s * (PAL_SLOT / G3_TEX_BLK));
     (void)kBankSize;
 }

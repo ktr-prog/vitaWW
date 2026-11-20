@@ -106,6 +106,7 @@ static void trampoline(void *key) {
     OSContext *c = key;
     HostCtx *h = ctx_of(key);
     void (*f)(void *) = (void (*)(void *))h->pc;
+    gHostPhase = PH_GAME;   // a new game thread starts in game code (phase sampler)
     f((void *)c->r[0]);
     ((void (*)(void))c->r[14])();
     host_fatal("thread returned past its exit function");
@@ -136,7 +137,9 @@ void OS_LoadContext(void *t) {
         sSaving = 0;
         cur->irq = sIrqDisabled;
         sIrqDisabled = next->irq;
+        unsigned char ph = gHostPhase;   // each game thread keeps its own phase across switches (phase sampler)
         host_coro_switch(&cur->sp, next->sp);
+        gHostPhase = ph;
         return;
     }
     static void *discarded;

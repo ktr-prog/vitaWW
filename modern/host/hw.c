@@ -83,8 +83,13 @@ static unsigned long long sPhaseCount[HOST_PHASES];
 static void *phase_sampler(void *arg) {
     (void)arg;
 #if HOST_VITA
+    // On the game thread's core at a higher priority, so each wake-up interrupts the game thread like a profiler
+    // tick (on the busy worker cores it only got to run when they went idle, which biased the samples).
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
-    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);
+    extern int sceKernelChangeThreadPriority(int, int);
+    extern int sceKernelGetThreadId(void);
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), 0x10000);
+    sceKernelChangeThreadPriority(sceKernelGetThreadId(), 96);
 #endif
     for (;;) {
         __atomic_fetch_add(&sPhaseCount[gHostPhase % HOST_PHASES], 1, __ATOMIC_RELAXED);
@@ -107,10 +112,11 @@ static void phase_report(void) {
     for (int i = 0; i < HOST_PHASES; i++) { c[i] = __atomic_exchange_n(&sPhaseCount[i], 0, __ATOMIC_RELAXED); tot += c[i]; }
     if (!tot) return;
 #define PCT(i) (unsigned)(c[i] * 100 / tot)
-    fprintf(stderr, "game thread (sampled, %% of wall time): game code %u, GX writes %u, other I/O %u, VRAM remap %u, "
-            "audio %u, render hand-off %u, waiting %u, pacing sleep %u, frontend %u\n",
+    fprintf(stderr, "game thread (%llu samples, %% of wall time): game code %u, GX writes %u, other I/O %u, VRAM remap %u, "
+            "audio %u, render hand-off %u, waiting %u, pacing sleep %u, frontend %u\n", tot,
             PCT(PH_GAME), PCT(PH_GX), PCT(PH_IO), PCT(PH_VRAM), PCT(PH_AUDIO), PCT(PH_RENDER), PCT(PH_WAIT),
             PCT(PH_PACE), PCT(PH_FRONTEND));
+    (void)0;
 #undef PCT
 }
 static int sFast = -1;

@@ -17,6 +17,9 @@ static u16 sRegs[0xa0 / 2];
 static u16 sDot1Depth = 0x7fff;
 u8 gG3VramCnt[9];
 u8 gG3VramCntFrame[9];
+const uint8_t *const *gG3BankDirtyFrame;
+static const uint8_t *const *sBankDirtyNext;
+void gpu3d_set_bank_dirty(const uint8_t *const dirty[9]) { sBankDirtyNext = dirty; }
 
 typedef struct { s32 m[16]; } Mtx;
 static int sMtxMode;
@@ -1451,6 +1454,8 @@ uint32_t gpu3d_read32(uint32_t addr) {
 void gpu3d_commit(const uint8_t *const bank[9]) {
     gG3Banks = bank;
     memcpy(gG3VramCntFrame, gG3VramCnt, sizeof gG3VramCntFrame);   // pairs with the bank snapshot
+    gG3BankDirtyFrame = sBankDirtyNext;   // dirty flags belong to this snapshot only
+    sBankDirtyNext = 0;
     sFrame++;
     sVtxPipe = sNrmPipe = sPolyPipe = sSlotCtr = 0;
     sSlots = 1;

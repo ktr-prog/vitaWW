@@ -90,18 +90,42 @@ static u32 bank_address(int i, u8 c) {
 
 // host_vram_flush() + host_vram_snapshot() in one pass: mapped granules are copied from their windows (the live
 // data), the rest from bank storage. Bank storage itself is left as is (readers of it flush first).
+//
+// dst is expected to hold the previous snapshot: each 1 KB block is compared and copied only when it changed, and
+// host_vram_snapshot_dirty() reports which blocks changed (the texture setup then copies only those). The first
+// snapshot into a new dst copies and flags everything.
+enum { SNAP_BLK = 1024 };
+static u8 sSnapDirty[BANK_TOTAL / SNAP_BLK];
+static const u8 *sSnapDst;
+static int snap_blk_differs(const u8 *a, const u8 *b) {
+    const u32 *x = (const u32 *)a, *y = (const u32 *)b;
+    u32 acc = 0;
+    for (int i = 0; i < SNAP_BLK / 4; i++) acc |= x[i] ^ y[i];
+    return acc != 0;
+}
+static void snap_granule(u8 *dst, const u8 *src, u32 o, int full) {
+    for (u32 k = 0; k < GRANULE; k += SNAP_BLK) {
+        int d = full || snap_blk_differs(dst + o + k, src + k);
+        if (d) memcpy(dst + o + k, src + k, SNAP_BLK);
+        sSnapDirty[(o + k) / SNAP_BLK] = (u8)d;
+    }
+}
 void host_vram_snapshot_live(u8 *dst) {
     static u8 covered[BANK_TOTAL / GRANULE];
+    int full = dst != sSnapDst;
+    sSnapDst = dst;
     memset(covered, 0, sizeof covered);
     for (int g = 0; g < NGRAN; g++)
         if (sGran[g].bank >= 0) {
             u32 o = sOffset[sGran[g].bank] + sGran[g].off;
-            memcpy(dst + o, sGran[g].win, GRANULE);
+            snap_granule(dst, sGran[g].win, o, full);
             covered[o / GRANULE] = 1;
         }
     for (u32 o = 0; o < BANK_TOTAL; o += GRANULE)
-        if (!covered[o / GRANULE]) memcpy(dst + o, sBanks + o, GRANULE);
+        if (!covered[o / GRANULE]) snap_granule(dst, sBanks + o, o, full);
 }
+// Changed 1 KB blocks of the last host_vram_snapshot_live(), indexed by bank-block offset / 1024.
+const u8 *host_vram_snapshot_dirty(void) { return sSnapDirty; }
 
 static void remap_full(void);
 static int granule(u32 a) {

@@ -10,6 +10,8 @@ extern "C" {
 #endif
 
 void gpu3d_reset(void);
+// Before gpu3d_commit(): per bank, the 1 KB blocks that changed since the previous commit (NULL: unknown).
+void gpu3d_set_bank_dirty(const uint8_t *const dirty[9]);
 void gpu3d_mt_enable(int on, int async);     // run GX command processing on a worker thread
 unsigned long long gpu3d_mt_busy_ns(void);  // worker busy time since the last call
 void gpu3d_write8(uint32_t addr, uint8_t value);

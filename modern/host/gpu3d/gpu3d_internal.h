@@ -67,6 +67,7 @@ typedef struct G3RenderState {
 extern G3RenderState gG3Render;
 extern const uint8_t *const *gG3Banks;
 extern u8 gG3VramCnt[9];
+extern const uint8_t *const *gG3BankDirtyFrame;   // gpu3d_set_bank_dirty() as of the last commit, or NULL
 extern u8 gG3VramCntFrame[9];   // VRAMCNT as of the last commit: what the renderer uses (the live copy changes
                                 // while the game uploads textures, possibly while the render thread runs)
 

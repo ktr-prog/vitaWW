@@ -561,6 +561,7 @@ static int sRenderFrames;
 // the committed 3D, then paces + presents. All GPU/GL work lives here so the GL context stays on one thread.
 static uint64_t sWorkerNs;
 static uint64_t sWBandsNs, sWPresentNs;
+static uint64_t sHoWaitRtNs, sHoSnapNs, sHoCommitNs;   // game-thread hand-off split
 // --- FPS overlay (Vita, while testing; ACWW_FPS=0 hides it) ---------------------------------------------------------
 // Top-left: frames shown per second, and game speed (DS frames run per second / 60, so 100% = full speed).
 static unsigned sVblankCount;   // DS frames run (render_frame calls, game thread)
@@ -709,7 +710,9 @@ static void render_frame_mt(void) {
         if (!pinned) { pinned = 1; sceKernelChangeThreadCpuAffinityMask(0, 0x10000); }
     }
 #endif
+    uint64_t h0 = host_plat_time_ns();
     render_thread_sync();
+    uint64_t h1 = host_plat_time_ns();
     if (!sSnapBankMem) sSnapBankMem = malloc(host_vram_total());
     host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
     for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
@@ -728,6 +731,8 @@ static void render_frame_mt(void) {
     in->defer3d = 0;
     in->gpu = 0;
     uint64_t t2d = host_plat_time_ns();
+    sHoSnapNs += t2d - h1;
+    sHoWaitRtNs += h1 - h0;
     gpu2d_set_defer_bands(1);
     gpu2d_render_frame(in);                 // main-thread prepass only (bands deferred to the worker)
     sRender2dNs += host_plat_time_ns() - t2d;
@@ -735,10 +740,20 @@ static void render_frame_mt(void) {
         extern int gHostCanvasRows;
         int aBottom = gpu2d_main_on_bottom();
         int above = gHostCanvasRows - (aBottom ? 192 : 384);
-        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0 && !(getenv("ACWW_SINGLE") && atoi(getenv("ACWW_SINGLE")) == 0),
-                       above);
+        static int single = -1;
+        if (single < 0) single = !(getenv("ACWW_SINGLE") && atoi(getenv("ACWW_SINGLE")) == 0);
+        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0 && single, above);
     }
+    {
+        extern const u8 *host_vram_snapshot_dirty(void);
+        static const u8 *dirty[9];
+        const u8 *d = host_vram_snapshot_dirty();
+        for (int i = 0; i < 9; i++) dirty[i] = d + host_vram_bank_offset(i) / 1024;
+        gpu3d_set_bank_dirty(dirty);         // changed 1 KB blocks of each snapshot bank (for the texture setup)
+    }
+    uint64_t c0 = host_plat_time_ns();
     gpu3d_commit(sSnapBank);                // swap geometry + bind snapshot texture banks (no rasterization)
+    sHoCommitNs += host_plat_time_ns() - c0;
     render_worker_kick();
     if (++sRenderFrames >= 60) {
         extern unsigned long long gpu3d_mt_skipped(void);
@@ -759,6 +774,11 @@ static void render_frame_mt(void) {
             const char *g3 = "";
 #endif
             fprintf(stderr, "render thread split (avg/drawn frame): 2d bands %llu us, present %llu us%s\n", bands, pres, g3);
+            fprintf(stderr, "game thread hand-off split (avg/frame): wait for render thread %llu us, VRAM snapshot %llu us,"
+                    " 2d prepass %llu us, geometry commit (incl. wait for GX worker) %llu us\n",
+                    (unsigned long long)(sHoWaitRtNs / 60000), (unsigned long long)(sHoSnapNs / 60000),
+                    (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sHoCommitNs / 60000));
+            sHoWaitRtNs = sHoSnapNs = sHoCommitNs = 0;
         }
         sRenderSkipped = 0;
         sRender2dNs = sRender3dNs = 0;
