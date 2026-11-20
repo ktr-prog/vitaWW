@@ -560,9 +560,11 @@ static int sRenderFrames;
 // The worker's half of a frame: pure compute over the snapshot (no game code). Produces the 2D canvas, rasterizes
 // the committed 3D, then paces + presents. All GPU/GL work lives here so the GL context stays on one thread.
 static uint64_t sWorkerNs;
+static uint64_t sWBandsNs, sWPresentNs;   // render-thread split: 2D bands / present (3D is sRender3dNs)
 static void render_worker_phase(void) {
     uint64_t tw = host_plat_time_ns();
     gpu2d_render_finish();                 // 2D bands + canvas from the per-line/VRAM snapshots
+    __atomic_fetch_add(&sWBandsNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
     if (sGpu3d) {
         uint64_t t3d = host_plat_time_ns();
         gpu3d_render_committed();
@@ -572,11 +574,13 @@ static void render_worker_phase(void) {
     // polling, UI) is a coroutine on the main thread's stack and keeps running there every DS frame.
 #if HOST_VITA
     {
+        uint64_t tp = host_plat_time_ns();
         extern const uint32_t *gpu2d_canvas(int *rows);
         extern void vita_gl_present_canvas(const void *, int, int, int, int, int, int);
         int rows = 0;
         const uint32_t *c = gpu2d_canvas(&rows);
         if (c && rows >= 192 && rows <= 640) vita_gl_present_canvas(c, 256, rows, 0, 0, 256, rows);
+        __atomic_fetch_add(&sWPresentNs, host_plat_time_ns() - tp, __ATOMIC_RELAXED);
     }
 #endif
     { static int lag = -1; if (lag < 0) lag = getenv("ACWW_RT_LAG") ? atoi(getenv("ACWW_RT_LAG")) : 0; if (lag) usleep(lag * 1000); }   // stress knob
@@ -696,6 +700,18 @@ static void render_frame_mt(void) {
                 (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sRender3dNs / 60000),
                 (unsigned long long)(__atomic_exchange_n(&sWorkerNs, 0, __ATOMIC_RELAXED) / 60000),
                 sRenderSkipped, gpu3d_mt_skipped());
+        {
+            unsigned long long bands = __atomic_exchange_n(&sWBandsNs, 0, __ATOMIC_RELAXED) / 60000;
+            unsigned long long pres = __atomic_exchange_n(&sWPresentNs, 0, __ATOMIC_RELAXED) / 60000;
+#if HOST_VITA
+            extern unsigned long long vita_gl3d_stats(char *buf, int n);
+            char g3[160];
+            vita_gl3d_stats(g3, sizeof g3);
+#else
+            const char *g3 = "";
+#endif
+            fprintf(stderr, "render thread split (avg/drawn frame): 2d bands %llu us, present %llu us%s\n", bands, pres, g3);
+        }
         sRenderSkipped = 0;
         sRender2dNs = sRender3dNs = 0;
         sRenderFrames = 0;

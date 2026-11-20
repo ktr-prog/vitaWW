@@ -33,6 +33,34 @@ static u8 sImgFlat[4 * IMG_SLOT];
 static u8 sPalFlat[8 * PAL_SLOT];
 static u8 sImgWasActive[4], sPalWasActive[8];
 
+// Changed 1 KB blocks of sImgFlat/sPalFlat since the previous g3_tex_setup (for the GL texture cache).
+enum { G3_TEX_BLK = 1024 };
+u8 gG3TexDirtyImg[4 * IMG_SLOT / G3_TEX_BLK], gG3TexDirtyPal[8 * PAL_SLOT / G3_TEX_BLK];
+static u8 sTexMerge[IMG_SLOT];
+
+// Bring d (n bytes) up to date with src block by block: compare, copy only changed blocks, flag them. Most frames
+// only a few blocks of texture VRAM change, so this reads the data once instead of copying all of it every frame.
+static void g3_tex_sync(u8 *d, const u8 *src, u32 n, u8 *dirty) {
+    for (u32 o = 0, b = 0; o < n; o += G3_TEX_BLK, b++)
+        if (memcmp(d + o, src + o, G3_TEX_BLK)) {
+            memcpy(d + o, src + o, G3_TEX_BLK);
+            dirty[b] = 1;
+        }
+}
+// One texture or palette slot: zero when no bank maps it, the bank itself, or the OR of several banks.
+static void g3_tex_slot(u8 *d, const u8 *const *src, int nsrc, u32 n, u8 *wasActive, u8 *dirty) {
+    if (!nsrc) {
+        if (*wasActive) { memset(d, 0, n); memset(dirty, 1, n / G3_TEX_BLK); }
+        *wasActive = 0;
+        return;
+    }
+    *wasActive = 1;
+    if (nsrc == 1) { g3_tex_sync(d, src[0], n, dirty); return; }
+    memcpy(sTexMerge, src[0], n);
+    for (int i = 1; i < nsrc; i++) g3_tex_or(sTexMerge, src[i], n);
+    g3_tex_sync(d, sTexMerge, n, dirty);
+}
+
 static void g3_tex_setup(void) {
     memset(sNImg, 0, sizeof sNImg);
     memset(sNPal, 0, sizeof sNPal);
@@ -49,28 +77,14 @@ static void g3_tex_setup(void) {
                 sPal[s][sNPal[s]++] = gG3Banks[b];
             }
         }
-    for (int s = 0; s < 4; s++) {
-        u8 *d = sImgFlat + s * IMG_SLOT;
-        if (!sNImg[s]) {
-            if (sImgWasActive[s]) memset(d, 0, IMG_SLOT);
-            sImgWasActive[s] = 0;
-            continue;
-        }
-        sImgWasActive[s] = 1;
-        memcpy(d, sImg[s][0], IMG_SLOT);
-        for (int i = 1; i < sNImg[s]; i++) g3_tex_or(d, sImg[s][i], IMG_SLOT);
-    }
-    for (int s = 0; s < 8; s++) {
-        u8 *d = sPalFlat + s * PAL_SLOT;
-        if (!sNPal[s]) {
-            if (sPalWasActive[s]) memset(d, 0, PAL_SLOT);
-            sPalWasActive[s] = 0;
-            continue;
-        }
-        sPalWasActive[s] = 1;
-        memcpy(d, sPal[s][0], PAL_SLOT);
-        for (int i = 1; i < sNPal[s]; i++) g3_tex_or(d, sPal[s][i], PAL_SLOT);
-    }
+    memset(gG3TexDirtyImg, 0, sizeof gG3TexDirtyImg);
+    memset(gG3TexDirtyPal, 0, sizeof gG3TexDirtyPal);
+    for (int s = 0; s < 4; s++)
+        g3_tex_slot(sImgFlat + s * IMG_SLOT, sImg[s], sNImg[s], IMG_SLOT, &sImgWasActive[s],
+                    gG3TexDirtyImg + s * (IMG_SLOT / G3_TEX_BLK));
+    for (int s = 0; s < 8; s++)
+        g3_tex_slot(sPalFlat + s * PAL_SLOT, sPal[s], sNPal[s], PAL_SLOT, &sPalWasActive[s],
+                    gG3TexDirtyPal + s * (PAL_SLOT / G3_TEX_BLK));
     (void)kBankSize;
 }
 

@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
@@ -724,7 +725,9 @@ static void submit_polygon(void) {
         return;
     }
     G3Polygon *poly = &sPolyRam[sBank][sNumPolys];
-    memset(poly, 0, sizeof *poly);
+    // The GL renderer (gG3ClipSpaceOut) never reads orig[]/glMtx (debug dumps / GPU-transform only): leave those
+    // ~900 bytes alone instead of clearing and refilling them for every polygon.
+    memset(poly, 0, gG3ClipSpaceOut ? offsetof(G3Polygon, orig) : sizeof *poly);
     poly->index = sNumPolys;
     G3Vertex *ram = sVertexRam[sBank];
     if (phantom) {
@@ -783,8 +786,11 @@ static void submit_polygon(void) {
 
     poly->wbuffer = (u8)(sFlushParam >> 1 & 1);
     poly_screen(poly, n);
-    poly->norig = phantom ? 0 : nv;
-    memcpy(poly->orig, v, sizeof(G3Vertex) * nv);
+    if (gG3ClipSpaceOut) poly->norig = 0;
+    else {
+        poly->norig = phantom ? 0 : nv;
+        memcpy(poly->orig, v, sizeof(G3Vertex) * nv);
+    }
     poly->yofs = (s16)sScreenYofs;
     if (!(attr & (1u << 13))) {
         int dot1 = 1;

@@ -323,6 +323,84 @@ int gpu2d_tall_3d_ok(void) {
 }
 int gpu2d_main_on_bottom(void) { return 1; }
 
+// Engine-0 compose for the main-screen-only path (the Vita): no dual-screen bookkeeping, no deferred 3D, no
+// diagnostics. Same result as the general loop in compose_line, organised layer-major: each layer is walked once
+// over the line from back to front, and a hit pushes the current top down to second, so after all layers the top
+// two are the first two opaque layers in front-to-back order - what the general loop finds per pixel. Then one
+// pass blends. This replaces a per-pixel walk over the layer list with a type dispatch on every entry.
+static int g2dFast = -1;   // ACWW_2DFAST=0: use the general loop (A/B check)
+
+static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const u8 *mask, const u8 *order, int layers,
+                              int has3d, s32 hofs3d, const u32 *line3d, u32 backdrop, u32 effect, u32 first,
+                              u32 second, u32 eva, u32 evb, u32 evy, u32 *dst, u32 *effectsUsed) {
+    enum { OBJ_ORDER = 4 + 4, L3D = 0x80 };   // L3D: flag on a layer id = the 3D layer (BG0)
+    // top / second candidates. The second slot starts as what the general loop uses when fewer than two layers
+    // are found: none found -> backdrop colour with LAYER_NONE; one found -> the backdrop (pushed down from top).
+    u32 tc[SCREEN_W], sc[SCREEN_W];
+    u8 tl[SCREEN_W], sl[SCREEN_W], ta[SCREEN_W];
+    for (int x = 0; x < SCREEN_W; x++) { tc[x] = sc[x] = backdrop; tl[x] = LAYER_BACKDROP; sl[x] = LAYER_NONE; }
+    u32 objPrio = 0;   // sprite priorities that have a visible pixel on this line
+    if (dispcnt & 0x1000)
+        for (int x = 0; x < SCREEN_W; x++)
+            if (obj->source[x] && (mask[x] & 0x10)) objPrio |= 1u << (obj->prio[x] & 3);
+#define PUSH(x) do { sc[x] = tc[x]; sl[x] = tl[x]; } while (0)
+    for (int k = layers - 1; k >= 0; k--) {
+        int n = order[k];
+        if (n >= OBJ_ORDER) {
+            u8 p = (u8)(n - OBJ_ORDER);
+            if (!(objPrio >> p & 1)) continue;
+            for (int x = 0; x < SCREEN_W; x++)
+                if ((mask[x] & 0x10) && obj->source[x] && obj->prio[x] == p) {
+                    PUSH(x);
+                    tc[x] = rgb6(obj_color(e, dispcnt, obj, x)); tl[x] = LAYER_OBJ;
+                }
+        } else if (n == 0 && has3d) {
+            int lo = hofs3d < 0 ? -hofs3d : 0, hi = SCREEN_W - (hofs3d > 0 ? hofs3d : 0);
+            const u32 *l3 = line3d + hofs3d;
+            for (int x = lo; x < hi; x++) {
+                u32 c = l3[x], a = c >> 24 & 0x1f;
+                if (!a || !(mask[x] & 1)) continue;
+                PUSH(x);
+                tc[x] = c & 0x3f3f3f; tl[x] = LAYER_BG0 | L3D; ta[x] = (u8)a;
+            }
+        } else {
+            const u16 *bg = e->bg[n];
+            u8 bit = (u8)(1u << n);
+            for (int x = 0; x < SCREEN_W; x++)
+                if ((bg[x] & PIX_OPAQUE) && (mask[x] & bit)) {
+                    PUSH(x);
+                    tc[x] = rgb6(bg[x]); tl[x] = (u8)n;
+                }
+        }
+    }
+#undef PUSH
+    u32 used = 0;
+    for (int x = 0; x < SCREEN_W; x++) {
+        u32 col0 = tc[x], out = col0, eff = EFF_NONE;
+        u32 t = tl[x], lay0 = t & 0x7f;
+        int below2nd = (second >> (sl[x] & 7)) & 1;
+        if (lay0 == LAYER_OBJ && obj->kind[x] != OBJ_NORMAL && below2nd) {
+            if (obj->kind[x] == OBJ_BITMAP) {
+                out = blend(col0, sc[x], obj->alpha[x] + 1u, 15u - obj->alpha[x]);
+                eff = EFF_BITMAP_OBJ;
+            } else {
+                out = blend(col0, sc[x], eva, evb);
+                eff = EFF_SEMI_OBJ;
+            }
+        } else if ((t & L3D) && below2nd) {
+            if (ta[x] != 31) out = blend3d(col0, sc[x], ta[x]);   // alpha 31: blend3d returns col0 exactly
+            eff = EFF_3D;
+        } else if ((mask[x] & 0x20) && ((first >> lay0) & 1)) {
+            if (effect == 1 && below2nd) { out = blend(col0, sc[x], eva, evb); eff = EFF_ALPHA; }
+            else if (effect == 2) { out = brighten(col0, evy, 8); eff = EFF_UP; }
+            else if (effect == 3) { out = darken(col0, evy, 7); eff = EFF_DOWN; }
+        }
+        used |= 1u << eff;
+        dst[x] = out;
+    }
+    *effectsUsed = used;
+}
+
 static void compose_line(Engine *e, int line, const u32 *line3d, u32 *dst) {
     u32 dispcnt = reg32(e, REG_DISPCNT);
     const ObjLine *obj = &e->obj;
@@ -372,6 +450,12 @@ static void compose_line(Engine *e, int line, const u32 *line3d, u32 *dst) {
     if (evy > 16) evy = 16;
     u32 backdrop = rgb6(pal16(e->palette, 0));
     u32 effectsUsed = 0;
+    if (g2dFast < 0) g2dFast = !(getenv("ACWW_2DFAST") && atoi(getenv("ACWW_2DFAST")) == 0);
+    if (g2dFast && e->num == 0 && !sSingle && !defer3d && !top3d && !sDiagnostics) {
+        compose_line_fast(e, dispcnt, obj, mask, order, layers, has3d, hofs3d, line3d, backdrop, effect, first, second,
+                          eva, evb, evy, dst, &effectsUsed);
+        goto features;
+    }
     for (int x = 0; x < SCREEN_W; x++) {
         u32 col[2] = {backdrop, backdrop};
         u8 lay[2] = {LAYER_BACKDROP, LAYER_BACKDROP};
@@ -452,6 +536,7 @@ static void compose_line(Engine *e, int line, const u32 *line3d, u32 *dst) {
             e->dbgBelowColor[at] = col[1];
         }
     }
+features:
     if (effectsUsed & (1u << EFF_ALPHA | 1u << EFF_SEMI_OBJ | 1u << EFF_BITMAP_OBJ | 1u << EFF_3D)) gpu2d_feature(e, F_ALPHA);
     if (effectsUsed & 1u << EFF_UP) gpu2d_feature(e, F_BRIGHT_UP);
     if (effectsUsed & 1u << EFF_DOWN) gpu2d_feature(e, F_BRIGHT_DOWN);
@@ -896,8 +981,13 @@ static void ref_advance(Engine *e, int line) {
     e->refLine = line + 1;
 }
 
+static void band2d_run(Band2d *w);
 static void *band2d_worker(void *arg) {
     Band2d *w = arg;
+    band2d_run(w);
+    return 0;
+}
+static void band2d_run(Band2d *w) {
     Engine *e = w->be;
     // e already holds a copy of the engine's inputs (regs, VRAM/palette/oam ptrs, objNextLine0 ...), taken on the
     // main thread at the end of the prepass - the live engine may be written by the game while this band runs.
@@ -916,7 +1006,6 @@ static void *band2d_worker(void *arg) {
         render_line(e, w->in, line);     // writes e->out[line] (+defer/side effects), advances obj mosaic
         ref_advance(e, line);
     }
-    return 0;
 }
 
 // Engine-0 multi-threaded render, split into a main-thread prepass and a worker-thread bands pass so the bands

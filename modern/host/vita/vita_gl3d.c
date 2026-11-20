@@ -30,6 +30,16 @@ static int sReady;       // GL objects created (lazy, after the vitaGL context i
 static GLuint sFbo[2], sColorTex[2], sDepthRb[2];
 static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-stalling) this call; -1 = none yet
 
+// Timing split of g3w_render, reported on the "render thread split" line.
+extern uint64_t host_plat_time_ns(void);
+static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls;
+unsigned long long vita_gl3d_stats(char *buf, int n) {
+    unsigned long long c = sStCalls ? sStCalls : 1;
+    snprintf(buf, (size_t)n, "; 3d: readback %llu us, draw submit %llu us (of which texture decode %llu us, %llu uploads/frame)",
+             sStReadNs / c / 1000, sStSubmitNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c);
+    sStReadNs = sStSubmitNs = sStTexNs = sStTexUploads = sStCalls = 0;
+    return c;
+} 
 // --- texture cache --------------------------------------------------------------------------------------------
 // Each DS texture (texparam/texpal) is decoded to an RGBA GL texture once and reused while its VRAM is unchanged.
 // DS games rewrite texture VRAM in place (animated textures every few frames, new data on scene loads), so every
@@ -43,9 +53,7 @@ static TexEnt sTex[TC_SLOTS];
 static int sTexCount;
 static int sLastTexSlot = -1;   // consecutive polygons (sorted by texture) usually hit the same entry
 static uint32_t sTexFrame = 1;
-static u8 sPrevImg[TC_IMG], sPrevPal[TC_PAL];
 static u8 sDirtyImg[TC_IMG / TC_BLK], sDirtyPal[TC_PAL / TC_BLK];
-static int sTexPrimed;
 static uint32_t sDecodeBuf[1024 * 1024];   // max DS texture 1024x1024
 
 static GLint ds_wrap(int repeat, int flip) {
@@ -76,6 +84,8 @@ static int tex_touches_dirty(uint32_t tp, uint32_t pp) {
     return range_dirty(sDirtyPal, TC_PAL / TC_BLK, pb, palBytes[fmt]);
 }
 static void tex_upload(TexEnt *e) {
+    uint64_t t0 = host_plat_time_ns();
+    sStTexUploads++;
     int w, h;
     gpu3d_texture_size(e->tp, &w, &h);
     if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return;
@@ -90,6 +100,7 @@ static void tex_upload(TexEnt *e) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(e->tp >> 17 & 1, e->tp >> 19 & 1));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    sStTexNs += host_plat_time_ns() - t0;
 }
 static int tex_slot(uint32_t tp, uint32_t pp) {
     int h = (int)((tp * 2654435761u ^ pp * 40503u) & (TC_SLOTS - 1));
@@ -110,32 +121,21 @@ static void tex_sweep(uint32_t keepFrom) {
     sTexCount = n;
     sLastTexSlot = -1;
 }
-// Once per frame, before any draw: find changed VRAM blocks and mark the affected entries stale.
+// Once per frame, before any draw: mark entries whose VRAM changed (g3_tex_setup flags the changed 1 KB blocks
+// while it updates the flat texture/palette image) and sweep old entries.
+extern u8 gG3TexDirtyImg[TC_IMG / TC_BLK], gG3TexDirtyPal[TC_PAL / TC_BLK];
 static void tex_frame_begin(const u8 *img, const u8 *pal) {
+    (void)img; (void)pal;
     sTexFrame++;
-    if (!img || !pal) return;
-    if (!sTexPrimed) {
-        memcpy(sPrevImg, img, TC_IMG);
-        memcpy(sPrevPal, pal, TC_PAL);
-        sTexPrimed = 1;
-        return;
-    }
     int any = 0;
-    for (u32 b = 0; b < TC_IMG / TC_BLK; b++) {
-        const u8 *n = img + b * TC_BLK;
-        u8 *o = sPrevImg + b * TC_BLK;
-        sDirtyImg[b] = memcmp(n, o, TC_BLK) != 0;
-        if (sDirtyImg[b]) { memcpy(o, n, TC_BLK); any = 1; }
-    }
-    for (u32 b = 0; b < TC_PAL / TC_BLK; b++) {
-        const u8 *n = pal + b * TC_BLK;
-        u8 *o = sPrevPal + b * TC_BLK;
-        sDirtyPal[b] = memcmp(n, o, TC_BLK) != 0;
-        if (sDirtyPal[b]) { memcpy(o, n, TC_BLK); any = 1; }
-    }
-    if (any)
+    for (u32 b = 0; b < TC_IMG / TC_BLK && !any; b++) any = gG3TexDirtyImg[b];
+    for (u32 b = 0; b < TC_PAL / TC_BLK && !any; b++) any = gG3TexDirtyPal[b];
+    if (any) {
+        memcpy(sDirtyImg, gG3TexDirtyImg, sizeof sDirtyImg);
+        memcpy(sDirtyPal, gG3TexDirtyPal, sizeof sDirtyPal);
         for (int i = 0; i < TC_SLOTS; i++)
             if (sTex[i].used && !sTex[i].stale && tex_touches_dirty(sTex[i].tp, sTex[i].pal)) sTex[i].stale = 1;
+    }
     if (sTexCount > TC_MAX * 3 / 4) tex_sweep(sTexFrame > 120 ? sTexFrame - 120 : 0);
 }
 static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
@@ -220,6 +220,8 @@ void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no s
 #define BATCH_V 65536   // capacity of the batched 3D vertex buffers (~2400 polys expanded to triangles/frame)
 
 static const G3RenderState *sSortR;
+static float sCol6[64];
+  // c / 63.0f for each 6-bit colour channel value (filled on first use)
 static int cmp_tex(const void *a, const void *b) {
     const G3Polygon *pa = sSortR->poly[*(const int *)a], *pb = sSortR->poly[*(const int *)b];
     uint64_t ka = (uint64_t)pa->texparam << 32 | pa->texpal;
@@ -231,7 +233,10 @@ static int cmp_tex(const void *a, const void *b) {
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
-    tex_frame_begin(img, pal);   // re-decode only textures whose VRAM changed since last frame
+    if (sCol6[63] == 0.0f) for (int c = 0; c < 64; c++) sCol6[c] = c / 63.0f;
+    tex_frame_begin(img, pal);
+    uint64_t tStart = host_plat_time_ns();
+    sStCalls++;   // re-decode only textures whose VRAM changed since last frame
 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
     // frame. By now the GPU has long finished those draws (a whole frame has passed), so glReadPixels does not
@@ -277,6 +282,8 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         for (int i = 0; i < VW * VH; i++) out[i] = 0;   // first frame: no 3D rendered yet
     }
 
+    uint64_t tRead = host_plat_time_ns();
+    sStReadNs += tRead - tStart;
     int draw = (sPrevDraw + 1) & 1;   // submit this frame to the other FBO
     glBindFramebuffer(GL_FRAMEBUFFER, sFbo[draw]);
     glViewport(0, 0, VW, VH);
@@ -345,16 +352,22 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             curTex = tex; curBlend = blend; haveState = 1;
         }
         int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
+        // No divisions per vertex (the A9's VFP divide is slow and unpipelined), same floats as before:
+        // colours come from a table built with the old expression; 1/(16*tw) and 1/(16*th) are exact powers of
+        // two, so multiplying is bit-identical to dividing by 16 and then by tw/th; alpha is per polygon.
+        const float su = 1.0f / (16.0f * tw), sv = 1.0f / (16.0f * th);
+        const float va = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
         float vp[16][4], vc[16][4], vu[16][2];
         for (int i = 0; i < p->nv; i++) {
             const G3Vertex *v = p->v[i];
             // DS clip-space position (pos[]=NDC*w); GL does the divide/viewport/depth and clips the frustum.
             // v->color is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel.
             vp[i][0] = (float)v->pos[0]; vp[i][1] = (float)v->pos[1]; vp[i][2] = (float)v->pos[2]; vp[i][3] = (float)v->pos[3];
-            vc[i][0] = (v->color[0] >> 3) / 63.0f; vc[i][1] = (v->color[1] >> 3) / 63.0f; vc[i][2] = (v->color[2] >> 3) / 63.0f;
-            vc[i][3] = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
-            vu[i][0] = tw ? (float)v->tex[0] / 16.0f / tw : 0.0f;
-            vu[i][1] = th ? (float)v->tex[1] / 16.0f / th : 0.0f;
+            vc[i][0] = sCol6[(v->color[0] >> 3) & 63]; vc[i][1] = sCol6[(v->color[1] >> 3) & 63];
+            vc[i][2] = sCol6[(v->color[2] >> 3) & 63];
+            vc[i][3] = va;
+            vu[i][0] = (float)v->tex[0] * su;
+            vu[i][1] = (float)v->tex[1] * sv;
         }
         for (int i = 1; i + 1 < p->nv; i++) {   // fan -> triangles: (0, i, i+1)
             const int idx[3] = {0, i, i + 1};
@@ -376,6 +389,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     // The draws are now in flight on the GPU; this FBO is read back next frame (no stall), not now.
     sPrevDraw = draw;
+    sStSubmitNs += host_plat_time_ns() - tRead;
 }
 
 // Enable predicate used by render_init: GPU path on, and the shader compiler reachable (else fall back to the

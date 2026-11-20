@@ -456,6 +456,7 @@ static void dma_run(int ch) {
             u32 fifo = (u32)dst;
             for (u32 i = 0; i < n; i++, src += 4, fifo += 4)
                 gpu3d_write32(fifo, *(volatile u32 *)src);
+            dst += (uintptr_t)n * 4;   // the DMA destination register ends past the last word, as in the generic path
         } else {
             for (u32 i = 0; i < n; i++) {
                 gpu3d_write32((u32)dst, *(volatile u32 *)src);
