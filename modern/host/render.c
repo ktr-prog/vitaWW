@@ -585,6 +585,10 @@ static void render_worker_phase(void) {
 
 static void *render_worker_main(void *a) {
     (void)a;
+#if HOST_VITA
+    extern int sceKernelChangeThreadCpuAffinityMask(int, int);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
+#endif
     for (;;) {
         pthread_mutex_lock(&sWMx);
         while (!sWReady) pthread_cond_wait(&sWCvWork, &sWMx);
@@ -643,6 +647,15 @@ static void render_frame_sync(void);
 // Main-thread half: wait for the previous frame's worker, snapshot inputs, run the game-code prepass + geometry
 // commit, then hand the frame to the worker and return so the main thread can start the next frame's CPU.
 static void render_frame_mt(void) {
+#if HOST_VITA
+    {
+        // The game thread gets core 0 to itself; the GX worker, render thread and 2D band helper share cores 1+2.
+        // Done here (after start-up) so library threads created during init keep their default masks.
+        static int pinned;
+        extern int sceKernelChangeThreadCpuAffinityMask(int, int);
+        if (!pinned) { pinned = 1; sceKernelChangeThreadCpuAffinityMask(0, 0x10000); }
+    }
+#endif
     render_thread_sync();
     host_vram_flush();
     if (!sSnapBankMem) sSnapBankMem = malloc(host_vram_total());

@@ -30,89 +30,139 @@ static int sReady;       // GL objects created (lazy, after the vitaGL context i
 static GLuint sFbo[2], sColorTex[2], sDepthRb[2];
 static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-stalling) this call; -1 = none yet
 
-// --- texture cache: decode each unique DS texture (by texparam/texpal) to an RGBA GL texture once ------------
-#define TEXCACHE 256
-static struct { uint32_t tp, pal; GLuint tex; int used, w, h; } sTexCache[TEXCACHE];
+// --- texture cache --------------------------------------------------------------------------------------------
+// Each DS texture (texparam/texpal) is decoded to an RGBA GL texture once and reused while its VRAM is unchanged.
+// DS games rewrite texture VRAM in place (animated textures every few frames, new data on scene loads), so every
+// frame the flat texture/palette VRAM is compared with last frame's in 1 KB blocks, and entries whose texel,
+// 4x4-index or palette bytes touch a changed block are re-decoded on their next use. Entries unused for a while
+// are freed; an entry used in the current frame is never evicted (its GL texture may still be referenced by
+// draws queued this frame).
+enum { TC_SLOTS = 2048, TC_MAX = 1024, TC_BLK = 1024, TC_IMG = 0x80000, TC_PAL = 0x20000 };
+typedef struct { uint32_t tp, pal, lastUsed; GLuint tex; uint8_t used, stale; } TexEnt;
+static TexEnt sTex[TC_SLOTS];
+static int sTexCount;
+static int sLastTexSlot = -1;   // consecutive polygons (sorted by texture) usually hit the same entry
+static uint32_t sTexFrame = 1;
+static u8 sPrevImg[TC_IMG], sPrevPal[TC_PAL];
+static u8 sDirtyImg[TC_IMG / TC_BLK], sDirtyPal[TC_PAL / TC_BLK];
+static int sTexPrimed;
 static uint32_t sDecodeBuf[1024 * 1024];   // max DS texture 1024x1024
-// The flattened DS texture/palette windows are rebuilt from VRAM every frame. Keep a
-// snapshot so edits or bank remaps invalidate decoded GL textures instead of showing stale data.
-#define IMG_BYTES (4 * 0x20000)
-#define PAL_BYTES (8 * 0x4000)
-static u8 sImgSnapshot[IMG_BYTES], sPalSnapshot[PAL_BYTES];
-static int sVramSnapshotValid;
-static int sLastTexSlot = -1;
-
-static int sync_snapshot_window(u8 *snapshot, const u8 *source, int size) {
-    enum { CHUNK = 4096 };
-    int changed = 0;
-    for (int ofs = 0; ofs < size; ofs += CHUNK) {
-        int n = size - ofs < CHUNK ? size - ofs : CHUNK;
-        if (memcmp(source + ofs, snapshot + ofs, (size_t)n)) {
-            memcpy(snapshot + ofs, source + ofs, (size_t)n);
-            changed = 1;
-        }
-    }
-    return changed;
-}
-
-static void sync_texture_cache(const u8 *img, const u8 *pal) {
-    if (!img || !pal) return;
-    int changed;
-    if (!sVramSnapshotValid) {
-        memcpy(sImgSnapshot, img, IMG_BYTES);
-        memcpy(sPalSnapshot, pal, PAL_BYTES);
-        changed = 1;
-        sVramSnapshotValid = 1;
-    } else {
-        // VRAM writes are usually sparse. Copy only changed pages rather than
-        // copying the complete 640 KiB texture/palette window on every update.
-        changed = sync_snapshot_window(sImgSnapshot, img, IMG_BYTES);
-        changed |= sync_snapshot_window(sPalSnapshot, pal, PAL_BYTES);
-    }
-    if (changed) {
-        for (int i = 0; i < TEXCACHE; i++) sTexCache[i].used = 0;
-        sLastTexSlot = -1;
-    }
-}
 
 static GLint ds_wrap(int repeat, int flip) {
     return flip ? GL_MIRRORED_REPEAT : (repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
 }
 
-static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
-    if ((texparam >> 26 & 7) == 0) return 0;   // format 0 == no texture
-    if (sLastTexSlot >= 0 && sTexCache[sLastTexSlot].used &&
-        sTexCache[sLastTexSlot].tp == texparam && sTexCache[sLastTexSlot].pal == texpal)
-        return sTexCache[sLastTexSlot].tex;
-    int slot = (int)((texparam * 2654435761u ^ texpal * 40503u) & (TEXCACHE - 1));
-    int empty = -1;
-    for (int i = 0; i < TEXCACHE; i++) {       // probe for a match or the first free slot
-        int s = (slot + i) & (TEXCACHE - 1);
-        if (!sTexCache[s].used) { empty = s; break; }
-        if (sTexCache[s].tp == texparam && sTexCache[s].pal == texpal) {
-            sLastTexSlot = s;
-            return sTexCache[s].tex;
-        }
+static int range_dirty(const u8 *dirty, u32 nblk, u32 base, u32 size) {
+    if (!size) return 0;
+    u32 first = base / TC_BLK, n = (base % TC_BLK + size + TC_BLK - 1) / TC_BLK;
+    if (n > nblk) n = nblk;
+    for (u32 i = 0; i < n; i++)
+        if (dirty[(first + i) % nblk]) return 1;
+    return 0;
+}
+// VRAM bytes a texture reads: texels, the 4x4-compressed palette indices, and its palette.
+static int tex_touches_dirty(uint32_t tp, uint32_t pp) {
+    static const u8 bpp[8] = {0, 8, 2, 4, 8, 2, 8, 16};
+    static const u32 palBytes[8] = {0, 64, 8, 32, 512, 0x10000, 16, 0};
+    int fmt = tp >> 26 & 7;
+    u32 w = 8u << (tp >> 20 & 7), h = 8u << (tp >> 23 & 7);
+    u32 a = ((tp & 0xffff) << 3) & (TC_IMG - 1);
+    if (range_dirty(sDirtyImg, TC_IMG / TC_BLK, a, w * h * bpp[fmt] / 8)) return 1;
+    if (fmt == 5) {
+        u32 x = (0x20000 + (a & 0x1ffff) / 2 + (a >= 0x40000 ? 0x10000 : 0)) & (TC_IMG - 1);
+        if (range_dirty(sDirtyImg, TC_IMG / TC_BLK, x, w * h / 8)) return 1;
     }
+    u32 pb = (fmt == 2 ? pp << 3 : pp << 4) & (TC_PAL - 1);
+    return range_dirty(sDirtyPal, TC_PAL / TC_BLK, pb, palBytes[fmt]);
+}
+static void tex_upload(TexEnt *e) {
     int w, h;
-    gpu3d_texture_size(texparam, &w, &h);
-    if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return 0;
-    gpu3d_decode_texture(texparam, texpal, sDecodeBuf);
-    int s = empty >= 0 ? empty : slot;         // insert at a free slot; evict only if the cache is full
-    if (!sTexCache[s].tex) glGenTextures(1, &sTexCache[s].tex);
-    glBindTexture(GL_TEXTURE_2D, sTexCache[s].tex);
-    // vitaGL/GXM can still be sampling this texture from the previous queued frame.
-    // Re-specifying the image gives the driver a fresh backing store; glTexSubImage2D
-    // on the reused storage caused alternating stale/new texture contents on hardware.
+    gpu3d_texture_size(e->tp, &w, &h);
+    if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return;
+    gpu3d_decode_texture(e->tp, e->pal, sDecodeBuf);
+    if (!e->tex) glGenTextures(1, &e->tex);
+    glBindTexture(GL_TEXTURE_2D, e->tex);
+    // vitaGL/GXM can still be sampling this texture from the previous queued frame. Re-specifying the image
+    // gives the driver a fresh backing store; glTexSubImage2D on the reused storage caused alternating
+    // stale/new texture contents on hardware.
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
-    sTexCache[s].w = w; sTexCache[s].h = h;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(texparam >> 16 & 1, texparam >> 18 & 1));
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(texparam >> 17 & 1, texparam >> 19 & 1));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(e->tp >> 16 & 1, e->tp >> 18 & 1));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(e->tp >> 17 & 1, e->tp >> 19 & 1));
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    sTexCache[s].tp = texparam; sTexCache[s].pal = texpal; sTexCache[s].used = 1;
+}
+static int tex_slot(uint32_t tp, uint32_t pp) {
+    int h = (int)((tp * 2654435761u ^ pp * 40503u) & (TC_SLOTS - 1));
+    while (sTex[h].used && !(sTex[h].tp == tp && sTex[h].pal == pp)) h = (h + 1) & (TC_SLOTS - 1);
+    return h;
+}
+// Free entries not used since frame `keepFrom` and rebuild the probe table without them.
+static void tex_sweep(uint32_t keepFrom) {
+    static TexEnt keep[TC_SLOTS];
+    int n = 0;
+    for (int i = 0; i < TC_SLOTS; i++) {
+        if (!sTex[i].used) continue;
+        if (sTex[i].lastUsed >= keepFrom) keep[n++] = sTex[i];
+        else if (sTex[i].tex) glDeleteTextures(1, &sTex[i].tex);
+    }
+    memset(sTex, 0, sizeof sTex);
+    for (int i = 0; i < n; i++) sTex[tex_slot(keep[i].tp, keep[i].pal)] = keep[i];
+    sTexCount = n;
+    sLastTexSlot = -1;
+}
+// Once per frame, before any draw: find changed VRAM blocks and mark the affected entries stale.
+static void tex_frame_begin(const u8 *img, const u8 *pal) {
+    sTexFrame++;
+    if (!img || !pal) return;
+    if (!sTexPrimed) {
+        memcpy(sPrevImg, img, TC_IMG);
+        memcpy(sPrevPal, pal, TC_PAL);
+        sTexPrimed = 1;
+        return;
+    }
+    int any = 0;
+    for (u32 b = 0; b < TC_IMG / TC_BLK; b++) {
+        const u8 *n = img + b * TC_BLK;
+        u8 *o = sPrevImg + b * TC_BLK;
+        sDirtyImg[b] = memcmp(n, o, TC_BLK) != 0;
+        if (sDirtyImg[b]) { memcpy(o, n, TC_BLK); any = 1; }
+    }
+    for (u32 b = 0; b < TC_PAL / TC_BLK; b++) {
+        const u8 *n = pal + b * TC_BLK;
+        u8 *o = sPrevPal + b * TC_BLK;
+        sDirtyPal[b] = memcmp(n, o, TC_BLK) != 0;
+        if (sDirtyPal[b]) { memcpy(o, n, TC_BLK); any = 1; }
+    }
+    if (any)
+        for (int i = 0; i < TC_SLOTS; i++)
+            if (sTex[i].used && !sTex[i].stale && tex_touches_dirty(sTex[i].tp, sTex[i].pal)) sTex[i].stale = 1;
+    if (sTexCount > TC_MAX * 3 / 4) tex_sweep(sTexFrame > 120 ? sTexFrame - 120 : 0);
+}
+static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
+    if ((texparam >> 26 & 7) == 0) return 0;   // format 0 == no texture
+    if (sLastTexSlot >= 0) {
+        TexEnt *l = &sTex[sLastTexSlot];
+        if (l->used && !l->stale && l->tp == texparam && l->pal == texpal) { l->lastUsed = sTexFrame; return l->tex; }
+    }
+    int s = tex_slot(texparam, texpal);
+    TexEnt *e = &sTex[s];
+    if (e->used) {
+        if (e->stale) { tex_upload(e); e->stale = 0; }
+        e->lastUsed = sTexFrame;
+        sLastTexSlot = s;
+        return e->tex;
+    }
+    if (sTexCount >= TC_MAX) {                 // full: drop everything not used this frame, then re-probe
+        tex_sweep(sTexFrame);
+        if (sTexCount >= TC_MAX) return 0;
+        s = tex_slot(texparam, texpal);
+        e = &sTex[s];
+    }
+    e->tp = texparam; e->pal = texpal; e->used = 1; e->stale = 0; e->lastUsed = sTexFrame; e->tex = 0;
+    sTexCount++;
+    tex_upload(e);
     sLastTexSlot = s;
-    return sTexCache[s].tex;
+    return e->tex;
 }
 
 static void load_shader_compiler(void) {
@@ -181,7 +231,7 @@ static int cmp_tex(const void *a, const void *b) {
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
-    sync_texture_cache(img, pal);
+    tex_frame_begin(img, pal);   // re-decode only textures whose VRAM changed since last frame
 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
     // frame. By now the GPU has long finished those draws (a whole frame has passed), so glReadPixels does not

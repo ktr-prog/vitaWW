@@ -123,11 +123,13 @@ static void read_options(void) {
 int main(int argc, char **argv) {
     SDL_SetMainReady();
     vita_io_init();  // must precede any file I/O: the game coroutine's file syscalls are marshaled to this worker
-    // run at the stock game clocks (333 MHz ARM / 222 MHz bus) - homebrew often launch throttled lower. This is
-    // the standard frequency Vita games use, NOT an overclock (which would be 444 MHz).
+    // Highest clocks the system offers apps: 444 MHz ARM (+33% over the stock 333 for every thread), 222 MHz
+    // bus, 222 MHz GPU (stock 111) and 166 MHz GPU crossbar. ACWW_CLOCK=333 in acww-options.txt restores stock.
     int wasArm = scePowerGetArmClockFrequency(), wasBus = scePowerGetBusClockFrequency();
-    scePowerSetArmClockFrequency(333);
+    scePowerSetArmClockFrequency(444);
     scePowerSetBusClockFrequency(222);
+    scePowerSetGpuClockFrequency(222);
+    scePowerSetGpuXbarClockFrequency(166);
     mkdir("ux0:/data", 0777);
     mkdir(DATA_DIR, 0777);
     open_log();
@@ -136,6 +138,13 @@ int main(int argc, char **argv) {
     ensure_readme();
     chdir(DATA_DIR);
     read_options();
+    if (getenv("ACWW_CLOCK") && atoi(getenv("ACWW_CLOCK")) == 333) {
+        scePowerSetArmClockFrequency(333);
+        scePowerSetGpuClockFrequency(111);
+        scePowerSetGpuXbarClockFrequency(111);
+    }
+    fprintf(stderr, "vita: clocks now arm %d, bus %d, gpu %d, xbar %d MHz\n", scePowerGetArmClockFrequency(),
+            scePowerGetBusClockFrequency(), scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
     // overlay logging is off by default; enable ACWW_OVLOG=1 in acww-options.txt for boot-progress diagnostics
 
     static char path[1024];

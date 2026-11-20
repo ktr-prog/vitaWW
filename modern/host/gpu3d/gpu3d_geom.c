@@ -15,6 +15,7 @@ static u32 sGxStat;
 static u16 sRegs[0xa0 / 2];
 static u16 sDot1Depth = 0x7fff;
 u8 gG3VramCnt[9];
+u8 gG3VramCntFrame[9];
 
 typedef struct { s32 m[16]; } Mtx;
 static int sMtxMode;
@@ -1122,12 +1123,18 @@ HOST_STATE_KEEP(gClipM) HOST_STATE_KEEP(gVecM) HOST_STATE_KEEP(gTexM)
 extern uint64_t host_plat_time_ns(void);
 
 static void mt_pause(int *spins) {
-    if (++*spins < 256) sched_yield();
-    else usleep(50);
+    if (++*spins < 32) sched_yield();
+    else usleep(100);   // idle: sleep instead of spinning so the core goes to the render thread / 2D band
 }
 static void gpu3d_write16_now(uint32_t addr, uint16_t v);
 static void *mt_worker(void *arg) {
     (void)arg;
+#if HOST_VITA
+    // Cores 1+2 only (USER_1|USER_2): core 0 belongs to the game thread. A two-core mask, never a single core
+    // (see the note in gpu3d_raster.c's band_worker).
+    extern int sceKernelChangeThreadCpuAffinityMask(int, int);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);
+#endif
     u32 tmp[64];
     int spins = 0;
     u32 r = 0;
@@ -1419,6 +1426,7 @@ uint32_t gpu3d_read32(uint32_t addr) {
 // main thread at the frame boundary while the render thread rasterizes the previously-committed geometry.
 void gpu3d_commit(const uint8_t *const bank[9]) {
     gG3Banks = bank;
+    memcpy(gG3VramCntFrame, gG3VramCnt, sizeof gG3VramCntFrame);   // pairs with the bank snapshot
     sFrame++;
     sVtxPipe = sNrmPipe = sPolyPipe = sSlotCtr = 0;
     sSlots = 1;

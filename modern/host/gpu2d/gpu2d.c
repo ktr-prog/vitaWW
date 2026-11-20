@@ -876,6 +876,7 @@ static void classic_compose(const Gpu2dFrameInput *in) {
 // sequential pre-pass. Gated by ACWW_2DMT (default on); the sequential path remains for sGpu/diagnostics/engine-1.
 #include <pthread.h>
 #include <stddef.h>
+#include <stdint.h>
 #define N2DBANDS 3
 static Engine s2dBandEng[N2DBANDS];
 static u8 s2dRegSnap[SCREEN_H][REG_SIZE];   // per-line register state (hblank can change scroll/etc. per scanline)
@@ -924,14 +925,15 @@ static void *band2d_worker(void *arg) {
 // code and read only the per-line snapshots (s2dRegSnap/s2dPalSnap) plus the engine's VRAM pointers.
 static Band2d sMtW[N2DBANDS];
 static int sMtBnd[N2DBANDS + 1];
+static int s2dNB = N2DBANDS;   // bands in use (2 on the Vita with the render thread: the render thread + one helper)
 static int sMtPending;   // a prepass ran in deferred mode and is waiting for its bands to be run by the worker
 
 static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
-    for (int b = 0; b <= N2DBANDS; b++) sMtBnd[b] = b * SCREEN_H / N2DBANDS;
+    for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
     int bi = 0;
     for (int line = 0; line < SCREEN_H; line++) {
-        while (bi < N2DBANDS && line == sMtBnd[bi]) {
+        while (bi < s2dNB && line == sMtBnd[bi]) {
             Snap2d *s = &sMtW[bi].snap;
             s->refX[0] = e->refX[0]; s->refX[1] = e->refX[1]; s->refY[0] = e->refY[0]; s->refY[1] = e->refY[1];
             s->refLine = e->refLine; s->refWritten[0] = e->refWritten[0]; s->refWritten[1] = e->refWritten[1];
@@ -947,18 +949,60 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
     }
-    for (int b = 0; b < N2DBANDS; b++) {
+    for (int b = 0; b < s2dNB; b++) {
         sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
         memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays
     }
 }
 
+// Band helpers: persistent threads (created once, then woken per frame) - creating and joining threads every
+// frame is expensive on the Vita. The calling thread renders band 0 itself.
+static pthread_mutex_t s2dMu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s2dGo = PTHREAD_COND_INITIALIZER, s2dDoneCv = PTHREAD_COND_INITIALIZER;
+static unsigned s2dGen;
+static int s2dPending, s2dHelpers;
+static void *band2d_helper(void *arg) {
+    int b = (int)(intptr_t)arg;
+#if HOST_VITA
+    extern int sceKernelChangeThreadCpuAffinityMask(int, int);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
+#endif
+    unsigned seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&s2dMu);
+        while (s2dGen == seen) pthread_cond_wait(&s2dGo, &s2dMu);
+        seen = s2dGen;
+        int run = b < s2dNB;
+        pthread_mutex_unlock(&s2dMu);
+        if (run) band2d_worker(&sMtW[b]);
+        pthread_mutex_lock(&s2dMu);
+        if (--s2dPending == 0) pthread_cond_signal(&s2dDoneCv);
+        pthread_mutex_unlock(&s2dMu);
+    }
+    return 0;
+}
 static void render_engine0_mt_bands(void) {
     Engine *e = &sEngine[0];
-    pthread_t th[N2DBANDS];
-    for (int b = 0; b < N2DBANDS; b++) pthread_create(&th[b], 0, band2d_worker, &sMtW[b]);
-    for (int b = 0; b < N2DBANDS; b++) {
-        pthread_join(th[b], 0);
+    int nb = s2dNB;
+    while (s2dHelpers < nb - 1) {
+        pthread_t t;
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 256 << 10);
+        if (pthread_create(&t, &at, band2d_helper, (void *)(intptr_t)(s2dHelpers + 1)) != 0) break;
+        s2dHelpers++;
+    }
+    pthread_mutex_lock(&s2dMu);
+    s2dPending = s2dHelpers;
+    s2dGen++;
+    pthread_cond_broadcast(&s2dGo);
+    pthread_mutex_unlock(&s2dMu);
+    band2d_worker(&sMtW[0]);
+    for (int b = s2dHelpers + 1; b < nb; b++) band2d_worker(&sMtW[b]);   // helpers that failed to start
+    pthread_mutex_lock(&s2dMu);
+    while (s2dPending) pthread_cond_wait(&s2dDoneCv, &s2dMu);
+    pthread_mutex_unlock(&s2dMu);
+    for (int b = 0; b < nb; b++) {
         int lo = sMtBnd[b], n = sMtBnd[b + 1] - lo;
         memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
         if (sDefer3d) memcpy(e->defer + lo * SCREEN_W, s2dBandEng[b].defer + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
@@ -966,7 +1010,18 @@ static void render_engine0_mt_bands(void) {
 }
 
 static int sDeferBands;   // render thread active: prepass on main, bands+canvas tail on the worker
-void gpu2d_set_defer_bands(int on) { sDeferBands = on; }
+void gpu2d_set_defer_bands(int on) {
+    static int init;
+    if (!init) {   // fixed for the session: the prepass and the bands must agree on the band split
+        init = 1;
+#if HOST_VITA
+        if (on) s2dNB = 2;   // render thread + one helper: cores 1+2 (core 0 is the game thread's)
+#endif
+        const char *v = getenv("ACWW_2DBANDS");
+        if (v && atoi(v) >= 1 && atoi(v) <= N2DBANDS) s2dNB = atoi(v);
+    }
+    sDeferBands = on;
+}
 
 // Validation hook: hash the finished engine-0 canvas so a threaded run can be byte-compared with a sync run.
 static void canvas_hash(void) {
@@ -983,7 +1038,6 @@ void gpu2d_render_finish(void) {
     if (!sMtPending) return;
     sMtPending = 0;
     render_engine0_mt_bands();
-    for (int n = 0; n < 2; n++) window_vertical(&sEngine[n], SCREEN_H);
     for (int i = 0; i < SCREEN_W * SCREEN_H; i++) sCanvas[i] = argb(sEngine[0].out[i]);
     sCanvasRows = SCREEN_H;
     sFrame++;
@@ -1059,7 +1113,13 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
             for (int x = 0; x < SCREEN_W; x++) sGpuFrame.obj0[n][x] = pack_obj(&e->objNextLine0, x);
     }
     if (mainOnly && !sGpu && !sDiagnostics && render_engine0_mt(in)) {
-        if (sMtPending) return;   // deferred: the render worker runs the bands + canvas tail via gpu2d_render_finish()
+        if (sMtPending) {
+            // Deferred: the render worker runs the bands + canvas tail via gpu2d_render_finish(). The end-of-frame
+            // window update stays here on the game thread (the worker must not touch the live engines, whose
+            // registers the game rewrites while the worker runs).
+            for (int n = 0; n < 2; n++) window_vertical(&sEngine[n], SCREEN_H);
+            return;
+        }
         goto after_lines;
     }
     for (int line = 0; line < SCREEN_H; line++) {

@@ -38,7 +38,7 @@ static void g3_tex_setup(void) {
     memset(sNPal, 0, sizeof sNPal);
     if (gG3Banks)
         for (int b = 0; b < 7; b++) {
-            u8 c = gG3VramCnt[b];
+            u8 c = gG3VramCntFrame[b];
             if (!(c & 0x80) || (c & 7) != 3 || !gG3Banks[b]) continue;
             int ofs = c >> 3 & 3;
             if (b < 4) sImg[ofs][sNImg[ofs]++] = gG3Banks[b];
