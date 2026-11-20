@@ -336,13 +336,50 @@ static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const 
     enum { OBJ_ORDER = 4 + 4, L3D = 0x80 };   // L3D: flag on a layer id = the 3D layer (BG0)
     // top / second candidates. The second slot starts as what the general loop uses when fewer than two layers
     // are found: none found -> backdrop colour with LAYER_NONE; one found -> the backdrop (pushed down from top).
-    u32 tc[SCREEN_W], sc[SCREEN_W];
-    u8 tl[SCREEN_W], sl[SCREEN_W], ta[SCREEN_W];
-    for (int x = 0; x < SCREEN_W; x++) { tc[x] = sc[x] = backdrop; tl[x] = LAYER_BACKDROP; sl[x] = LAYER_NONE; }
     u32 objPrio = 0;   // sprite priorities that have a visible pixel on this line
     if (dispcnt & 0x1000)
         for (int x = 0; x < SCREEN_W; x++)
             if (obj->source[x] && (mask[x] & 0x10)) objPrio |= 1u << (obj->prio[x] & 3);
+    // 3D-only line: no window, and every layer but the 3D one is empty here (transparent BG line, no sprite
+    // pixels). Then each pixel is the 3D colour over the backdrop - the same outcome as the general loops below.
+    if (has3d && !(dispcnt & 0xe000)) {
+        int only3d = 1;
+        for (int k = 0; k < layers && only3d; k++) {
+            int n = order[k];
+            if (n >= OBJ_ORDER) only3d = !(objPrio >> (n - OBJ_ORDER) & 1);
+            else if (n != 0) only3d = !e->bgAny[n];
+        }
+        if (only3d) {
+            int lo = hofs3d < 0 ? -hofs3d : 0, hi = SCREEN_W - (hofs3d > 0 ? hofs3d : 0);
+            const u32 *l3 = line3d + hofs3d;
+            int over = (second >> LAYER_BACKDROP) & 1;      // 3D over the backdrop blends (EFF_3D)
+            int eff3d = (first & 1);                         // BG0 is a first target (brightness effects)
+            int effBd = (first >> LAYER_BACKDROP) & 1;       // backdrop is a first target
+            u32 bdOut = backdrop, bdEff = EFF_NONE;
+            if (effBd && effect == 2) bdOut = brighten(backdrop, evy, 8), bdEff = EFF_UP;
+            else if (effBd && effect == 3) bdOut = darken(backdrop, evy, 7), bdEff = EFF_DOWN;
+            u32 used = 0;
+            for (int x = 0; x < SCREEN_W; x++) {
+                u32 c = x >= lo && x < hi ? l3[x] : 0, a = c >> 24 & 0x1f;
+                if (!a) { dst[x] = bdOut; used |= 1u << bdEff; continue; }
+                u32 col0 = c & 0x3f3f3f, out = col0, eff = EFF_NONE;
+                if (over) {
+                    if (a != 31) out = blend3d(col0, backdrop, a);
+                    eff = EFF_3D;
+                } else if (eff3d) {
+                    if (effect == 2) { out = brighten(col0, evy, 8); eff = EFF_UP; }
+                    else if (effect == 3) { out = darken(col0, evy, 7); eff = EFF_DOWN; }
+                }
+                used |= 1u << eff;
+                dst[x] = out;
+            }
+            *effectsUsed = used;
+            return;
+        }
+    }
+    u32 tc[SCREEN_W], sc[SCREEN_W];
+    u8 tl[SCREEN_W], sl[SCREEN_W], ta[SCREEN_W];
+    for (int x = 0; x < SCREEN_W; x++) { tc[x] = sc[x] = backdrop; tl[x] = LAYER_BACKDROP; sl[x] = LAYER_NONE; }
 #define PUSH(x) do { sc[x] = tc[x]; sl[x] = tl[x]; } while (0)
     for (int k = layers - 1; k >= 0; k--) {
         int n = order[k];
@@ -997,6 +1034,15 @@ static void band2d_run(Band2d *w) {
     e->refLine = w->snap.refLine; e->refWritten[0] = w->snap.refWritten[0]; e->refWritten[1] = w->snap.refWritten[1];
     e->winActive[0] = w->snap.winActive[0]; e->winActive[1] = w->snap.winActive[1];
     e->objMosaicLine = w->snap.objMosaicLine; e->objMosaicCount = w->snap.objMosaicCount;
+    // The band's OAM is fixed for the frame: list the entries that are not disabled once, instead of decoding
+    // all 128 on every line (entries are walked in the same order, so priority ties resolve the same way).
+    e->objCandN = 0;
+    for (int i = 0; i < 128; i++) {
+        u16 a0 = (u16)(e->oam[i * 8] | e->oam[i * 8 + 1] << 8);
+        if ((!(a0 & 0x100) && (a0 & 0x200)) || (a0 >> 14) == 3) continue;
+        e->objCand[e->objCandN++] = (u8)i;
+    }
+    e->objCandOn = 1;
     for (int line = w->lo; line < w->hi; line++) {
         memcpy(e->regs, s2dRegSnap[line], REG_SIZE);   // per-line registers (as they were when this line rendered)
         e->palette = s2dPalSnap[line];                 // per-line palette
@@ -1006,6 +1052,7 @@ static void band2d_run(Band2d *w) {
         else gpu2d_render_obj_line(e, line, &e->obj);
         render_line(e, w->in, line);     // writes e->out[line] (+defer/side effects), advances obj mosaic
         ref_advance(e, line);
+        if (line + 1 == w->hi) e->objCandOn = 0;
         if (w->canvas) {   // straight to the canvas: no gather into the engine and no second pass over the frame
             const u32 *o = e->out + line * SCREEN_W;
             u32 *d = w->canvas + line * SCREEN_W;

@@ -42,7 +42,9 @@ void gpu2d_render_obj_line(Engine *e, int line, ObjLine *dst) {
     u32 dispcnt = reg32(e, REG_DISPCNT);
     if (line == 0) e->objMosaicLine = e->objMosaicCount = 0;
     if (!(dispcnt & 0x1000)) return;
-    for (int i = 0; i < 128; i++) {
+    int nc = e->objCandOn ? e->objCandN : 128;
+    for (int ci = 0; ci < nc; ci++) {
+        int i = e->objCandOn ? e->objCand[ci] : ci;
         const u8 *o = e->oam + i * 8;
         u16 a0 = (u16)(o[0] | o[1] << 8), a1 = (u16)(o[2] | o[3] << 8), a2 = (u16)(o[4] | o[5] << 8);
         int affine = a0 & 0x100, mode = a0 >> 10 & 3, shape = a0 >> 14;
