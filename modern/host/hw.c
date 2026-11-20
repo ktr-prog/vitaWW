@@ -7,8 +7,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <pthread.h>
 #endif
+#include <pthread.h>   // phase sampler thread (all platforms)
+#include <unistd.h>    // usleep
 
 #include "host.h"
 #include "host_mem.h"
