@@ -234,9 +234,20 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     if (!sEnabled || !out) return;
     lazy_init();
     if (sCol6[63] == 0.0f) for (int c = 0; c < 64; c++) sCol6[c] = c / 63.0f;
-    tex_frame_begin(img, pal);
+    {   // lazy texture setup: sync the VRAM ranges of every texture drawn this frame (sets the change flags)
+        uint32_t lastTp = 0, lastPal = 0;
+        int have = 0;
+        for (int k = 0; k < r->npoly; k++) {
+            const G3Polygon *p = r->poly[k];
+            if (p->nv < 3 || !(p->texparam >> 26 & 7)) continue;
+            if (have && p->texparam == lastTp && p->texpal == lastPal) continue;
+            gpu3d_tex_sync_for(p->texparam, p->texpal);
+            lastTp = p->texparam; lastPal = p->texpal; have = 1;
+        }
+    }
+    tex_frame_begin(img, pal);   // re-decode only textures whose VRAM changed since last frame
     uint64_t tStart = host_plat_time_ns();
-    sStCalls++;   // re-decode only textures whose VRAM changed since last frame
+    sStCalls++;
 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
     // frame. By now the GPU has long finished those draws (a whole frame has passed), so glReadPixels does not

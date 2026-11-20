@@ -87,7 +87,7 @@ static void g3_tex_slot(u8 *d, const u8 *const *src, const s32 *srcId, int nsrc,
     g3_tex_sync(d, sTexMerge, n, dirty);
 }
 
-static void g3_tex_setup(void) {
+static void g3_tex_map(void) {
     memset(sNImg, 0, sizeof sNImg);
     memset(sNPal, 0, sizeof sNPal);
     if (gG3Banks)
@@ -103,6 +103,9 @@ static void g3_tex_setup(void) {
                 sPalSrc[s][sNPal[s]] = b << 20; sPal[s][sNPal[s]++] = gG3Banks[b];
             }
         }
+}
+static void g3_tex_setup(void) {
+    g3_tex_map();
     memset(gG3TexDirtyImg, 0, sizeof gG3TexDirtyImg);
     memset(gG3TexDirtyPal, 0, sizeof gG3TexDirtyPal);
     for (int s = 0; s < 4; s++)
@@ -112,6 +115,70 @@ static void g3_tex_setup(void) {
         g3_tex_slot(sPalFlat + s * PAL_SLOT, sPal[s], sPalSrc[s], sNPal[s], PAL_SLOT, &sPalWasActive[s], &sPalLast[s],
                     gG3TexDirtyPal + s * (PAL_SLOT / G3_TEX_BLK));
     (void)kBankSize;
+}
+
+// Lazy variant for the GL renderer: map the slots now, and bring only the byte ranges of the textures actually
+// drawn this frame up to date (g3_sync_img/g3_sync_pal, each 1 KB block at most once per frame), instead of
+// comparing all 640 KB of texture VRAM every frame. Change flags are set for synced blocks that changed; a cached
+// texture not drawn this frame is checked when it is next drawn.
+static u8 sSyncedImg[4 * IMG_SLOT / G3_TEX_BLK], sSyncedPal[8 * PAL_SLOT / G3_TEX_BLK];
+static const u8 kZeroBlk[G3_TEX_BLK] __attribute__((aligned(16)));
+static void g3_tex_setup_lazy(void) {
+    g3_tex_map();
+    memset(gG3TexDirtyImg, 0, sizeof gG3TexDirtyImg);
+    memset(gG3TexDirtyPal, 0, sizeof gG3TexDirtyPal);
+    memset(sSyncedImg, 0, sizeof sSyncedImg);
+    memset(sSyncedPal, 0, sizeof sSyncedPal);
+}
+static void g3_sync_block(u8 *flat, const u8 *const *src, int nsrc, u32 off, u8 *dirty) {
+    static u8 tmp[G3_TEX_BLK] __attribute__((aligned(16)));
+    const u8 *b;
+    if (!nsrc) b = kZeroBlk;
+    else if (nsrc == 1) b = src[0] + off;
+    else {
+        memcpy(tmp, src[0] + off, G3_TEX_BLK);
+        for (int i = 1; i < nsrc; i++) g3_tex_or(tmp, src[i] + off, G3_TEX_BLK);
+        b = tmp;
+    }
+    if (g3_blk_differs(flat, b)) { memcpy(flat, b, G3_TEX_BLK); *dirty = 1; }
+}
+static void g3_sync_img(u32 a, u32 n) {
+    enum { NB = 4 * IMG_SLOT / G3_TEX_BLK, PER = IMG_SLOT / G3_TEX_BLK };
+    if (!n) return;
+    a &= 4 * IMG_SLOT - 1;
+    u32 first = a / G3_TEX_BLK, cnt = (a % G3_TEX_BLK + n + G3_TEX_BLK - 1) / G3_TEX_BLK;
+    if (cnt > NB) cnt = NB;
+    for (u32 i = 0; i < cnt; i++) {
+        u32 b = (first + i) % NB, s = b / PER;
+        if (sSyncedImg[b]) continue;
+        sSyncedImg[b] = 1;
+        g3_sync_block(sImgFlat + b * G3_TEX_BLK, sImg[s], sNImg[s], (b % PER) * G3_TEX_BLK, &gG3TexDirtyImg[b]);
+    }
+}
+static void g3_sync_pal(u32 a, u32 n) {
+    enum { NB = 8 * PAL_SLOT / G3_TEX_BLK, PER = PAL_SLOT / G3_TEX_BLK };
+    if (!n) return;
+    a &= 8 * PAL_SLOT - 1;
+    u32 first = a / G3_TEX_BLK, cnt = (a % G3_TEX_BLK + n + G3_TEX_BLK - 1) / G3_TEX_BLK;
+    if (cnt > NB) cnt = NB;
+    for (u32 i = 0; i < cnt; i++) {
+        u32 b = (first + i) % NB, s = b / PER;
+        if (sSyncedPal[b]) continue;
+        sSyncedPal[b] = 1;
+        g3_sync_block(sPalFlat + b * G3_TEX_BLK, sPal[s], sNPal[s], (b % PER) * G3_TEX_BLK, &gG3TexDirtyPal[b]);
+    }
+}
+// VRAM byte ranges one texture reads: texels, the 4x4-compressed palette indices, and its palette.
+static void g3_tex_sync_for(u32 tp, u32 pp) {
+    static const u8 bpp[8] = {0, 8, 2, 4, 8, 2, 8, 16};
+    static const u32 palBytes[8] = {0, 64, 8, 32, 512, 0x10000, 16, 0};
+    int fmt = tp >> 26 & 7;
+    if (!fmt) return;
+    u32 w = 8u << (tp >> 20 & 7), h = 8u << (tp >> 23 & 7);
+    u32 a = ((tp & 0xffff) << 3) & (4 * IMG_SLOT - 1);
+    g3_sync_img(a, w * h * bpp[fmt] / 8);
+    if (fmt == 5) g3_sync_img(0x20000 + (a & 0x1ffff) / 2 + (a >= 0x40000 ? 0x10000 : 0), w * h / 8);
+    g3_sync_pal(fmt == 2 ? pp << 3 : pp << 4, palBytes[fmt]);
 }
 
 static inline u8 img8(u32 a) { return sImgFlat[a & 0x7ffff]; }

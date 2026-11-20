@@ -597,7 +597,10 @@ void g3_render(void) {
     }
     if (timing) clock_gettime(CLOCK_MONOTONIC, &t0);
     sR = &gG3Render;
-    g3_tex_setup();
+    static int lazy = -1;
+    if (lazy < 0) lazy = !(getenv("ACWW_TEXLAZY") && atoi(getenv("ACWW_TEXLAZY")) == 0);
+    if (sWgpu && lazy) g3_tex_setup_lazy();   // the GL renderer syncs the textures it draws (gpu3d_tex_sync_for)
+    else g3_tex_setup();
     if (sWgpu)
         g3w_render(sR, sImgFlat, sPalFlat, sWgpuReadback ? sColor : NULL);
     else {
@@ -632,6 +635,7 @@ void g3_raster_diagnostics(int on) { sDiag = on; }
 // Decode a whole DS texture (given its texparam/texpal) to RGBA8888 for a GPU renderer. Reuses the software
 // texel decoder g3_texel, which reads the flattened VRAM (sImgFlat/sPalFlat) set up by g3_tex_setup() - so this
 // must be called after that setup (the g3w_render path runs right after g3_render() calls g3_tex_setup()).
+void gpu3d_tex_sync_for(uint32_t texparam, uint32_t texpal) { g3_tex_sync_for(texparam, texpal); }
 void gpu3d_texture_size(uint32_t texparam, int *w, int *h) {
     *w = 8 << (texparam >> 20 & 7);
     *h = 8 << (texparam >> 23 & 7);

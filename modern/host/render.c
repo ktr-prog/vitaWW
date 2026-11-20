@@ -606,14 +606,75 @@ static void overlay_fps(uint32_t *canvas) {
     snprintf(buf, sizeof buf, "%u FPS %u%%", fps, speed);
     overlay_text(canvas, 0, 0, buf);
 }   // render-thread split: 2D bands / present (3D is sRender3dNs)
+// 2D job thread: this frame's 2D bands composite with the PREVIOUS frame's 3D image (the 3D output is double-
+// buffered: the 2D input pointer was taken in the prepass, and this frame's 3D renders into the other buffer), so
+// the 2D work runs here while the render thread does the 3D, instead of one after the other.
+static pthread_mutex_t s2dJobMx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s2dJobGo = PTHREAD_COND_INITIALIZER, s2dJobDoneCv = PTHREAD_COND_INITIALIZER;
+static int s2dJobPending, s2dJobDone = 1, s2dJobStarted;
+static uint64_t s2dJobNs;
+static void *job2d_main(void *a) {
+    (void)a;
+#if HOST_VITA
+    extern int sceKernelChangeThreadCpuAffinityMask(int, int);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
+#endif
+    for (;;) {
+        pthread_mutex_lock(&s2dJobMx);
+        while (!s2dJobPending) pthread_cond_wait(&s2dJobGo, &s2dJobMx);
+        s2dJobPending = 0;
+        pthread_mutex_unlock(&s2dJobMx);
+        uint64_t t = host_plat_time_ns();
+        gpu2d_render_finish();                 // 2D bands + canvas from the per-line/VRAM snapshots
+        s2dJobNs = host_plat_time_ns() - t;
+        pthread_mutex_lock(&s2dJobMx);
+        s2dJobDone = 1;
+        pthread_cond_signal(&s2dJobDoneCv);
+        pthread_mutex_unlock(&s2dJobMx);
+    }
+    return 0;
+}
+static int job2d_start(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        ok = !(getenv("ACWW_2D3D_PARALLEL") && atoi(getenv("ACWW_2D3D_PARALLEL")) == 0);
+        if (ok) {
+            pthread_t t;
+            pthread_attr_t at;
+            pthread_attr_init(&at);
+            pthread_attr_setstacksize(&at, 1 << 20);
+            ok = pthread_create(&t, &at, job2d_main, 0) == 0;
+            s2dJobStarted = ok;
+        }
+    }
+    if (!ok) return 0;
+    pthread_mutex_lock(&s2dJobMx);
+    s2dJobDone = 0;
+    s2dJobPending = 1;
+    pthread_cond_signal(&s2dJobGo);
+    pthread_mutex_unlock(&s2dJobMx);
+    return 1;
+}
+static void job2d_wait(void) {
+    pthread_mutex_lock(&s2dJobMx);
+    while (!s2dJobDone) pthread_cond_wait(&s2dJobDoneCv, &s2dJobMx);
+    pthread_mutex_unlock(&s2dJobMx);
+}
 static void render_worker_phase(void) {
     uint64_t tw = host_plat_time_ns();
-    gpu2d_render_finish();                 // 2D bands + canvas from the per-line/VRAM snapshots
-    __atomic_fetch_add(&sWBandsNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
+    int par = job2d_start();
+    if (!par) {
+        gpu2d_render_finish();             // 2D bands + canvas from the per-line/VRAM snapshots
+        __atomic_fetch_add(&sWBandsNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
+    }
     if (sGpu3d) {
         uint64_t t3d = host_plat_time_ns();
         gpu3d_render_committed();
         sRender3dNs += host_plat_time_ns() - t3d;
+    }
+    if (par) {
+        job2d_wait();
+        __atomic_fetch_add(&sWBandsNs, s2dJobNs, __ATOMIC_RELAXED);
     }
     // Present the canvas this worker just produced. Only the GL present happens here: the frontend body (input
     // polling, UI) is a coroutine on the main thread's stack and keeps running there every DS frame.
