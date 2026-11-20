@@ -378,7 +378,14 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         const float va = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
         float vp[16][4], vc[16][4], vu[16][2];
         for (int i = 0; i < p->nv; i++) {
-            const G3Vertex *v = p->v[i];
+            const G3VHot *v = p->hv[0] ? p->hv[i] : (const G3VHot *)0;
+            G3VHot tmp;
+            if (!v) {   // slow geometry path (ACWW_G3FAST=0): same fields from the full vertex
+                const G3Vertex *f = p->v[i];
+                memcpy(tmp.pos, f->pos, sizeof tmp.pos); memcpy(tmp.color, f->color, sizeof tmp.color);
+                memcpy(tmp.tex, f->tex, sizeof tmp.tex);
+                v = &tmp;
+            }
             // DS clip-space position (pos[]=NDC*w); GL does the divide/viewport/depth and clips the frustum.
             // v->color is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel.
             vp[i][0] = (float)v->pos[0]; vp[i][1] = (float)v->pos[1]; vp[i][2] = (float)v->pos[2]; vp[i][3] = (float)v->pos[3];

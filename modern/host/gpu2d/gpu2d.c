@@ -364,6 +364,7 @@ static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const 
                 tc[x] = c & 0x3f3f3f; tl[x] = LAYER_BG0 | L3D; ta[x] = (u8)a;
             }
         } else {
+            if (!e->bgAny[n]) continue;   // fully transparent on this line
             const u16 *bg = e->bg[n];
             u8 bit = (u8)(1u << n);
             for (int x = 0; x < SCREEN_W; x++)
@@ -967,7 +968,7 @@ static Engine s2dBandEng[N2DBANDS];
 static u8 s2dRegSnap[SCREEN_H][REG_SIZE];   // per-line register state (hblank can change scroll/etc. per scanline)
 static u8 s2dPalSnap[SCREEN_H][0x400];       // per-line palette (hblank can write palette per scanline: sky/water)
 typedef struct { s32 refX[2], refY[2]; int refLine; u8 refWritten[2], winActive[2]; int objMosaicLine, objMosaicCount; } Snap2d;
-typedef struct { const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; } Band2d;
+typedef struct { const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; u32 *canvas; } Band2d;
 
 static void ref_advance(Engine *e, int line) {
     for (int i = 0; i < 2; i++) {
@@ -1005,6 +1006,11 @@ static void band2d_run(Band2d *w) {
         else gpu2d_render_obj_line(e, line, &e->obj);
         render_line(e, w->in, line);     // writes e->out[line] (+defer/side effects), advances obj mosaic
         ref_advance(e, line);
+        if (w->canvas) {   // straight to the canvas: no gather into the engine and no second pass over the frame
+            const u32 *o = e->out + line * SCREEN_W;
+            u32 *d = w->canvas + line * SCREEN_W;
+            for (int x = 0; x < SCREEN_W; x++) d[x] = argb(o[x]);
+        }
     }
 }
 
@@ -1070,9 +1076,10 @@ static void *band2d_helper(void *arg) {
     }
     return 0;
 }
-static void render_engine0_mt_bands(void) {
+static void render_engine0_mt_bands(u32 *canvas) {
     Engine *e = &sEngine[0];
     int nb = s2dNB;
+    for (int b = 0; b < nb; b++) sMtW[b].canvas = canvas;
     while (s2dHelpers < nb - 1) {
         pthread_t t;
         pthread_attr_t at;
@@ -1091,7 +1098,7 @@ static void render_engine0_mt_bands(void) {
     pthread_mutex_lock(&s2dMu);
     while (s2dPending) pthread_cond_wait(&s2dDoneCv, &s2dMu);
     pthread_mutex_unlock(&s2dMu);
-    for (int b = 0; b < nb; b++) {
+    for (int b = 0; b < nb && !canvas; b++) {
         int lo = sMtBnd[b], n = sMtBnd[b + 1] - lo;
         memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
         if (sDefer3d) memcpy(e->defer + lo * SCREEN_W, s2dBandEng[b].defer + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
@@ -1126,8 +1133,11 @@ static void canvas_hash(void) {
 void gpu2d_render_finish(void) {
     if (!sMtPending) return;
     sMtPending = 0;
-    render_engine0_mt_bands();
-    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) sCanvas[i] = argb(sEngine[0].out[i]);
+    if (sDefer3d) {
+        render_engine0_mt_bands(NULL);
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) sCanvas[i] = argb(sEngine[0].out[i]);
+    } else
+        render_engine0_mt_bands(sCanvas);   // (engine 0's own out[] is then not filled: only the canvas is shown)
     sCanvasRows = SCREEN_H;
     sFrame++;
     canvas_hash();
@@ -1137,7 +1147,7 @@ void gpu2d_render_finish(void) {
 static int render_engine0_mt(const Gpu2dFrameInput *in) {
     render_engine0_mt_prepass(in);
     if (sDeferBands) { sMtPending = 1; return 1; }   // worker will run the bands + tail via gpu2d_render_finish()
-    render_engine0_mt_bands();
+    render_engine0_mt_bands(NULL);
     return 1;
 }
 

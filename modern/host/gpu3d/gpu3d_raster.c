@@ -601,9 +601,10 @@ void g3_render(void) {
     if (lazy < 0) lazy = !(getenv("ACWW_TEXLAZY") && atoi(getenv("ACWW_TEXLAZY")) == 0);
     if (sWgpu && lazy) g3_tex_setup_lazy();   // the GL renderer syncs the textures it draws (gpu3d_tex_sync_for)
     else g3_tex_setup();
+    extern int gG3ClipSpaceOut;
     if (sWgpu)
         g3w_render(sR, sImgFlat, sPalFlat, sWgpuReadback ? sColor : NULL);
-    else {
+    else if (!gG3ClipSpaceOut) {   // (clip-space geometry only feeds a GPU backend: a host ACWW_G3CLIPOUT test)
         render_bands();
     }
     sShown ^= 1;

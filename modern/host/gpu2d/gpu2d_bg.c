@@ -39,7 +39,7 @@ static u16 tile8_pixel(const Engine *e, u32 charBase, u16 entry, u32 px, u32 py,
     return (u16)((c & 0x7fff) | PIX_OPAQUE);
 }
 
-static void text_line(Engine *e, int n, int line, u16 *dst) {
+static int text_line(Engine *e, int n, int line, u16 *dst) {
     u16 cnt = reg16(e, REG_BGCNT + 2 * n);
     u32 hofs = reg16(e, REG_BGHOFS + 4 * n) & 0x1ff, vofs = reg16(e, REG_BGVOFS + 4 * n) & 0x1ff;
     u32 cb = char_base(e, cnt), mb = map_base(e, cnt);
@@ -49,29 +49,43 @@ static void text_line(Engine *e, int n, int line, u16 *dst) {
     int color256 = cnt & 0x80;
     const u8 *ext = color256 ? ext_palette(e, n, cnt) : NULL;
     gpu2d_feature(e, color256 ? (ext ? F_TEXT8_EXTPAL : F_TEXT8) : F_TEXT4);
+    // Per tile: one pointer lookup for the whole row (a tile row is 4/8 bytes, 32/64-byte aligned, so it never
+    // straddles a VRAM granule) instead of a granule lookup per byte; an all-transparent row is just zeroes.
+    const u32 bgm = e->bgMask;
+    int any = 0;
     for (int x = 0; x < SCREEN_W;) {
         u32 sx = (x + hofs) & (wide - 1);
         u16 entry = bg16(e, rowBase + (sx >= 256 ? 0x800u : 0) + (sx & 255) / 8 * 2);
         u32 tile = entry & 0x3ffu, py = entry & 0x800 ? 7 - (y & 7) : y & 7;
+        int flip = entry & 0x400 ? 7 : 0;
+        u32 px = sx & 7;
+        int cnt8 = 8 - (int)px;
+        if (cnt8 > SCREEN_W - x) cnt8 = SCREEN_W - x;
         u8 row[8];
         const u8 *pal;
         if (color256) {
-            for (u32 i = 0; i < 8; i++) row[i] = bg8(e, cb + tile * 64 + py * 8 + i);
+            u32 a = (cb + tile * 64 + py * 8) & bgm;
+            const u8 *t = e->bgGran[a >> GRANULE_SHIFT] + (a & (GRANULE - 1));
+            u32 lo = (u32)t[0] | (u32)t[1] << 8 | (u32)t[2] << 16 | (u32)t[3] << 24;
+            u32 hi = (u32)t[4] | (u32)t[5] << 8 | (u32)t[6] << 16 | (u32)t[7] << 24;
+            if (!(lo | hi)) { for (int i = 0; i < cnt8; i++) dst[x + i] = 0; x += cnt8; continue; }
+            for (u32 i = 0; i < 4; i++) { row[i] = (u8)(lo >> 8 * i); row[4 + i] = (u8)(hi >> 8 * i); }
             pal = ext ? ext + (entry >> 12) * 512u : e->palette;
         } else {
-            for (u32 i = 0; i < 4; i++) {
-                u8 b = bg8(e, cb + tile * 32 + py * 4 + i);
-                row[2 * i] = b & 15;
-                row[2 * i + 1] = b >> 4;
-            }
+            u32 a = (cb + tile * 32 + py * 4) & bgm;
+            const u8 *t = e->bgGran[a >> GRANULE_SHIFT] + (a & (GRANULE - 1));
+            u32 w = (u32)t[0] | (u32)t[1] << 8 | (u32)t[2] << 16 | (u32)t[3] << 24;
+            if (!w) { for (int i = 0; i < cnt8; i++) dst[x + i] = 0; x += cnt8; continue; }
+            for (u32 i = 0; i < 8; i++) row[i] = (u8)(w >> 4 * i & 15);
             pal = e->palette + (entry >> 12) * 32u;
         }
-        int flip = entry & 0x400 ? 7 : 0;
-        for (u32 px = sx & 7; px < 8 && x < SCREEN_W; px++, x++) {
+        any = 1;
+        for (int i = 0; i < cnt8; i++, px++, x++) {
             u8 idx = row[px ^ flip];
             dst[x] = idx ? (u16)((pal16(pal, idx) & 0x7fff) | PIX_OPAQUE) : 0;
         }
     }
+    return any;
 }
 
 static void affine_start(const Engine *e, int n, int line, s32 *x, s32 *y, s32 *pa, s32 *pc) {
@@ -153,10 +167,12 @@ void gpu2d_render_bg_line(Engine *e, int n, int line) {
     u32 dispcnt = reg32(e, REG_DISPCNT);
     int mode = dispcnt & 7;
     u16 cnt = reg16(e, REG_BGCNT + 2 * n);
-    memset(dst, 0, sizeof e->bg[n]);
-    if (!(dispcnt & 0x100u << n)) return;
-    if (e->num == 1 && mode > 5) return;
-    if (n == 0 && e->num == 0 && (dispcnt & 8)) return;
+    e->bgAny[n] = 0;
+    if (!(dispcnt & 0x100u << n) || (e->num == 1 && mode > 5) || (n == 0 && e->num == 0 && (dispcnt & 8))) {
+        memset(dst, 0, sizeof e->bg[n]);
+        return;
+    }
+    e->bgAny[n] = 1;   // (conservative for the non-text kinds)
     int mosaic = cnt & 0x40;
     u16 mos = reg16(e, REG_MOSAIC);
     if (mosaic) {
@@ -164,7 +180,7 @@ void gpu2d_render_bg_line(Engine *e, int n, int line) {
         line -= line % ((mos >> 4 & 15) + 1);
     }
     switch (kBgKinds[mode][n]) {
-    case BG_TEXT: text_line(e, n, line, dst); break;
+    case BG_TEXT: e->bgAny[n] = (u8)text_line(e, n, line, dst); break;
     case BG_AFFINE: affine_line(e, n, line, dst); break;
     case BG_EXTENDED: extended_line(e, n, line, dst); break;
     case BG_LARGE: {
@@ -173,7 +189,7 @@ void gpu2d_render_bg_line(Engine *e, int n, int line) {
         bitmap_line(e, n, line, dst, 0, kW[cnt >> 14], kH[cnt >> 14], 0);
         break;
     }
-    default: break;
+    default: memset(dst, 0, sizeof e->bg[n]); e->bgAny[n] = 0; break;
     }
     int mw = (mos & 15) + 1;
     if (mosaic && mw > 1)

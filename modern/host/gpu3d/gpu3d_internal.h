@@ -30,7 +30,16 @@ typedef struct G3Vertex {
     s32 dbgClip[8];
 } G3Vertex;
 
+// Lean vertex for the GL path (gG3ClipSpaceOut): clip-space position, 9-bit colour, texcoord. One cache line;
+// written once by the geometry worker and only read by the GL renderer.
+typedef struct G3VHot {
+    s32 pos[4];
+    s32 color[3];
+    s16 tex[2];
+} G3VHot;
+
 typedef struct G3Polygon {
+    const G3VHot *hv[4];   // GL fast path: the vertices (v[] unused there); NULL hv[0] = use v[]
     G3Vertex *v[10];
     int nv;
     s32 z[10];

@@ -60,6 +60,18 @@ static int sStripValid;
 static s32 sPosResult[4];
 static s16 sVecResult[3];
 
+// GL fast path (gG3ClipSpaceOut without gG3GpuXform, i.e. the Vita): every vertex is computed once straight into
+// a compact per-bank pool and polygons point into it - no 136-byte G3Vertex built, copied into a polygon-local
+// array, copied again into vertex RAM and shifted down for strips. sNumVerts still counts vertex RAM as the
+// hardware does (strip-shared vertices once, culled polygons' none) for the overflow limit; the pool only holds
+// the data, so it has room for the culled polygons' vertices too.
+enum { G3_POOL_N = MAX_VERTICES * 2 };
+static G3VHot *sPool[2];
+static int sPoolN;
+static G3VHot sPoolSpill;          // target when the pool is full: the polygon is then dropped as an overflow
+static const G3VHot *sTempH[4];
+static int sFastGL = -1;           // -1: decide at the first vertex (the backend sets gG3ClipSpaceOut at init)
+HOST_STATE_KEEP(sPool) HOST_STATE_KEEP(sFastGL)
 static G3Vertex sVertexRam[2][MAX_VERTICES];
 static G3Polygon sPolyRam[2][MAX_POLYGONS];
 static int sBank;
@@ -815,8 +827,141 @@ static void submit_polygon(void) {
     if (!poly->translucent) sNumOpaque++;
 }
 
+// GL fast path polygon: the same outcome as submit_polygon() with gG3ClipSpaceOut (no CPU clip, so never a
+// phantom or split polygon), but vertices by pointer into the pool and only the fields the GL renderer reads.
+static void submit_polygon_fast(void) {
+    sPolyDone = 1;
+    sPolySerial++;
+    int nv = sPolyType & 1 ? 4 : 3;
+    const G3VHot *v[4];
+    if (sPolyType == 2 && (sStripPolys & 1)) { v[0] = sTempH[1]; v[1] = sTempH[0]; v[2] = sTempH[2]; }
+    else if (sPolyType == 3) { v[0] = sTempH[0]; v[1] = sTempH[1]; v[2] = sTempH[3]; v[3] = sTempH[2]; }
+    else { v[0] = sTempH[0]; v[1] = sTempH[1]; v[2] = sTempH[2]; v[3] = sTempH[3]; }
+
+    s64 ax = v[1]->pos[0] - v[0]->pos[0], ay = v[1]->pos[1] - v[0]->pos[1], aw = v[1]->pos[3] - v[0]->pos[3];
+    s64 bx = v[2]->pos[0] - v[0]->pos[0], by = v[2]->pos[1] - v[0]->pos[1], bw = v[2]->pos[3] - v[0]->pos[3];
+    s64 nx = ay * bw - aw * by, ny = aw * bx - ax * bw, nw = ax * by - ay * bx;
+    s64 dot = nx * v[0]->pos[0] + ny * v[0]->pos[1] + nw * v[0]->pos[3];
+    int facing = dot >= 0;
+    u32 attr = sCurPolyAttr;
+    sPolyOutcome = 0;
+    sPolyNOut = 0;
+    if (facing ? !(attr & 0x80) : !(attr & 0x40)) { sStripValid = 0; sPolyOutcome = 1; return; }
+    sPolyNOut = nv;
+    sPolyClipped = 0;
+
+    int strip = sPolyType == 2 || sPolyType == 3;
+    int need = nv - (strip && sStripValid ? 2 : 0);
+    int spill = 0;
+    for (int i = 0; i < nv; i++) spill |= v[i] == &sPoolSpill;
+    if (sNumPolys >= MAX_POLYGONS || sNumVerts + need > MAX_VERTICES || spill) {
+        sRamOverflow = 1;
+        sPolyOutcome = 5;
+        sStripValid = 0;
+        return;
+    }
+    if (strip) sStripValid = 1;
+    // One-dot polygons: the slow GL path never computes screen x/y (they stay 0), so every polygon counts as one
+    // dot there and only the depth test below decides. Same here, from the same normalised w.
+    if (!(attr & (1u << 13))) {
+        int ws = 0;
+        for (int i = 0; i < nv; i++) { u32 w = (u32)v[i]->pos[3]; while ((w >> ws) && ws < 32) ws += 4; }
+        s32 wmin = 0x7fffffff;
+        for (int i = 0; i < nv; i++) {
+            u32 w = (u32)v[i]->pos[3];
+            s32 wn = (s32)(ws < 16 ? w << (16 - ws) : w >> (ws - 16));
+            if (wn < wmin) wmin = wn;
+        }
+        if (wmin > ((s32)sDot1Depth << 9) / 0x200 * 0x200 && wmin > (s32)sDot1Depth) {
+            sPolyOutcome = 4;
+            sStripValid = 0;
+            return;
+        }
+    }
+    sNumVerts += need;
+    G3Polygon *poly = &sPolyRam[sBank][sNumPolys];
+    poly->hv[0] = v[0]; poly->hv[1] = v[1]; poly->hv[2] = v[2]; poly->hv[3] = nv == 4 ? v[3] : 0;
+    poly->v[0] = poly->v[1] = poly->v[2] = poly->v[3] = 0;
+    poly->nv = nv;
+    poly->attr = attr;
+    poly->texparam = sTexParam;
+    poly->texpal = sTexPal;
+    poly->facing = (u8)facing;
+    u32 alpha = attr >> 16 & 31;
+    int fmt = sTexParam >> 26 & 7;
+    int tl = (alpha > 0 && alpha < 31) || fmt == 1 || fmt == 6;
+    poly->translucent = (u8)tl;
+    int mode = attr >> 4 & 3;
+    poly->shadowMask = mode == 3 && (attr >> 24 & 63) == 0;
+    poly->shadow = mode == 3 && (attr >> 24 & 63) != 0;
+    poly->wbuffer = (u8)(sFlushParam >> 1 & 1);
+    poly->sortKey = tl ? 1u << 21 : 0;
+    poly->index = sNumPolys;
+    poly->yofs = (s16)G3_YOFS;
+    poly->norig = 0;
+    poly->ytop = 0;
+    sNumPolys++;
+    if (!tl) sNumOpaque++;
+}
+
+static void submit_vertex_fast(void) {
+    if (!sMT) update_clip();
+    const s32 *cm = gClipM->m;
+    G3VHot *v;
+    if (sPoolN < G3_POOL_N) v = &sPool[sBank][sPoolN++];
+    else { v = &sPoolSpill; sRamOverflow = 1; }
+    s32 x = sVtx[0], y = sVtx[1], z = sVtx[2];
+    for (int i = 0; i < 4; i++)
+        v->pos[i] = (s32)(((s64)x * cm[i] + (s64)y * cm[4 + i] + (s64)z * cm[8 + i] + ((s64)cm[12 + i] << 12)) >> 12);
+    for (int i = 0; i < 3; i++) v->color[i] = sVtxColor[i] ? sVtxColor[i] << 4 | 0xf : 0;
+    if ((sTexParam >> 30) == 3) {
+        const s32 *tm = gTexM->m;
+        for (int i = 0; i < 2; i++)
+            v->tex[i] = (s16)((((s64)x * tm[i] + (s64)y * tm[4 + i] + (s64)z * tm[8 + i]) >> 24) + sTexRaw[i]);
+    } else {
+        v->tex[0] = sTexCoord[0];
+        v->tex[1] = sTexCoord[1];
+    }
+    sTempH[sVtxInPoly++] = v;
+    sVtxCount++;
+    switch (sPolyType) {
+    case 0: if (sVtxInPoly == 3) { submit_polygon_fast(); sVtxInPoly = 0; } break;
+    case 1: if (sVtxInPoly == 4) { submit_polygon_fast(); sVtxInPoly = 0; } break;
+    case 2:
+        if (sVtxInPoly == 3) {
+            submit_polygon_fast();
+            sStripPolys++;
+            sTempH[0] = sTempH[1]; sTempH[1] = sTempH[2];
+            sVtxInPoly = 2;
+        }
+        break;
+    case 3:
+        if (sVtxInPoly == 4) {
+            submit_polygon_fast();
+            sStripPolys++;
+            sTempH[0] = sTempH[2]; sTempH[1] = sTempH[3];
+            sVtxInPoly = 2;
+        }
+        break;
+    }
+}
+
+static int fast_gl_decide(void) {
+    if (sFastGL < 0) {
+        const char *e = getenv("ACWW_G3FAST");
+        sFastGL = gG3ClipSpaceOut && !gG3GpuXform && !(e && !atoi(e));
+        if (sFastGL) {
+            for (int b = 0; b < 2; b++)
+                if (!sPool[b] && !(sPool[b] = malloc(sizeof(G3VHot) * G3_POOL_N))) sFastGL = 0;
+            fprintf(stderr, "gpu3d: lean GL vertex path %s\n", sFastGL ? "on" : "off (no memory)");
+        }
+    }
+    return sFastGL;
+}
+
 static void submit_vertex(void) {
     if (!sInBegin) return;
+    if (sFastGL > 0 || (sFastGL < 0 && fast_gl_decide())) { submit_vertex_fast(); return; }
     if (!sMT) update_clip();
     const s32 *cm = gClipM->m, *tm = gTexM->m;
     G3Vertex *v = &sTemp[sVtxInPoly];
@@ -904,6 +1049,27 @@ static void box_test(const u32 *p) {
     sGxStat = (sGxStat & ~2u) | (in ? 2u : 0);
 }
 
+// Lit-colour cache: lighting() is a pure function of the raw normal, the vector matrix, the light/material state
+// and the polygon's light-enable bits. Models repeat normals a lot (flat ground, faceted meshes), so remember the
+// colour per raw normal until any of those inputs change (sLitGen bump) - same result, no recompute.
+typedef struct { u32 key, gen; u8 col[3], attr; } LitEnt;
+static LitEnt sLitCache[256];
+static u32 sLitGen = 1;
+static void lit_cached(u32 raw) {
+    if (sFeaturesOn > 1) { lighting(); return; }
+    u32 h = (raw ^ raw >> 10 ^ raw >> 20) & 255;
+    LitEnt *c = &sLitCache[h];
+    u8 attr = (u8)(sCurPolyAttr & 15);
+    if (c->gen == sLitGen && c->key == raw && c->attr == attr) {
+        sVtxColor[0] = c->col[0]; sVtxColor[1] = c->col[1]; sVtxColor[2] = c->col[2];
+        sCurLightRec = -1;
+        return;
+    }
+    lighting();
+    c->gen = sLitGen; c->key = raw; c->attr = attr;
+    c->col[0] = sVtxColor[0]; c->col[1] = sVtxColor[1]; c->col[2] = sVtxColor[2];
+}
+
 static u32 sExecParams[32];
 static int sExecCount, sExecCmd = -1;
 
@@ -923,6 +1089,9 @@ static void execute(u8 cmd, const u32 *p) {
         if (f >= 0 && sFrame == (u64)f) fprintf(stderr, "cmdlog %02x %08x tex %08x vin %d\n", cmd, p[0], sTexParam, sVtxInPoly);
     }
     g3_feature(F_CMD + (cmd & 0x7f));
+    // Lighting inputs changed. With the GX worker, matrix commands run on the game thread and the worker sees the
+    // vector matrix only through its 0xf1 snapshot (which bumps there): the counter stays single-writer.
+    if ((cmd >= 0x30 && cmd <= 0x34) || (!sMT && cmd >= 0x10 && cmd <= 0x1c)) sLitGen++;
     Mtx a;
     switch (cmd) {
     case 0x10: sMtxMode = p[0] & 3; break;
@@ -985,7 +1154,7 @@ static void execute(u8 cmd, const u32 *p) {
                 sTexCoord[i] = (s16)((((s64)sNormal[0] * gTexM->m[i] + (s64)sNormal[1] * gTexM->m[4 + i] +
                                        (s64)sNormal[2] * gTexM->m[8 + i]) >> 24) + sTexRaw[i]);
         }
-        lighting();
+        lit_cached(p[0] & 0x3fffffff);
         break;
     case 0x22:
         sTexRaw[0] = (s16)p[0];
@@ -1165,7 +1334,7 @@ static void *mt_worker(void *arg) {
             }
             switch (c) {
             case 0xf0: gpu3d_write16_now(p[0], (u16)p[1]); break;
-            case 0xf1: memcpy(wClip.m, p, sizeof wClip.m); memcpy(wVec.m, p + 16, sizeof wVec.m); break;
+            case 0xf1: memcpy(wClip.m, p, sizeof wClip.m); memcpy(wVec.m, p + 16, sizeof wVec.m); sLitGen++; break;
             case 0xf2: memcpy(wTex.m, p, sizeof wTex.m); break;
             case 0x71: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); sVtx[2] = (s16)p[1]; break;   // result: game thread
             default: execute((u8)c, p); break;
@@ -1335,7 +1504,23 @@ static inline __attribute__((always_inline)) void gxfifo_write_mt(u32 v) {
         sPackLeft = 4;
         pack_advance_mt();
     } else {
-        mt_entry(sPackCmds & 0xff, v);
+        u8 c = sPackCmds & 0xff;
+        // Fast path: a one-parameter pass-through command (colour, normal, texcoord, vertex packed, ...) with
+        // nothing pending - header and parameter go straight into the ring. Same ring contents as mt_entry.
+        if (kParams[c] == 1 && sStrMode == 0 && sExecCmd < 0 && !sMtCvDirty && !sMtTexDirty && mt_streamable(c) &&
+            sMtWLocal - sMtRSeen + 2 <= MTQ_N) {
+            u32 w = sMtWLocal;
+            sMtQ[w & MTQ_M] = c | 1u << 8;
+            sMtQ[(w + 1) & MTQ_M] = v;
+            sMtWLocal = w + 2;
+            mt_command_done(0);
+            sPackParamsLeft = 0;
+            sPackCmds >>= 8;
+            sPackLeft--;
+            pack_advance_mt();
+            return;
+        }
+        mt_entry(c, v);
         if (--sPackParamsLeft == 0) {
             sPackCmds >>= 8;
             sPackLeft--;
@@ -1425,8 +1610,29 @@ static void do_swap(void) {
     r->fogColor = sRegs[(0x358 - 0x320) / 2] | (u32)sRegs[(0x35a - 0x320) / 2] << 16;
     r->fogOffset = sRegs[(0x35c - 0x320) / 2] & 0x7fff;
     for (int i = 0; i < 32; i++) r->fogTable[i] = (u8)(sRegs[(0x360 - 0x320) / 2 + i / 2] >> (8 * (i & 1))) & 0x7f;
+    {   // ACWW_G3HASH: per-frame hash of what the GL renderer reads (A/B check of the geometry paths)
+        static int on = -1;
+        if (on < 0) on = getenv("ACWW_G3HASH") != 0;
+        if (on) {
+            u64 h = 1469598103934665603ull;
+#define H(x) (h = (h ^ (u64)(u32)(x)) * 1099511628211ull)
+            for (int i = 0; i < r->npoly; i++) {
+                const G3Polygon *p = r->poly[i];
+                H(p->nv); H(p->attr); H(p->texparam); H(p->texpal); H(p->translucent); H(p->sortKey);
+                for (int k = 0; k < p->nv && k < 4; k++) {
+                    const s32 *pos = p->hv[0] ? p->hv[k]->pos : p->v[k]->pos;
+                    const s32 *col = p->hv[0] ? p->hv[k]->color : p->v[k]->color;
+                    const s16 *tx = p->hv[0] ? p->hv[k]->tex : p->v[k]->tex;
+                    H(pos[0]); H(pos[1]); H(pos[2]); H(pos[3]); H(col[0]); H(col[1]); H(col[2]); H(tx[0]); H(tx[1]);
+                }
+            }
+#undef H
+            fprintf(stderr, "g3hash %llu %d %016llx\n", (unsigned long long)sFrame, r->npoly, (unsigned long long)h);
+        }
+    }
     sBank ^= 1;
     sNumPolys = sNumVerts = sNumOpaque = 0;
+    sPoolN = 0;
     sStripValid = 0;
     sFlushPending = 0;
 }
@@ -1445,6 +1651,8 @@ void gpu3d_reset(void) {
     sPackLeft = sPackParamsLeft = 0;
     sExecCmd = -1;
     sNumPolys = sNumVerts = sNumOpaque = 0;
+    sPoolN = 0;
+    if (getenv("ACWW_G3CLIPOUT")) gG3ClipSpaceOut = 1;   // host test of the GL geometry paths (no 3D drawn)
     memset(&gG3Render, 0, sizeof gG3Render);
     if (sFeaturesOn < 0) sFeaturesOn = getenv("ACWW_GPU3D_FEATURES") ? atoi(getenv("ACWW_GPU3D_FEATURES")) : 0;
 }

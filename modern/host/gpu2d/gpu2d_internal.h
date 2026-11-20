@@ -57,6 +57,7 @@ typedef struct Engine {
     u8 refWritten[2];
     u8 winActive[2];
     u16 bg[4][SCREEN_W];
+    u8 bgAny[4];   // the BG line just rendered may have an opaque pixel (0: all transparent)
     ObjLine obj;
     ObjLine objNextLine0;
     int haveNextLine0;
