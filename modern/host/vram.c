@@ -103,12 +103,11 @@ static int snap_blk_differs(const u8 *a, const u8 *b) {
     for (int i = 0; i < SNAP_BLK / 4; i++) acc |= x[i] ^ y[i];
     return acc != 0;
 }
+// Plain copy: comparing first was much slower on the Vita than its optimized memcpy (6.8 ms vs ~2.5 ms per frame on
+// the game thread), so no dirty flags are produced (the texture setup compares on the render thread instead).
 static void snap_granule(u8 *dst, const u8 *src, u32 o, int full) {
-    for (u32 k = 0; k < GRANULE; k += SNAP_BLK) {
-        int d = full || snap_blk_differs(dst + o + k, src + k);
-        if (d) memcpy(dst + o + k, src + k, SNAP_BLK);
-        sSnapDirty[(o + k) / SNAP_BLK] = (u8)d;
-    }
+    (void)full;
+    memcpy(dst + o, src, GRANULE);
 }
 void host_vram_snapshot_live(u8 *dst) {
     static u8 covered[BANK_TOTAL / GRANULE];

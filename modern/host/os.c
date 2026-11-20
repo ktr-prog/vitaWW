@@ -38,7 +38,7 @@ void host_deliver_irqs(void) {
         host_irq_ack(1u << bit);
         sInIrq = 1;
         sIrqDisabled = 0x80;
-        if (data_027e0000[bit]) data_027e0000[bit]();
+        if (data_027e0000[bit]) HOST_PHASE(PH_IRQ, data_027e0000[bit]());
         sIrqDisabled = 0;
         sInIrq = 0;
         OSThread *t = data_027e0450.head;

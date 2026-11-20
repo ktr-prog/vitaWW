@@ -46,6 +46,8 @@ static u8 sTexMerge[IMG_SLOT] __attribute__((aligned(16)));
 static int g3_blk_differs(const u8 *a, const u8 *b) {
     const u32 *x = (const u32 *)a, *y = (const u32 *)b;
     u32 acc = 0;
+    // Prefetch the next block (the Vita's RAM latency dominates a plain streaming compare; memcpy prefetches too).
+    for (int p = 0; p < G3_TEX_BLK; p += 64) { __builtin_prefetch(a + G3_TEX_BLK + p); __builtin_prefetch(b + G3_TEX_BLK + p); }
     for (int i = 0; i < G3_TEX_BLK / 4; i++) acc |= x[i] ^ y[i];
     return acc != 0;
 }

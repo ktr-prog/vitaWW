@@ -433,7 +433,15 @@ static void dump_state(void) {
     }
 }
 
+static void snd7_run_body(u64 now);
+extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 4 = PH_AUDIO
 void snd7_run(u64 now) {
+    unsigned char ph = gHostPhase;
+    gHostPhase = 4;
+    snd7_run_body(now);
+    gHostPhase = ph;
+}
+static void snd7_run_body(u64 now) {
     if (!sInit) snd7_init();
     while (!sTimerStopped && sNextTick <= now) {
         alarms_run(sNextTick);

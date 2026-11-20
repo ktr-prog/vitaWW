@@ -749,7 +749,7 @@ static void render_frame_mt(void) {
         static const u8 *dirty[9];
         const u8 *d = host_vram_snapshot_dirty();
         for (int i = 0; i < 9; i++) dirty[i] = d + host_vram_bank_offset(i) / 1024;
-        gpu3d_set_bank_dirty(dirty);         // changed 1 KB blocks of each snapshot bank (for the texture setup)
+        (void)dirty;   // the snapshot is a plain copy (no dirty flags): the texture setup compares on the render thread
     }
     uint64_t c0 = host_plat_time_ns();
     gpu3d_commit(sSnapBank);                // swap geometry + bind snapshot texture banks (no rasterization)

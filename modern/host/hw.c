@@ -93,7 +93,7 @@ static void *phase_sampler(void *arg) {
 #endif
     for (;;) {
         __atomic_fetch_add(&sPhaseCount[gHostPhase % HOST_PHASES], 1, __ATOMIC_RELAXED);
-        usleep(250);
+        usleep(1000);   // ~1 ms ticks: enough samples per report, little disturbance to the game thread
     }
     return 0;
 }
@@ -113,9 +113,9 @@ static void phase_report(void) {
     if (!tot) return;
 #define PCT(i) (unsigned)(c[i] * 100 / tot)
     fprintf(stderr, "game thread (%llu samples, %% of wall time): game code %u, GX writes %u, other I/O %u, VRAM remap %u, "
-            "audio %u, render hand-off %u, waiting %u, pacing sleep %u, frontend %u\n", tot,
+            "audio %u, render hand-off %u, waiting %u, pacing sleep %u, frontend %u, IRQ handlers %u, events %u, DMA %u\n", tot,
             PCT(PH_GAME), PCT(PH_GX), PCT(PH_IO), PCT(PH_VRAM), PCT(PH_AUDIO), PCT(PH_RENDER), PCT(PH_WAIT),
-            PCT(PH_PACE), PCT(PH_FRONTEND));
+            PCT(PH_PACE), PCT(PH_FRONTEND), PCT(PH_IRQ), PCT(PH_EVENTS), PCT(PH_DMA));
     (void)0;
 #undef PCT
 }
@@ -261,7 +261,7 @@ static void run_events(void) {
     if (sInEvents) return;
     sInEvents = 1;
     sTimeless = 0;
-    run_events_body();
+    HOST_PHASE(PH_EVENTS, run_events_body());
     __atomic_store_n(&sHeartbeat, (u32)sCycles, __ATOMIC_RELAXED);
     sInEvents = 0;
 }
@@ -476,7 +476,9 @@ static uintptr_t dma_address(u32 reg, uintptr_t full) { return (u32)full == reg 
 static int dma_is_io(uintptr_t a) { return a <= 0xffffffffu && is_io((u32)a); }
 void gx_fifo_write(u32 addr, u32 value);
 void gpu3d_write32(u32 addr, u32 value);
-static void dma_run(int ch) {
+static void dma_run_body(int ch);
+static void dma_run(int ch) { HOST_PHASE(PH_DMA, dma_run_body(ch)); }
+static void dma_run_body(int ch) {
     u32 base = 0x040000b0 + ch * 12, cnt = R32(base + 8);
     uintptr_t src = dma_address(R32(base), sDmaSrc[ch]), dst = dma_address(R32(base + 4), sDmaDst[ch]);
     u32 n = cnt & 0x1fffff, w = (cnt >> 26 & 1) ? 4 : 2;

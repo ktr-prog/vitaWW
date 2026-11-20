@@ -1,6 +1,12 @@
 
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
+#if HOST_VITA
+#define HOST_VITA_AUDIO 1
+#else
+#define HOST_VITA_AUDIO 0
+#endif
 
 #include "snd7.h"
 
@@ -222,7 +228,15 @@ static s32 run_channel(int ch) {
         s->hist[s->hn++ & (FIR_HIST - 1)] = (s16)(s->cur < -0x8000 ? -0x8000 : s->cur > 0x7fff ? 0x7fff : s->cur);
     }
     u32 per = 0x10000u - r->tmr;
-    s32 v = per < TIMER_STEP && format_of(ch) != 3 ? filtered(s, r->tmr, per) : s->cur;
+    // Voices played faster than the output rate: the windowed-sinc FIR (cleaner than the DS) is most of the mixing
+    // cost; the Vita uses the hardware's own sample-and-hold instead (ACWW_AUDIO_FIR=1 restores the filter).
+    static int fir = -1;
+    if (fir < 0) {
+        fir = !HOST_VITA_AUDIO;
+        const char *e = getenv("ACWW_AUDIO_FIR");
+        if (e) fir = atoi(e) != 0;
+    }
+    s32 v = fir && per < TIMER_STEP && format_of(ch) != 3 ? filtered(s, r->tmr, per) : s->cur;
     return (v << kVolShift[r->cnt >> 8 & 3]) * (s32)(r->cnt & 0x7f);
 }
 
