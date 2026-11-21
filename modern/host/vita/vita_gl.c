@@ -121,20 +121,57 @@ int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
     sGcState = -1;
     if (!sReady) return 0;
-    // Cg sources compiled as is (GL_CG_*: not through vitaGL's GLSL translator). Each step is logged, so a
-    // failure on a device shows where it happened.
-    fprintf(stderr, "vita_gl: GPU compose: compiling shaders\n");
-    GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, kGcVertexShaderCg);
-    GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, kGcFragmentShaderCg) : 0;
-    if (!vs || !fs) return 0;
-    fprintf(stderr, "vita_gl: GPU compose: linking\n");
+    // Cg sources compiled as is (GL_CG_*: not through vitaGL's GLSL translator). Compiling takes seconds on the
+    // Vita, so the linked program is kept in ux0:data/vitaWW (keyed by a hash of the sources) and loaded from there
+    // on later starts. Each step is logged, so a failure on a device shows where it happened.
+    unsigned long long h = 1469598103934665603ull;
+    for (const char *q = kGcVertexShaderCg; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
+    for (const char *q = kGcFragmentShaderCg; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
+    char cachePath[96];
+    snprintf(cachePath, sizeof cachePath, "ux0:data/vitaWW/compose-%016llx.bin", h);
     sGcProg = glCreateProgram();
-    glAttachShader(sGcProg, vs);
-    glAttachShader(sGcProg, fs);
-    glLinkProgram(sGcProg);
-    GLint ok = 0;
-    glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
-    if (!ok) { fprintf(stderr, "vita_gl: compose program failed to link\n"); return 0; }
+    int fromCache = 0;
+    FILE *cf = fopen(cachePath, "rb");
+    if (cf) {
+        fseek(cf, 0, SEEK_END);
+        long len = ftell(cf);
+        fseek(cf, 0, SEEK_SET);
+        void *bin = len > 0 ? malloc((size_t)len) : NULL;
+        if (bin && fread(bin, 1, (size_t)len, cf) == (size_t)len) {
+            glProgramBinary(sGcProg, 0, bin, (GLsizei)len);
+            GLint ok = 0;
+            glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
+            fromCache = ok != 0;
+        }
+        free(bin);
+        fclose(cf);
+        fprintf(stderr, "vita_gl: GPU compose: shaders %s the cache\n", fromCache ? "loaded from" : "could not be loaded from");
+        if (!fromCache) { glDeleteProgram(sGcProg); sGcProg = glCreateProgram(); }
+    }
+    if (!fromCache) {
+        fprintf(stderr, "vita_gl: GPU compose: compiling shaders (first start only)\n");
+        GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, kGcVertexShaderCg);
+        GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, kGcFragmentShaderCg) : 0;
+        if (!vs || !fs) return 0;
+        fprintf(stderr, "vita_gl: GPU compose: linking\n");
+        glAttachShader(sGcProg, vs);
+        glAttachShader(sGcProg, fs);
+        glLinkProgram(sGcProg);
+        GLint ok = 0;
+        glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
+        if (!ok) { fprintf(stderr, "vita_gl: compose program failed to link\n"); return 0; }
+        GLint len = 0;
+        glGetProgramiv(sGcProg, GL_PROGRAM_BINARY_LENGTH, &len);
+        void *bin = len > 0 ? malloc((size_t)len) : NULL;
+        if (bin) {
+            GLsizei got = 0;
+            GLenum fmt = 0;
+            glGetProgramBinary(sGcProg, len, &got, &fmt, bin);
+            FILE *wf = got > 0 ? fopen(cachePath, "wb") : NULL;
+            if (wf) { fwrite(bin, 1, (size_t)got, wf); fclose(wf); }
+            free(bin);
+        }
+    }
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
     fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
     if (sGcAttr < 0) return 0;

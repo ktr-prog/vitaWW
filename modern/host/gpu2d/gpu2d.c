@@ -1257,9 +1257,8 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
             bi++;
         }
         memcpy(s2dRegSnap[line], e->regs, REG_SIZE);   // capture registers for this line before hblank mutates them
-        // capture palette for this line (hblank sky/water gradients); an unchanged palette shares the line above's
-        if (line && !memcmp(s2dPalLine[line - 1], e->palette, 0x400)) s2dPalLine[line] = s2dPalLine[line - 1];
-        else { memcpy(s2dPalSnap[line], e->palette, 0x400); s2dPalLine[line] = s2dPalSnap[line]; }
+        memcpy(s2dPalSnap[line], e->palette, 0x400);   // capture palette for this line (hblank sky/water gradients)
+        s2dPalLine[line] = s2dPalSnap[line];   // (comparing with the line above first measured slower on the Vita)
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
