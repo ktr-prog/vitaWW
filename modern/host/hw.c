@@ -135,12 +135,16 @@ static void host_pace_frame(void) {
         }
         last = t;
     }
-    if (sFast < 0) sFast = getenv("ACWW_FAST") ? (atoi(getenv("ACWW_FAST")) > 1 ? atoi(getenv("ACWW_FAST")) : 1) : 0;
+#if !HOST_VITA
+    if (sFast < 0) sFast = getenv("ACWW_FAST") ? (atoi(getenv("ACWW_FAST")) > 1 ? atoi(getenv("ACWW_FAST")) : 1) : 0;   // (host tests)
     if (sFast == 1 || host_frame() < (u64)sFast) return;
+#endif
+    // Frame cap at the DS rate (59.83 fps). A late frame moves the schedule instead of building up a debt to
+    // catch up on later, so the game never runs faster than that to make up lost time.
     u64 now = host_plat_time_ns();
     if (sNextFrame == 0) sNextFrame = now;
     sNextFrame += 16715000;
-    if (now > sNextFrame + 1000000000u) sNextFrame = now;
+    if (now > sNextFrame) sNextFrame = now;   // late: start the next frame's period from now
     HOST_PHASE(PH_PACE, host_plat_sleep_until_ns(sNextFrame));
 }
 
