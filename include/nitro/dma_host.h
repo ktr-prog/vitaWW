@@ -7,6 +7,8 @@ extern "C" {
 void HostDma_Addresses(unsigned int ch, __UINTPTR_TYPE__ src, __UINTPTR_TYPE__ dest);
 // Feed a display list straight into the geometry engine (what the GX DMA would do), synchronously.
 void HostGx_SendList(const void *src, unsigned int bytes);
+// One GX FIFO command word followed by its parameters (NNS_G3dGeBufferOP_N), as one block.
+void HostGx_SendOp(unsigned int op, const unsigned int *args, unsigned int num);
 #ifdef __cplusplus
 }
 #endif

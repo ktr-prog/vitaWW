@@ -1352,6 +1352,45 @@ static void mt_pause(int *spins) {
 }
 static void gpu3d_write16_now(uint32_t addr, uint16_t v);
 static int do_swap(void);
+// One pass-through command on the worker: the per-vertex commands inline (execute()'s big frame and its
+// diagnostics checks are most of their cost there), anything else through execute(). Same effects as execute().
+static inline __attribute__((always_inline)) void w_cmd(u32 c, const u32 *p) {
+    if (c >= 0x20 && c <= 0x28 && c != 0x21 && !sFeaturesOn && sCmdLog < 0) {
+        switch (c) {
+        case 0x20:
+            sVtxColor[0] = p[0] & 31; sVtxColor[1] = p[0] >> 5 & 31; sVtxColor[2] = p[0] >> 10 & 31;
+            sCurLightRec = -1;
+            break;
+        case 0x22:
+            sTexRaw[0] = (s16)p[0];
+            sTexRaw[1] = (s16)(p[0] >> 16);
+            if ((sTexParam >> 30) == 1) {
+                for (int i2 = 0; i2 < 2; i2++)
+                    sTexCoord[i2] = (s16)(((s64)sTexRaw[0] * gTexM->m[i2] + (s64)sTexRaw[1] * gTexM->m[4 + i2] +
+                                           gTexM->m[8 + i2] + gTexM->m[12 + i2]) >> 12);
+            } else { sTexCoord[0] = sTexRaw[0]; sTexCoord[1] = sTexRaw[1]; }
+            break;
+        case 0x23: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); sVtx[2] = (s16)p[1]; submit_vertex(); break;
+        case 0x24:
+            sVtx[0] = (s16)((p[0] & 0x3ff) << 6);
+            sVtx[1] = (s16)((p[0] >> 10 & 0x3ff) << 6);
+            sVtx[2] = (s16)((p[0] >> 20 & 0x3ff) << 6);
+            submit_vertex();
+            break;
+        case 0x25: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); submit_vertex(); break;
+        case 0x26: sVtx[0] = (s16)p[0]; sVtx[2] = (s16)(p[0] >> 16); submit_vertex(); break;
+        case 0x27: sVtx[1] = (s16)p[0]; sVtx[2] = (s16)(p[0] >> 16); submit_vertex(); break;
+        case 0x28:
+            sVtx[0] += (s16)((p[0] & 0x3ff) << 6) >> 6;
+            sVtx[1] += (s16)((p[0] >> 10 & 0x3ff) << 6) >> 6;
+            sVtx[2] += (s16)((p[0] >> 20 & 0x3ff) << 6) >> 6;
+            submit_vertex();
+            break;
+        }
+        return;
+    }
+    execute((u8)c, p);
+}
 static void *mt_worker(void *arg) {
     (void)arg;
 #if HOST_VITA
@@ -1360,7 +1399,7 @@ static void *mt_worker(void *arg) {
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
     sceKernelChangeThreadCpuAffinityMask(0, 0x60000);
 #endif
-    u32 tmp[64];
+    u32 tmp[192];
     int spins = 0;
     u32 r = 0;
     for (;;) {
@@ -1380,40 +1419,19 @@ static void *mt_worker(void *arg) {
                 for (u32 i = 0; i < n; i++) tmp[i] = sMtQ[(r + 1 + i) & MTQ_M];
                 p = tmp;
             }
-            if (c >= 0x20 && c <= 0x28 && c != 0x21 && !sFeaturesOn && sCmdLog < 0) {
-                // The per-vertex commands, inline (execute()'s big frame and its diagnostics checks are most of
-                // their cost there). Same effects as execute().
-                switch (c) {
-                case 0x20:
-                    sVtxColor[0] = p[0] & 31; sVtxColor[1] = p[0] >> 5 & 31; sVtxColor[2] = p[0] >> 10 & 31;
-                    sCurLightRec = -1;
-                    break;
-                case 0x22:
-                    sTexRaw[0] = (s16)p[0];
-                    sTexRaw[1] = (s16)(p[0] >> 16);
-                    if ((sTexParam >> 30) == 1) {
-                        for (int i2 = 0; i2 < 2; i2++)
-                            sTexCoord[i2] = (s16)(((s64)sTexRaw[0] * gTexM->m[i2] + (s64)sTexRaw[1] * gTexM->m[4 + i2] +
-                                                   gTexM->m[8 + i2] + gTexM->m[12 + i2]) >> 12);
-                    } else { sTexCoord[0] = sTexRaw[0]; sTexCoord[1] = sTexRaw[1]; }
-                    break;
-                case 0x23: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); sVtx[2] = (s16)p[1]; submit_vertex(); break;
-                case 0x24:
-                    sVtx[0] = (s16)((p[0] & 0x3ff) << 6);
-                    sVtx[1] = (s16)((p[0] >> 10 & 0x3ff) << 6);
-                    sVtx[2] = (s16)((p[0] >> 20 & 0x3ff) << 6);
-                    submit_vertex();
-                    break;
-                case 0x25: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); submit_vertex(); break;
-                case 0x26: sVtx[0] = (s16)p[0]; sVtx[2] = (s16)(p[0] >> 16); submit_vertex(); break;
-                case 0x27: sVtx[1] = (s16)p[0]; sVtx[2] = (s16)(p[0] >> 16); submit_vertex(); break;
-                case 0x28:
-                    sVtx[0] += (s16)((p[0] & 0x3ff) << 6) >> 6;
-                    sVtx[1] += (s16)((p[0] >> 10 & 0x3ff) << 6) >> 6;
-                    sVtx[2] += (s16)((p[0] >> 20 & 0x3ff) << 6) >> 6;
-                    submit_vertex();
-                    break;
+            if (c == 0xf5) {   // a packed group of pass-through commands: the FIFO header word, then the parameters
+                const u32 *pp = p + 1;
+                for (u32 hdr = p[0]; hdr; hdr >>= 8) {
+                    u32 sc = hdr & 0xff;
+                    w_cmd(sc, pp);
+                    pp += kParams[sc];
                 }
+                r += 1 + n;
+                park = sFlushPending;
+                continue;
+            }
+            if (c >= 0x20 && c <= 0x28 && c != 0x21 && !sFeaturesOn && sCmdLog < 0) {
+                w_cmd(c, p);
                 r += 1 + n;
                 continue;
             }
@@ -1899,18 +1917,65 @@ static u32 gxstat(void) {
 // commands being streamed into the ring, parameters of a matrix command being collected) cost a few instructions.
 // Anything else - a zero-parameter command, the start or end of a matrix command, a matrix snapshot due, the ring
 // looking full - writes the state back and takes the general path for that word. Same ring contents and state.
+// The matrix snapshots the worker needs before the next drawing command (as mt_dispatch sends them).
+static void mt_snapshots(void) {
+    if (sMtCvDirty) {
+        u32 b[32];
+        update_clip();
+        memcpy(b, sClip.m, sizeof sClip.m);
+        memcpy(b + 16, sVec.m, sizeof sVec.m);
+        mt_push(0xf1, b, 32);
+        sMtCvDirty = 0;
+    }
+    if (sMtTexDirty) { mt_push(0xf2, (const u32 *)sTex.m, 16); sMtTexDirty = 0; }
+}
+static inline int fast_pass(u8 c) { return (c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60; }
 static void fifo_block_mt(const u32 *src, u32 n) {
     u32 i = 0;
     while (i < n) {
         u32 cmds = sPackCmds, strLeft = sStrLeft, w = sMtWLocal;
         int left = sPackLeft, pleft = sPackParamsLeft, strMode = sStrMode, execCmd = sExecCmd;
         const u32 rseen = sMtRSeen;
-        const int blocked = sMtCvDirty | sMtTexDirty | sMtSkip;
+        int blocked = sMtCvDirty | sMtTexDirty | sMtSkip;
         int slow = 0;
         for (; i < n; i++) {
             u32 v = src[i];
             if (pleft == 0) {                         // a header word
                 if (v == 0) { if (strMode || execCmd >= 0) { slow = 1; break; } continue; }
+                // The whole packed group at once when every command in it is a pass-through with parameters
+                // (vertices, normals, colours, texture coordinates, ...), all its parameters are in this block
+                // and the ring has room: the same records as one command at a time, without the per-word steps.
+                // END_VTXS (no parameters) is a pass-through record too. Matrix snapshots that are due go first.
+                if (!sMtSkip && strMode == 0 && execCmd < 0) {
+                    u32 tot = 0, h = v;
+                    int ok = 1;
+                    for (; h; h >>= 8) {
+                        u8 c = h & 0xff;
+                        u32 k = kParams[c];
+                        if (!(k ? fast_pass(c) : c == 0x41)) { ok = 0; break; }
+                        tot += k;
+                    }
+                    if (ok && i + 1 + tot <= n && blocked) {
+                        sMtWLocal = w;
+                        mt_snapshots();
+                        w = sMtWLocal;
+                        blocked = sMtCvDirty | sMtTexDirty | sMtSkip;
+                        if (blocked) ok = 0;
+                    }
+                    if (ok && i + 1 + tot <= n && w - rseen + tot + 2 <= MTQ_N) {
+                        // One record for the group: 0xf5, the header word and the parameters as they are.
+                        sMtQ[w++ & MTQ_M] = 0xf5 | (tot + 1) << 8;
+                        u32 wi = w & MTQ_M;
+                        if (wi + tot + 1 <= MTQ_N) memcpy(&sMtQ[wi], src + i, (tot + 1) * sizeof(u32));
+                        else for (u32 j = 0; j <= tot; j++) sMtQ[(w + j) & MTQ_M] = src[i + j];
+                        w += tot + 1;
+                        i += tot;
+                        left = 0;
+                        sMtWDone = w;
+                        if (w - sMtW >= MTQ_BATCH) mt_publish_w(w);
+                        continue;
+                    }
+                }
                 cmds = v;
                 left = 4;
             } else {                                  // a parameter of command cmds & 0xff
@@ -1925,7 +1990,7 @@ static void fifo_block_mt(const u32 *src, u32 n) {
                     }
                 } else if (strMode == 0 && execCmd < 0) {
                     u32 k = kParams[c];
-                    if (blocked || !((c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60) ||
+                    if (blocked || !fast_pass(c) ||
                         w - rseen + k + 1 > MTQ_N) { slow = 1; break; }
                     sMtQ[w & MTQ_M] = c | k << 8;
                     sMtQ[(w + 1) & MTQ_M] = v;

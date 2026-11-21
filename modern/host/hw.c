@@ -583,6 +583,21 @@ static void gx_send_list_body(const void *src, unsigned int bytes) {
     sGxWrites += bytes >> 2;
 }
 void HostGx_SendList(const void *src, unsigned int bytes) { HOST_PHASE(PH_DMA, gx_send_list_body(src, bytes)); }
+static void gx_send_op_body(unsigned int op, const unsigned int *args, unsigned int num) {
+    extern void gpu3d_write_block(u32 addr, const u32 *src, u32 n);
+    if (gHostGxStageN) HostGx_StageFlush();
+    u32 buf[64];
+    if (num < 64) {
+        buf[0] = op;
+        for (unsigned i = 0; i < num; i++) buf[1 + i] = args[i];
+        gpu3d_write_block(0x04000400, buf, num + 1);
+    } else {
+        gpu3d_write_block(0x04000400, &op, 1);
+        gpu3d_write_block(0x04000400, args, num);
+    }
+    sGxWrites += num + 1;
+}
+void HostGx_SendOp(unsigned int op, const unsigned int *args, unsigned int num) { HOST_PHASE(PH_GX, gx_send_op_body(op, args, num)); }
 static void dma_control_written(int ch) {
     u32 cnt = R32(0x040000b0 + ch * 12 + 8);
     if (!(cnt >> 31)) return;
@@ -905,6 +920,17 @@ void HostGx_WriteBlock(u32 addr, const u32 *src, u32 n) {
 static inline int io_irqreg_fast(u32 a, unsigned size) {
     return (a == 0x04000208 || a == 0x04000210) && size <= 4 && sHBlankLine < 0 && sIoTrace == 0 && sIoHist == 0;
 }
+// The divider / square-root unit (0x280-0x2bf): ~300 accesses a frame in the town. Plain register memory plus the
+// lazy compute (lazy_math), without the general I/O path's bookkeeping.
+static inline int io_math_fast(u32 a, unsigned size) {
+    return a - 0x04000280u < 0x40u && size <= 8 && sHBlankLine < 0 && sIoTrace == 0 && sIoHist == 0;
+}
+static inline void math_written(u32 a, unsigned size) {
+    for (u32 w = a & ~3u; w < a + size; w += 4) {
+        if (w == 0x04000280 || (w >= 0x04000290 && w < 0x040002a0)) sDivDirty = 1;
+        else if (w == 0x040002b0 || w == 0x040002b8 || w == 0x040002bc) sSqrtDirty = 1;
+    }
+}
 unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
     u32 a = (u32)addr;
     if (gHostGxStageN) HostGx_StageFlush();
@@ -916,6 +942,21 @@ unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
         if (cost) { sCycles += cost; run_events(); }
         else io_spin_check();
         unsigned long long v = size == 1 ? *host_io(a) : size == 2 ? *(u16 *)host_io(a) : *(u32 *)host_io(a);
+        io_access_done();
+        gHostPhase = ph;
+        return v;
+    }
+    if (io_math_fast(a, size)) {
+        unsigned char ph = gHostPhase;
+        if (ph == PH_GAME) gHostPhase = PH_IO;
+        sIoCount++;
+        u32 cost = io_read_cost(a);
+        if (cost) { sCycles += cost; run_events(); }
+        else io_spin_check();
+        lazy_math(a & ~3u);
+        if (size == 8) lazy_math((a & ~3u) + 4);
+        unsigned long long v = size == 1 ? *host_io(a) : size == 2 ? *(u16 *)host_io(a) : size == 4 ? *(u32 *)host_io(a)
+                             : (*(u32 *)host_io(a) | (unsigned long long)*(u32 *)host_io(a + 4) << 32);
         io_access_done();
         gHostPhase = ph;
         return v;
@@ -964,6 +1005,20 @@ unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long
         if (size == 1) *host_io(a) = (u8)v;
         else if (size == 2) *(u16 *)host_io(a) = (u16)v;
         else *(u32 *)host_io(a) = (u32)v;
+        if (!sTimingLegacy) { sPollAddr = ~0u; io_spin_check(); }
+        io_access_done();
+        gHostPhase = ph;
+        return v;
+    }
+    if (io_math_fast(a, size)) {
+        unsigned char ph = gHostPhase;
+        if (ph == PH_GAME) gHostPhase = PH_IO;
+        sIoCount++;
+        if (size == 1) *host_io(a) = (u8)v;
+        else if (size == 2) *(u16 *)host_io(a) = (u16)v;
+        else if (size == 4) *(u32 *)host_io(a) = (u32)v;
+        else { *(u32 *)host_io(a) = (u32)v; *(u32 *)host_io(a + 4) = (u32)(v >> 32); }
+        math_written(a, size);
         if (!sTimingLegacy) { sPollAddr = ~0u; io_spin_check(); }
         io_access_done();
         gHostPhase = ph;

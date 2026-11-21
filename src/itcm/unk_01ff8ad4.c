@@ -6,6 +6,7 @@ typedef unsigned short u16;
 typedef unsigned int u32;
 #include "types64.h"
 #include "nitro/io_access.h"
+#include "nitro/dma_host.h"
 #include "proto/autoload_2/unk_021053f4.h"
 #include "proto/autoload_2/unk_0213bd28.h"
 #include "proto/itcm/unk_01ff8000.h"
@@ -910,8 +911,7 @@ void NNS_G3dGeBufferOP_N(u32 op, const u32 *args, u32 num) {
             NNS_G3dGeWaitSendDL();
         }
     }
-    IO_W(&reg_G3X_GXFIFO, op);
-    MIi_CpuSend32(args, &reg_G3X_GXFIFO, num << 2);
+    HostGx_SendOp(op, args, num);   // host: the command and its parameters to the GX FIFO as one block
 }
 
 void NNS_G3dDraw(RenderObj *obj) {
