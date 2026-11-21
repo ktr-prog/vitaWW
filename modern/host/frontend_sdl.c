@@ -416,13 +416,6 @@ static void window_to_logical(int wx, int wy, int *x, int *y) {
     *y = (int)SDL_floorf(((float)wy - r[1]) * 384.0f / r[3]);
 }
 static void finger_to_logical(float fx, float fy, int *x, int *y) {
-#if HOST_VITA
-    // The Vita shows the DS touch screen across its whole display (16:9, vita_gl.c): the front panel's normalised
-    // position is that screen's, in the lower half of the 256x384 stacked layout the touch code expects.
-    *x = (int)SDL_floorf(fx * 256.0f);
-    *y = 192 + (int)SDL_floorf(fy * 192.0f);
-    return;
-#endif
     int w, h;
     SDL_GetWindowSize(sWin, &w, &h);
     if (sGpu) { window_to_logical((int)(fx * w), (int)(fy * h), x, y); return; }
@@ -446,7 +439,12 @@ void frontend_backend_touch_read(int held) {
     if (!held && !sCurDown) sSawUp = 1;
 }
 static int raw_touch(int *x, int *y, unsigned *presses) {
-#if HOST_IOS
+#if HOST_VITA
+    // Touch input is off on the Vita for now: the front panel does not reach the game.
+    *x = *y = 0;
+    *presses = sRawPresses;
+    return 0;
+#elif HOST_IOS
     *presses = tc_stylus_presses(&sTouch);
     return tc_stylus(&sTouch, x, y);
 #else

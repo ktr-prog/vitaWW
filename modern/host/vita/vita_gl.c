@@ -102,6 +102,9 @@ unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;   // present spli
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
+// The composed canvas is 16:9 at the DS's 192 lines: GC_W columns (the 3D view across all of them, the 2D layers
+// 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
+enum { GC_W = 341, GC_TEX_W = 352 };
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
@@ -178,6 +181,7 @@ int vita_gl_gc_init(void) {
     sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     glUseProgram(sGcProg);
+    glUniform1f(glGetUniformLocation(sGcProg, "uW"), (float)GC_W);
     static const char *const kNames[9] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d"};
     for (int i = 0; i < 9; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
     glUseProgram(0);
@@ -207,7 +211,7 @@ int vita_gl_gc_init(void) {
     }
     glGenTextures(1, &sGcCanvas);
     glBindTexture(GL_TEXTURE_2D, sGcCanvas);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GC_TEX_W, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -250,7 +254,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glActiveTexture(GL_TEXTURE0);
 
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);   // the RGBA canvas texture is its colour attachment
-    glViewport(0, 0, 256, 192);
+    glViewport(0, 0, GC_W, 192);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_ALPHA_TEST);
@@ -270,7 +274,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glUseProgram(0);
     glDepthMask(GL_TRUE);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
-    blit_canvas(sGcFbo, 0, 0, 256, 192);
+    blit_canvas(sGcFbo, 0, 0, GC_W, 192);
     if (first) { first = 0; fprintf(stderr, "vita_gl: GPU compose: first frame presented\n"); }
 }
 
@@ -284,8 +288,8 @@ void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int 
 }
 
 static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
-    // The whole 16:9 screen: the game's 3D camera renders 16:9 on the Vita (Camera::setDefaultProjection, the
-    // widescreen AR code), so the 256x192 picture is stretched across all 960x544 - the 3D comes out in proportion.
+    // The whole 16:9 screen: the GPU-composed canvas is already 16:9 (3D view across it, the 2D layers unstretched
+    // in the middle; vita_gl_present_gc), so it scales evenly to 960x544. (The CPU fallback canvas is stretched.)
     const int dx = 0, dy = 0, dw = SCREEN_W, dh = SCREEN_H;
     // The read source is our FBO (canvas texture); the draw target is the default framebuffer (the screen). The
     // blit covers every pixel, so no clear. vitaGL's blit samples the FBO's attachment and flips V.
