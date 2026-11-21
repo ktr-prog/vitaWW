@@ -607,7 +607,11 @@ void Camera::updateMode()
 
 void Camera::setDefaultProjection()
 {
+#if HOST_VITA
+    aspect = 0x1c71;   // 16:9, the Vita's screen (the widescreen AR code 0203B74C 00001C71: the picture fills it)
+#else
     aspect = 0x1548;
+#endif
     nearClip = 0xf6;
     farClip = 0x3e800;
     setFovy(fovy);

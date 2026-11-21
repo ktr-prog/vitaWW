@@ -6336,6 +6336,13 @@ extern "C" int Sky_HostExtLine(int line, s32 *out)
 
 extern "C" void Sky_HBlankSub()
 {
+#if HOST_VITA
+    // The Vita shows only the main screen. Everything below but the backdrop write is the sub screen's per-line
+    // sky (engine B gradient colour, affine scroll, BG1 cut-off and blending), which is never drawn there: only
+    // the main screen's backdrop colour is kept.
+    REG16(HW_PLTT) = sSkyGradient.keyColors[1];
+    return;
+#endif
     s32 y = IO_R(&REG16(0x4000006)) + gWeatherManager.screenOffsetY[gWeatherManager.bufferIndex];
     if (y >= 0xc0) y = 0xbf;
     REG16(HW_PLTT + 0x400) = sSkyGradient.lineColors[sSkyGradient.bufferIndex][y];

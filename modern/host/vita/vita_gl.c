@@ -91,7 +91,7 @@ static void ensure_tex(int w, int h, const void *pixels) {
     }
 }
 
-// Blit the canvas texture (sTex, via sFbo) to the screen, scaled to FIT, and flip.
+// Blit the canvas texture (sTex, via sFbo) to the whole screen, and flip.
 static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh);
 
 // ---- GPU compose -------------------------------------------------------------------------------------------------
@@ -275,7 +275,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
 }
 
 // Present one frame: upload the composited DS canvas (XRGB8888 == GL_BGRA bytes, a zero-conversion upload) and
-// blit the sub-rectangle [sx,sy,sw,sh] of it to the screen, scaled to FIT (letterbox, 4:3, black bars).
+// blit the sub-rectangle [sx,sy,sw,sh] of it to the whole screen (16:9).
 void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int sx, int sy, int sw, int sh) {
     if (!sReady) return;
 
@@ -284,18 +284,12 @@ void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int 
 }
 
 static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
-    // FIT: largest scale that still fits both axes (letterbox)
-    float scale = (float)SCREEN_W / sw;
-    if ((float)SCREEN_H / sh < scale) scale = (float)SCREEN_H / sh;
-    int dw = (int)(sw * scale + 0.5f), dh = (int)(sh * scale + 0.5f);
-    int dx = (SCREEN_W - dw) / 2, dy = (SCREEN_H - dh) / 2;
-
-    // Clear the whole screen black (precompiled clear shader), then blit the canvas region onto it. The read
-    // source is our FBO (canvas texture); the draw target is the default framebuffer (the screen). vitaGL's blit
-    // samples the FBO's attachment and flips V so the top-of-canvas row lands at the top of the screen.
+    // The whole 16:9 screen: the game's 3D camera renders 16:9 on the Vita (Camera::setDefaultProjection, the
+    // widescreen AR code), so the 256x192 picture is stretched across all 960x544 - the 3D comes out in proportion.
+    const int dx = 0, dy = 0, dw = SCREEN_W, dh = SCREEN_H;
+    // The read source is our FBO (canvas texture); the draw target is the default framebuffer (the screen). The
+    // blit covers every pixel, so no clear. vitaGL's blit samples the FBO's attachment and flips V.
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
     // vitaGL flips V when reading an FBO as a texture, which would show the canvas upside-down; invert the source
     // Y range (srcY0=bottom, srcY1=top) to cancel that flip so row 0 of the canvas lands at the top of the screen.
