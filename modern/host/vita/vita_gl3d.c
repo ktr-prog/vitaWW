@@ -255,16 +255,14 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     if (sPrevDraw >= 0) {
         glBindFramebuffer(GL_FRAMEBUFFER, sFbo[sPrevDraw]);
         static u8 rb[VW * VH * 4];
-        // The FBO lives in CDRAM, which the CPU reads very slowly (glReadPixels' plain memcpy from it was ~4 ms).
-        // Default: the GPU's transfer engine copies it into a buffer in main RAM (vglReadPixels, no CPU copy), and
-        // the conversion below reads that. ACWW_READBACK=cpu: the old glReadPixels copy.
+        // ACWW_READBACK=gpu: GPU transfer into main RAM (vglReadPixels) - measured slower on the Vita (~9 ms vs ~4 ms:
+        // the transfer waits behind queued GPU work and the uncached reads are slow), so glReadPixels is the default.
         static int gpuRb = -1;
         static u8 *gbuf;
         if (gpuRb < 0) {
             const char *e = getenv("ACWW_READBACK");
-            gpuRb = !(e && !strcmp(e, "cpu"));
+            gpuRb = e && !strcmp(e, "gpu");
             if (gpuRb && !(gbuf = vglAlloc(VW * VH * 4, VGL_MEM_RAM))) gpuRb = 0;
-            fprintf(stderr, "vita_gl3d: 3D readback via %s\n", gpuRb ? "GPU transfer to main RAM" : "glReadPixels");
         }
         const u8 *rbs = rb;
         if (gpuRb) { vglReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, gbuf); rbs = gbuf; }
@@ -338,8 +336,11 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // polygon uses the same identity projection, there is no per-object matrix load, so all polygons batch into
     // one glDrawArrays per run sharing texture+blend - ~2400 draw calls collapse to a handful. Polys arrive
     // pre-culled from the CPU facing test, so GL culling stays off.
-    int haveState = 0, curBlend = -1;
+    static float bPos[BATCH_V][4], bCol[BATCH_V][4], bUv[BATCH_V][2];
+    int bn = 0, haveState = 0, curBlend = -1;
     GLuint curTex = 0;
+#define GL3D_FLUSH() do { if (bn) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_FLOAT, 0, bCol); \
+        glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawArrays(GL_TRIANGLES, 0, bn); bn = 0; } } while (0)
     // Render opaque polygons sorted by texture (same texture batches into one draw, cutting GXM texture-bind
     // flushes - the dominant 3D render cost when the scene interleaves many textures). Depth test resolves the
     // opaque image regardless of draw order. Translucent polygons follow in submission order (order matters).
@@ -367,47 +368,13 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         const G3Polygon *p = r->poly[sOrder[oi]];
         sPolyTex[oi] = tex_for(p->texparam, p->texpal);
     }
-    // Vertices go straight into GPU-visible memory: one interleaved array for the whole frame, allocated from
-    // vitaGL's per-frame scratch pool and bound as a VBO (vglBufferData), so each draw is just a range of it - no
-    // per-draw copy of the client arrays by the driver (it copied all three arrays into its scratch pool on every
-    // glDrawArrays). ACWW_GLVBO=0: client arrays from a static buffer, as before.
-    typedef struct { float p[4], c[4], uv[2]; } GV;
-    static GV sBatch[BATCH_V];
-    static GLuint sVbo;
-    static int useVbo = -1;
-    if (useVbo < 0) {
-        useVbo = !(getenv("ACWW_GLVBO") && atoi(getenv("ACWW_GLVBO")) == 0);
-        fprintf(stderr, "vita_gl3d: vertex upload %s\n", useVbo ? "direct to GPU scratch (VBO)" : "client arrays");
-    }
-    int total = 0;
-    for (int oi = 0; oi < nOrd; oi++) total += (r->poly[sOrder[oi]]->nv - 2) * 3;
-    GV *vb = useVbo && total ? (GV *)vglAllocFromScratch((size_t)total * sizeof(GV)) : NULL;
-    GV *vout = vb ? vb : sBatch;
-    if (vb) {
-        if (!sVbo) glGenBuffers(1, &sVbo);
-        glBindBuffer(GL_ARRAY_BUFFER, sVbo);
-        vglBufferData(GL_ARRAY_BUFFER, vb);
-        glVertexPointer(4, GL_FLOAT, sizeof(GV), (const void *)0);
-        glColorPointer(4, GL_FLOAT, sizeof(GV), (const void *)16);
-        glTexCoordPointer(2, GL_FLOAT, sizeof(GV), (const void *)32);
-    }
-    int bn = 0, bstart = 0;   // vertices written / first vertex of the pending draw
-#define GL3D_FLUSH() do { if (bn > bstart) { \
-        if (vb) glDrawArrays(GL_TRIANGLES, bstart, bn - bstart); \
-        else { glVertexPointer(4, GL_FLOAT, sizeof(GV), vout[bstart].p); glColorPointer(4, GL_FLOAT, sizeof(GV), vout[bstart].c); \
-               glTexCoordPointer(2, GL_FLOAT, sizeof(GV), vout[bstart].uv); glDrawArrays(GL_TRIANGLES, 0, bn - bstart); } \
-        bstart = bn; } } while (0)
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
         const G3Polygon *p = r->poly[k];
         if (p->nv < 3) continue;
         GLuint tex = sPolyTex[oi];
         int blend = p->translucent ? 1 : 0;
-        int need = (p->nv - 2) * 3;
-        // A draw may not exceed vitaGL's glDrawArrays index limit (MAX_IDX_NUMBER, 0xC000); the client-array
-        // fallback also restarts its static buffer once it is full (its draws were copied when issued).
-        if (!vb && bn + need > BATCH_V) { GL3D_FLUSH(); bn = bstart = 0; }
-        if (!haveState || tex != curTex || blend != curBlend || bn - bstart + need > BATCH_V) {
+        if (!haveState || tex != curTex || blend != curBlend || bn + (p->nv - 2) * 3 > BATCH_V) {
             GL3D_FLUSH();
             if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); } else glDisable(GL_TEXTURE_2D);
             if (blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
@@ -443,16 +410,14 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             const int idx[3] = {0, i, i + 1};
             for (int j = 0; j < 3; j++, bn++) {
                 int s = idx[j];
-                GV *o = &vout[bn];
-                o->p[0] = vp[s][0]; o->p[1] = vp[s][1]; o->p[2] = vp[s][2]; o->p[3] = vp[s][3];
-                o->c[0] = vc[s][0]; o->c[1] = vc[s][1]; o->c[2] = vc[s][2]; o->c[3] = vc[s][3];
-                o->uv[0] = vu[s][0]; o->uv[1] = vu[s][1];
+                bPos[bn][0] = vp[s][0]; bPos[bn][1] = vp[s][1]; bPos[bn][2] = vp[s][2]; bPos[bn][3] = vp[s][3];
+                bCol[bn][0] = vc[s][0]; bCol[bn][1] = vc[s][1]; bCol[bn][2] = vc[s][2]; bCol[bn][3] = vc[s][3];
+                bUv[bn][0] = vu[s][0]; bUv[bn][1] = vu[s][1];
             }
         }
     }
     GL3D_FLUSH();
 #undef GL3D_FLUSH
-    if (vb) glBindBuffer(GL_ARRAY_BUFFER, 0);
 
     glDisableClientState(GL_VERTEX_ARRAY);
     glDisableClientState(GL_COLOR_ARRAY);

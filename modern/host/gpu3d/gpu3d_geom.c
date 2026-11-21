@@ -542,8 +542,8 @@ static int clip_plane(G3Vertex *dst, const G3Vertex *src, int n, int comp, int s
     }
     return m;
 }
-static int clip_polygon(G3Vertex *in, int n, G3Vertex **out, int farClip, int *clipped) {
-    G3Vertex *a = sClipBuf[0], *b = sClipBuf[1];
+static int clip_polygon_buf(G3Vertex (*buf)[10], G3Vertex *in, int n, G3Vertex **out, int farClip, int *clipped) {
+    G3Vertex *a = buf[0], *b = buf[1];
     memcpy(a, in, n * sizeof *a);
     *clipped = 0;
     for (int i = 0; i < n; i++)
@@ -574,6 +574,10 @@ static int clip_polygon(G3Vertex *in, int n, G3Vertex **out, int farClip, int *c
     }
     *out = a;
     return n;
+}
+
+static int clip_polygon(G3Vertex *in, int n, G3Vertex **out, int farClip, int *clipped) {
+    return clip_polygon_buf(sClipBuf, in, n, out, farClip, clipped);
 }
 
 static void debug_tex_poly(const char *what, const G3Vertex *v, int nv, int n) {
@@ -1044,7 +1048,9 @@ static void box_test(const u32 *p) {
         G3Vertex face[4], *out;
         for (int k = 0; k < 4; k++) face[k] = c[kFaces[f][k]];
         int clipped;
-        if (clip_polygon(face, 4, &out, 1, &clipped) > 0) in = 1;
+        // Own clip buffers: with the GX worker this runs on the game thread while the worker may be clipping.
+        static G3Vertex sBoxClip[2][10];
+        if (clip_polygon_buf(sBoxClip, face, 4, &out, 1, &clipped) > 0) in = 1;
     }
     sGxStat = (sGxStat & ~2u) | (in ? 2u : 0);
 }
@@ -1404,7 +1410,10 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
         if (c == 0x12 || c >= 0x14) { if (sMtxMode == 3) sMtTexDirty = 1; else sMtCvDirty = 1; }
         return;
     }
-    if (c == 0x70) { mt_sync(); box_test(p); return; }
+    // BOX_TEST depends only on the clip matrix, which the game thread keeps current in command order: answer it
+    // here without waiting for the worker to drain (the game issues one per model for culling; each wait used to
+    // serialise the game thread behind all queued geometry).
+    if (c == 0x70) { static int syncBox = -1; if (syncBox < 0) syncBox = getenv("ACWW_BOXSYNC") && atoi(getenv("ACWW_BOXSYNC")); if (syncBox) mt_sync(); box_test(p); return; }
     if (c == 0x72) { vec_test(p[0]); return; }
     if (!is_command(c)) return;
     if (sMtSkip && c >= 0x23 && c <= 0x28) return;
