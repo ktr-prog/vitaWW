@@ -62,7 +62,14 @@ void MIi_CpuCopy32(const void *src, void *dst, u32 n) {
     u32 *d = dst;
     for (n /= 4; n--;) *d++ = *s++;
 }
+void HostGx_WriteBlock(u32 addr, const u32 *src, u32 n);
 void MIi_CpuSend32(const void *src, volatile void *dst, u32 n) {
+    // To the GX FIFO / a command port (NNS sends nearly all its geometry this way): one block call instead of a
+    // register write per word. Same words, same order.
+    if ((uintptr_t)dst - 0x04000400u < 0x200u && !((uintptr_t)src & 3) && !is_reg(src)) {
+        HostGx_WriteBlock((u32)(uintptr_t)dst, (const u32 *)src, n / 4);
+        return;
+    }
     if (is_reg(dst)) { units(src, dst, n, 4, 0, 0, 1); return; }
     const u32 *s = src;
     volatile u32 *d = dst;

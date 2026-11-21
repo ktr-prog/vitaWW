@@ -136,6 +136,9 @@ BOOL ProcBase::postDelete(s32 a) {
     List_Remove(&gTaskDeleteList, &self->executeNode);
     if (self->procHeap != NULL) (self->procHeap)->destroy2();
     if (self->seq != NULL) CmdSeq_Undo((CmdSeq *)self->seq);
+#ifdef HOST_PROFILE_NODELETE   // local profiling builds only: avoid a host-only crash in one proc's destructor
+    return FALSE;
+#endif
     delete self;
     return FALSE;
 }

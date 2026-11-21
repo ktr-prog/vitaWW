@@ -491,14 +491,23 @@ static uintptr_t dma_address(u32 reg, uintptr_t full) { return (u32)full == reg 
 static int dma_is_io(uintptr_t a) { return a <= 0xffffffffu && is_io((u32)a); }
 void gx_fifo_write(u32 addr, u32 value);
 void gpu3d_write32(u32 addr, u32 value);
+extern unsigned int gHostGxStageN;   // GX store queue (hw.c)
+void HostGx_StageFlush(void);
 static void dma_run_body(int ch);
 static void dma_run(int ch) { HOST_PHASE(PH_DMA, dma_run_body(ch)); }
 static void dma_run_body(int ch) {
+    if (gHostGxStageN) HostGx_StageFlush();
     u32 base = 0x040000b0 + ch * 12, cnt = R32(base + 8);
     uintptr_t src = dma_address(R32(base), sDmaSrc[ch]), dst = dma_address(R32(base + 4), sDmaDst[ch]);
     u32 n = cnt & 0x1fffff, w = (cnt >> 26 & 1) ? 4 : 2;
     int dc = cnt >> 21 & 3, sc = cnt >> 23 & 3;
     if (n == 0) n = 0x200000;
+    {   // ACWW_DMALOG=<frame>: list that frame's DMA transfers (diagnostics)
+        static long logf = -2;
+        if (logf == -2) logf = getenv("ACWW_DMALOG") ? strtol(getenv("ACWW_DMALOG"), 0, 10) : -1;
+        if (logf >= 0 && (long)host_frame() == logf)
+            fprintf(stderr, "dma ch%d src %08x dst %08x n %u w %u sc %d dc %d mode %u\n", ch, (u32)src, (u32)dst, n, w, sc, dc, cnt >> 27 & 7);
+    }
     if (src < 0x10000 || dst < 0x10000) {
         // MI_StopDma fires a dummy transfer from/to address 0 to stop a channel; harmless, skip it silently
         // (logging here is file I/O, which is exactly what faults from the game coroutine - keep this path quiet)
@@ -842,8 +851,33 @@ static void io_note(uintptr_t a, int write, void *caller) {
     if (sIoHist < 0) sIoHist = getenv("ACWW_IOHIST") != NULL;
     if (sIoHist) io_hist((u32)a, (uintptr_t)caller, write);
 }
+// GX store queue (include/nitro/io_access.h): (address, value) pairs.
+unsigned int gHostGxStage[512 + 2];
+unsigned int gHostGxStageN;
+void HostGx_StageFlush(void) {
+    u32 n = gHostGxStageN;
+    if (!n) return;
+    gHostGxStageN = 0;
+    sGxWrites += n / 2;
+    unsigned char ph = gHostPhase;
+    gHostPhase = PH_GX;
+    extern void gpu3d_write_pairs(const u32 *pairs, u32 n);
+    gpu3d_write_pairs(gHostGxStage, n / 2);
+    gHostPhase = ph;
+}
+// A block of words to one GX port (MIi_CpuSend32 to the FIFO): as HostIo_Write per word, in one call.
+void HostGx_WriteBlock(u32 addr, const u32 *src, u32 n) {
+    if (gHostGxStageN) HostGx_StageFlush();
+    sGxWrites += n;
+    unsigned char ph = gHostPhase;
+    gHostPhase = PH_GX;
+    extern void gpu3d_write_block(u32 addr, const u32 *src, u32 n);
+    gpu3d_write_block(addr, src, n);
+    gHostPhase = ph;
+}
 unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
     u32 a = (u32)addr;
+    if (gHostGxStageN) HostGx_StageFlush();
     if (sHBlankLine >= 0)
         return size == 8 ? io_load(a, 4) | (unsigned long long)io_load(a + 4, 4) << 32 : io_load(a, size);
     unsigned char ph = gHostPhase;
@@ -857,6 +891,7 @@ unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
 }
 unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long long v) {
     u32 a = (u32)addr;
+    if (gHostGxStageN) HostGx_StageFlush();
     // GX command/FIFO firehose fast path. The native game submits 3D geometry as a torrent of 32-bit writes to
     // 0x04000400-0x040005ff; forward_display() handles that whole range identically (store the word, feed the GX
     // pipeline via render_write32). Short-circuit it here so each of those tens-of-thousands-per-frame writes skips

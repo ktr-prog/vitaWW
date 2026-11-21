@@ -339,8 +339,8 @@ static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const 
     // top / second candidates. The second slot starts as what the general loop uses when fewer than two layers
     // are found: none found -> backdrop colour with LAYER_NONE; one found -> the backdrop (pushed down from top).
     u32 objPrio = 0;   // sprite priorities that have a visible pixel on this line
-    if (dispcnt & 0x1000)
-        for (int x = 0; x < SCREEN_W; x++)
+    if (dispcnt & 0x1000)   // (only where a sprite wrote: obj->source is zero outside [lo, hi))
+        for (int x = obj->lo < 0 ? 0 : obj->lo, xe = obj->hi > SCREEN_W ? SCREEN_W : obj->hi; x < xe; x++)
             if (obj->source[x] && (mask[x] & 0x10)) objPrio |= 1u << (obj->prio[x] & 3);
     // 3D-only line: no window, and every layer but the 3D one is empty here (transparent BG line, no sprite
     // pixels). Then each pixel is the 3D colour over the backdrop - the same outcome as the general loops below.
@@ -361,6 +361,40 @@ static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const 
             if (effBd && effect == 2) bdOut = brighten(backdrop, evy, 8), bdEff = EFF_UP;
             else if (effBd && effect == 3) bdOut = darken(backdrop, evy, 7), bdEff = EFF_DOWN;
             u32 used = 0;
+            if (!(!over && eff3d && (effect == 2 || effect == 3))) {
+                // No brightness effect on the 3D pixels: four at a time - alpha 0 -> the backdrop result, else the
+                // 3D colour; the rare partly transparent 3D pixels over the backdrop are blended one by one.
+                typedef u32 v4u __attribute__((vector_size(16)));
+                u32 l3b[SCREEN_W] __attribute__((aligned(16)));
+                const u32 *src = l3;
+                if (lo != 0 || hi != SCREEN_W) {
+                    memset(l3b, 0, sizeof l3b);
+                    if (hi > lo) memcpy(l3b + lo, l3 + lo, (size_t)(hi - lo) * sizeof(u32));
+                    src = l3b;
+                }
+                v4u anyZero = {0, 0, 0, 0}, anyPart = {0, 0, 0, 0}, anySet = {0, 0, 0, 0};
+                const v4u bd = {bdOut, bdOut, bdOut, bdOut};
+                for (int x = 0; x < SCREEN_W; x += 4) {
+                    v4u c;
+                    memcpy(&c, src + x, 16);
+                    v4u a = c >> 24 & 0x1f;
+                    v4u z = (v4u)(a == 0);
+                    v4u out = (z & bd) | (~z & (c & 0x3f3f3f));
+                    memcpy(dst + x, &out, 16);
+                    anyZero |= z;
+                    anySet |= ~z;
+                    anyPart |= (v4u)(a != 0) & (v4u)(a != 31);
+                }
+                if ((anyZero[0] | anyZero[1] | anyZero[2] | anyZero[3])) used |= 1u << bdEff;
+                if ((anySet[0] | anySet[1] | anySet[2] | anySet[3])) used |= 1u << (over ? EFF_3D : EFF_NONE);
+                if (over && (anyPart[0] | anyPart[1] | anyPart[2] | anyPart[3]))
+                    for (int x = 0; x < SCREEN_W; x++) {
+                        u32 a = src[x] >> 24 & 0x1f;
+                        if (a && a != 31) dst[x] = blend3d(src[x] & 0x3f3f3f, backdrop, a);
+                    }
+                *effectsUsed = used;
+                return;
+            }
             for (int x = 0; x < SCREEN_W; x++) {
                 u32 c = x >= lo && x < hi ? l3[x] : 0, a = c >> 24 & 0x1f;
                 if (!a) { dst[x] = bdOut; used |= 1u << bdEff; continue; }
@@ -1075,6 +1109,16 @@ static void band2d_run(Band2d *w) {
     for (int i = 0; i < 128; i++) {
         u16 a0 = (u16)(e->oam[i * 8] | e->oam[i * 8 + 1] << 8);
         if ((!(a0 & 0x100) && (a0 & 0x200)) || (a0 >> 14) == 3) continue;
+        {   // y and bounding height (as gpu2d_render_obj_line computes them) for a quick per-line reject
+            static const u8 kW[3][4] = {{8, 16, 32, 64}, {16, 32, 32, 64}, {8, 8, 16, 32}};
+            static const u8 kH[3][4] = {{8, 16, 32, 64}, {8, 8, 16, 32}, {16, 32, 32, 64}};
+            (void)kW;
+            u16 a1 = (u16)(e->oam[i * 8 + 2] | e->oam[i * 8 + 3] << 8);
+            int bh = kH[a0 >> 14][a1 >> 14];
+            if ((a0 & 0x100) && (a0 & 0x200)) bh *= 2;
+            e->objCandY[e->objCandN] = (u8)(a0 & 0xff);
+            e->objCandH[e->objCandN] = (u8)(bh > 255 ? 255 : bh);
+        }
         e->objCand[e->objCandN++] = (u8)i;
     }
     e->objCandOn = 1;

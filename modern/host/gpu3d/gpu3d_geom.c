@@ -1309,7 +1309,37 @@ HOST_STATE_KEEP(sMtStarted) HOST_STATE_KEEP(sMtThread) HOST_STATE_KEEP(sMT) HOST
 HOST_STATE_KEEP(gClipM) HOST_STATE_KEEP(gVecM) HOST_STATE_KEEP(gTexM)
 extern uint64_t host_plat_time_ns(void);
 
+extern unsigned int gHostGxStageN;   // GX store queue (hw.c)
+void HostGx_StageFlush(void);
 static void mt_sync_body(void);
+// The worker sleeps (instead of polling) when its ring is empty or it is parked on a swap: an idle worker no longer
+// takes time from the render/2D threads that share its cores. The game thread wakes it only when it is asleep
+// (the sleeping flag and the published index are a seq_cst store-then-load pair on each side).
+static pthread_mutex_t sMtSleepMx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t sMtSleepCv = PTHREAD_COND_INITIALIZER;
+static int sMtSleeping;
+static inline void mt_wake(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&sMtSleeping, __ATOMIC_SEQ_CST)) {
+        pthread_mutex_lock(&sMtSleepMx);
+        __atomic_store_n(&sMtSleeping, 0, __ATOMIC_SEQ_CST);
+        pthread_cond_signal(&sMtSleepCv);
+        pthread_mutex_unlock(&sMtSleepMx);
+    }
+}
+static inline void mt_publish_w(u32 w) { __atomic_store_n(&sMtW, w, __ATOMIC_RELEASE); mt_wake(); }
+// Worker: sleep until the published index moves past r (parkWait = 0) or the park is released (parkWait = 1).
+static void mt_sleep(u32 r, int parkWait) {
+    pthread_mutex_lock(&sMtSleepMx);
+    __atomic_store_n(&sMtSleeping, 1, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int ready = parkWait ? !__atomic_load_n(&sMtParked, __ATOMIC_SEQ_CST) : __atomic_load_n(&sMtW, __ATOMIC_SEQ_CST) != r;
+        if (ready || !__atomic_load_n(&sMtSleeping, __ATOMIC_SEQ_CST)) break;
+        pthread_cond_wait(&sMtSleepCv, &sMtSleepMx);
+    }
+    __atomic_store_n(&sMtSleeping, 0, __ATOMIC_SEQ_CST);
+    pthread_mutex_unlock(&sMtSleepMx);
+}
 static void mt_pause(int *spins) {
     if (++*spins < 32) sched_yield();
     else usleep(100);   // idle: sleep instead of spinning so the core goes to the render thread / 2D band
@@ -1368,7 +1398,11 @@ static void *mt_worker(void *arg) {
     u32 r = 0;
     for (;;) {
         u32 w = __atomic_load_n(&sMtW, __ATOMIC_ACQUIRE);
-        if (r == w) { mt_pause(&spins); continue; }
+        if (r == w) {
+            if (++spins < 32) sched_yield();
+            else { mt_sleep(r, 0); spins = 0; }
+            continue;
+        }
         spins = 0;
         uint64_t t0 = host_plat_time_ns();
         int park = 0;
@@ -1402,14 +1436,17 @@ static void *mt_worker(void *arg) {
         if (park) {
             { static int lag = -1; if (lag < 0) lag = getenv("ACWW_GX_LAG") ? atoi(getenv("ACWW_GX_LAG")) : 0; if (lag) usleep(lag * 1000); }
             int s = 0;
-            while (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
+            while (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) {
+                if (++s < 32) sched_yield();
+                else mt_sleep(0, 1);
+            }
         }
     }
     return 0;
 }
 // Game thread: wait until the worker has executed everything queued (or is parked on a swap).
 static inline void mt_publish(void) {
-    if (sMtW != sMtWDone) __atomic_store_n(&sMtW, sMtWDone, __ATOMIC_RELEASE);
+    if (sMtW != sMtWDone) mt_publish_w(sMtWDone);
 }
 extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 6 = PH_WAIT
 // Game-thread waits for the GX worker, by reason (0 box test, 1 RAM-count read, 2 vblank commit, 3 other), for
@@ -1436,6 +1473,7 @@ void gpu3d_wait_stats(char *buf, int n, int frames) {
 static void raw_close(int publishNow);
 static void mt_sync_body(void) {
     int s = 0;
+    if (gHostGxStageN) HostGx_StageFlush();
     raw_close(1);
     mt_publish();
     while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWDone && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
@@ -1458,7 +1496,7 @@ static int mt_reserve(u32 words) {
 }
 static inline __attribute__((always_inline)) void mt_command_done(int publishNow) {
     sMtWDone = sMtWLocal;
-    if (publishNow || sMtWDone - sMtW >= MTQ_BATCH) __atomic_store_n(&sMtW, sMtWDone, __ATOMIC_RELEASE);
+    if (publishNow || sMtWDone - sMtW >= MTQ_BATCH) mt_publish_w(sMtWDone);
 }
 static void mt_push(u32 c, const u32 *p, u32 n) {
     if (!mt_reserve(n + 1)) return;
@@ -1566,6 +1604,29 @@ static void mt_entry(u8 cmd, u32 param) {
     }
 }
 
+// The common cases of mt_entry, inline: the next parameter of a command being streamed into the ring, and the
+// first parameter of a pass-through command when nothing is pending (no matrix snapshot due, room in the ring).
+// Same ring contents and state as mt_entry; returns 0 when mt_entry must handle the word.
+static inline __attribute__((always_inline)) int mt_fast(u8 c, u32 v) {
+    if (sStrMode == 1) {
+        sMtQ[sMtWLocal++ & MTQ_M] = v;
+        if (--sStrLeft == 0) { mt_command_done(0); sStrMode = 0; sExecCmd = -1; }
+        return 1;
+    }
+    if (sStrMode == 0 && sExecCmd < 0) {
+        u32 k = kParams[c];
+        if (k && !sMtCvDirty && !sMtTexDirty && mt_streamable(c) && sMtWLocal - sMtRSeen + k + 1 <= MTQ_N) {
+            u32 w = sMtWLocal;
+            sMtQ[w & MTQ_M] = c | k << 8;
+            sMtQ[(w + 1) & MTQ_M] = v;
+            sMtWLocal = w + 2;
+            if (k == 1) mt_command_done(0);
+            else { sStrLeft = k - 1; sStrMode = 1; sExecCmd = c; }
+            return 1;
+        }
+    }
+    return 0;
+}
 // Worker mode: the GX FIFO decoder (gxfifo_write/pack_advance) calling mt_entry directly, so the whole per-word
 // path inlines. Same logic: a word with no parameters pending holds up to four packed commands.
 static inline __attribute__((always_inline)) void pack_advance_mt(void) {
@@ -1587,22 +1648,7 @@ static inline __attribute__((always_inline)) void gxfifo_write_mt(u32 v) {
         pack_advance_mt();
     } else {
         u8 c = sPackCmds & 0xff;
-        // Fast path: a one-parameter pass-through command (colour, normal, texcoord, vertex packed, ...) with
-        // nothing pending - header and parameter go straight into the ring. Same ring contents as mt_entry.
-        if (kParams[c] == 1 && sStrMode == 0 && sExecCmd < 0 && !sMtCvDirty && !sMtTexDirty && mt_streamable(c) &&
-            sMtWLocal - sMtRSeen + 2 <= MTQ_N) {
-            u32 w = sMtWLocal;
-            sMtQ[w & MTQ_M] = c | 1u << 8;
-            sMtQ[(w + 1) & MTQ_M] = v;
-            sMtWLocal = w + 2;
-            mt_command_done(0);
-            sPackParamsLeft = 0;
-            sPackCmds >>= 8;
-            sPackLeft--;
-            pack_advance_mt();
-            return;
-        }
-        mt_entry(c, v);
+        if (!mt_fast(c, v)) mt_entry(c, v);
         if (--sPackParamsLeft == 0) {
             sPackCmds >>= 8;
             sPackLeft--;
@@ -1615,16 +1661,7 @@ static inline __attribute__((always_inline)) void gxfifo_write_mt(u32 v) {
 // the one-parameter pass-through case written straight into the ring.
 static inline __attribute__((always_inline)) void gx_port_mt(u8 c, u32 v) {
     if (sRawOpen) raw_close(0);
-    if (kParams[c] == 1 && sStrMode == 0 && sExecCmd < 0 && !sMtCvDirty && !sMtTexDirty && mt_streamable(c) &&
-        sMtWLocal - sMtRSeen + 2 <= MTQ_N) {
-        u32 w = sMtWLocal;
-        sMtQ[w & MTQ_M] = c | 1u << 8;
-        sMtQ[(w + 1) & MTQ_M] = v;
-        sMtWLocal = w + 2;
-        mt_command_done(0);
-        return;
-    }
-    mt_entry(c, v);
+    if (!mt_fast(c, v)) mt_entry(c, v);
 }
 // ---- raw GX FIFO ---------------------------------------------------------------------------------------------
 // The game thread no longer decodes GX FIFO words into per-command ring records. It copies the raw words into
@@ -1879,7 +1916,21 @@ static void gpu3d_write16_now(uint32_t addr, uint16_t v) {
     else if (addr == 0x04000610) sDot1Depth = v & 0x7fff;
     else if (addr >= 0x04000400 && addr < 0x04000600) { /* (the host writes these 32-bit) */ }
 }
+extern unsigned int gHostGxStageN;
+extern void HostGx_StageFlush(void);
+// The queued GX stores (hw.c / io_access.h), in order: the same as gpu3d_write32 per pair.
+void gpu3d_write_pairs(const u32 *p, u32 n) {
+    for (u32 i = 0; i < n; i++, p += 2) {
+        u32 a = p[0], v = p[1];
+        if (sMT && sGeomOn) {
+            if (a - 0x04000400u < 0x40u) { if (sRawOn) gx_raw_word(v); else gxfifo_write_mt(v); continue; }
+            if (a - 0x04000440u < 0x1c0u) { gx_port_mt((u8)((a - 0x04000400u) >> 2), v); continue; }
+        }
+        gpu3d_write32(a, v);
+    }
+}
 void gpu3d_write32(uint32_t addr, uint32_t v) {
+    if (gHostGxStageN) HostGx_StageFlush();   // queued stores go first (host-side callers)
     if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) { if (sRawOn) gx_raw_word(v); else gxfifo_write_mt(v); return; }   // worker mode, GX FIFO
     if (sMT && sGeomOn && addr - 0x04000440u < 0x1c0u) { gx_port_mt((u8)((addr - 0x04000400u) >> 2), v); return; }   // command ports
     if (addr >= 0x04000400 && addr < 0x04000600 && !sGeomOn) { g3_feature(F_GEOM_OFF_WRITE); return; }
@@ -1916,15 +1967,93 @@ static u32 gxstat(void) {
 }
 
 // A block of words to one GX port (display-list DMA): the per-word loop runs here, fully inlined in worker mode.
+// A block of GX FIFO words in worker mode (display-list DMA, NNS's MIi_CpuSend32): the packed-command decoder of
+// gxfifo_write_mt + mt_fast with its state in locals, so the common words (headers, parameters of pass-through
+// commands being streamed into the ring, parameters of a matrix command being collected) cost a few instructions.
+// Anything else - a zero-parameter command, the start or end of a matrix command, a matrix snapshot due, the ring
+// looking full - writes the state back and takes the general path for that word. Same ring contents and state.
+static void fifo_block_mt(const u32 *src, u32 n) {
+    u32 i = 0;
+    while (i < n) {
+        u32 cmds = sPackCmds, strLeft = sStrLeft, w = sMtWLocal;
+        int left = sPackLeft, pleft = sPackParamsLeft, strMode = sStrMode, execCmd = sExecCmd;
+        const u32 rseen = sMtRSeen;
+        const int blocked = sMtCvDirty | sMtTexDirty | sMtSkip | sRawOpen;
+        int slow = 0;
+        for (; i < n; i++) {
+            u32 v = src[i];
+            if (pleft == 0) {                         // a header word
+                if (v == 0) { if (strMode || execCmd >= 0) { slow = 1; break; } continue; }
+                cmds = v;
+                left = 4;
+            } else {                                  // a parameter of command cmds & 0xff
+                u8 c = cmds & 0xff;
+                if (strMode == 1) {
+                    sMtQ[w++ & MTQ_M] = v;
+                    if (--strLeft == 0) {
+                        strMode = 0;
+                        execCmd = -1;
+                        sMtWDone = w;
+                        if (w - sMtW >= MTQ_BATCH) mt_publish_w(w);
+                    }
+                } else if (strMode == 0 && execCmd < 0) {
+                    u32 k = kParams[c];
+                    if (blocked || !((c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60) ||
+                        w - rseen + k + 1 > MTQ_N) { slow = 1; break; }
+                    sMtQ[w & MTQ_M] = c | k << 8;
+                    sMtQ[(w + 1) & MTQ_M] = v;
+                    w += 2;
+                    if (k == 1) {
+                        sMtWDone = w;
+                        if (w - sMtW >= MTQ_BATCH) mt_publish_w(w);
+                    } else { strLeft = k - 1; strMode = 1; execCmd = c; }
+                } else if (strMode == 0 && execCmd >= 0 && sExecCount + 1 < kParams[(u8)execCmd]) {
+                    sExecParams[sExecCount++] = v;    // a parameter of a matrix/test command, not the last
+                } else { slow = 1; break; }
+                if (--pleft) continue;
+                cmds >>= 8;
+                left--;
+            }
+            // pack_advance: on to the next packed command
+            while (left > 0) {
+                u8 c = cmds & 0xff;
+                if (cmds == 0) { left = 0; break; }
+                if (kParams[c]) { pleft = kParams[c]; break; }
+                if (c) { pleft = 0; slow = 2; break; }   // a zero-parameter command: general path
+                cmds >>= 8;
+                left--;
+            }
+            if (slow) { i++; break; }
+            if (left <= 0) pleft = 0;
+        }
+        sPackCmds = cmds; sPackLeft = left; sPackParamsLeft = pleft;
+        sStrMode = strMode; sStrLeft = strLeft; sExecCmd = execCmd; sMtWLocal = w;
+        if (slow == 1) { gxfifo_write_mt(src[i]); i++; }
+        else if (slow == 2) pack_advance_mt();   // runs the zero-parameter command(s) and continues the packing
+    }
+}
 void gpu3d_write_block(uint32_t addr, const uint32_t *src, uint32_t n) {
+    if (gHostGxStageN) HostGx_StageFlush();
     if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) {
+        static int fast = -1;
+        if (fast < 0) fast = !(getenv("ACWW_GXBLOCK") && atoi(getenv("ACWW_GXBLOCK")) == 0);
         if (sRawOn) for (uint32_t i = 0; i < n; i++) gx_raw_word(src[i]);
+        else if (fast) fifo_block_mt(src, n);
         else for (uint32_t i = 0; i < n; i++) gxfifo_write_mt(src[i]);
         return;
     }
     for (uint32_t i = 0; i < n; i++) gpu3d_write32(addr, src[i]);
 }
 uint32_t gpu3d_read32(uint32_t addr) {
+    if (gHostGxStageN) HostGx_StageFlush();
+    {   // ACWW_GXREADLOG=1: count GX register reads per address (diagnostics; printed every 600 reads)
+        static int on = -1; static unsigned cnt[0x100], tot;
+        if (on < 0) on = getenv("ACWW_GXREADLOG") != 0;
+        if (on) {
+            cnt[((addr - 0x04000000) >> 2) & 0xff]++;
+            if (++tot % 20000 == 0) { fprintf(stderr, "gxreads:"); for (int i = 0; i < 0x100; i++) if (cnt[i]) fprintf(stderr, " %03x:%u", i * 4, cnt[i]); fprintf(stderr, "\n"); }
+        }
+    }
     if (sMT) { if (addr == 0x04000604) mt_sync_r(1); }
     else drain();
     if (addr == 0x04000600) return gxstat();
@@ -1961,6 +2090,7 @@ void gpu3d_bind_banks(const uint8_t *const bank[9], const uint8_t cnt[9]) {
     memcpy(gG3VramCntFrame, cnt, sizeof gG3VramCntFrame);
 }
 void gpu3d_commit(const uint8_t *const bank[9]) {
+    if (gHostGxStageN) HostGx_StageFlush();
     gG3Banks = bank;
     memcpy(gG3VramCntFrame, gG3VramCnt, sizeof gG3VramCntFrame);   // pairs with the bank snapshot
     gG3BankDirtyFrame = sBankDirtyNext;   // dirty flags belong to this snapshot only
@@ -1990,6 +2120,7 @@ void gpu3d_commit(const uint8_t *const bank[9]) {
             sMtSwapsDone++;
             sCommitSwapped = sMtSwapsDone;
             __atomic_store_n(&sMtParked, 0, __ATOMIC_RELEASE);
+            mt_wake();
         }
         return;
     }

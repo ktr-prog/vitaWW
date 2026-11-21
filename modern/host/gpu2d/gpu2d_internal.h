@@ -41,6 +41,7 @@ typedef struct ObjLine {
     u8 mosaic[SCREEN_W];
     u16 coverKey[SCREEN_W];
     u8 window[SCREEN_W];
+    int lo, hi;   // x range any sprite wrote on this line (outside it every array is zero); lo >= hi: none
 } ObjLine;
 
 typedef struct Engine {
@@ -58,7 +59,7 @@ typedef struct Engine {
     u8 winActive[2];
     u16 bg[4][SCREEN_W];
     u8 bgAny[4];
-    u8 objCand[128];   // band renderer: OAM entries that are not disabled (objCandOn), else all 128 are walked
+    u8 objCand[128], objCandY[128], objCandH[128];   // + each candidate's y and bounding height   // band renderer: OAM entries that are not disabled (objCandOn), else all 128 are walked
     int objCandN, objCandOn;   // the BG line just rendered may have an opaque pixel (0: all transparent)
     ObjLine obj;
     ObjLine objNextLine0;

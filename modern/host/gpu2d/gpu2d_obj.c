@@ -38,13 +38,26 @@ static u32 obj_texel(const Engine *e, u32 dispcnt, u16 a0, u16 a2, u32 u, u32 v,
 }
 
 void gpu2d_render_obj_line(Engine *e, int line, ObjLine *dst) {
-    memset(dst, 0, sizeof *dst);
+    // Clear only what the previous line wrote (sprites cover a small part of most lines): the arrays are zero
+    // outside [lo, hi), as after a full clear.
+    if (dst->hi > dst->lo) {
+        int a = dst->lo < 0 ? 0 : dst->lo, b = dst->hi > SCREEN_W ? SCREEN_W : dst->hi, k = b - a;
+        if (k > 0) {
+            memset(dst->value + a, 0, (size_t)k * 2); memset(dst->coverKey + a, 0, (size_t)k * 2);
+            memset(dst->source + a, 0, (size_t)k); memset(dst->prio + a, 0, (size_t)k); memset(dst->kind + a, 0, (size_t)k);
+            memset(dst->alpha + a, 0, (size_t)k); memset(dst->index + a, 0, (size_t)k); memset(dst->mosaic + a, 0, (size_t)k);
+            memset(dst->window + a, 0, (size_t)k);
+        }
+    }
+    dst->lo = SCREEN_W;
+    dst->hi = 0;
     u32 dispcnt = reg32(e, REG_DISPCNT);
     if (line == 0) e->objMosaicLine = e->objMosaicCount = 0;
     if (!(dispcnt & 0x1000)) return;
     int nc = e->objCandOn ? e->objCandN : 128;
     for (int ci = 0; ci < nc; ci++) {
         int i = e->objCandOn ? e->objCand[ci] : ci;
+        if (e->objCandOn && ((line - e->objCandY[ci]) & 0xff) >= e->objCandH[ci]) continue;   // not on this line
         const u8 *o = e->oam + i * 8;
         u16 a0 = (u16)(o[0] | o[1] << 8), a1 = (u16)(o[2] | o[3] << 8), a2 = (u16)(o[4] | o[5] << 8);
         int affine = a0 & 0x100, mode = a0 >> 10 & 3, shape = a0 >> 14;
@@ -61,6 +74,10 @@ void gpu2d_render_obj_line(Engine *e, int line, ObjLine *dst) {
         }
         s32 x0 = a1 & 0x1ff;
         if (x0 >= 256) x0 -= 512;
+        {
+            s32 sl = x0 < 0 ? 0 : x0, sh = x0 + bw > SCREEN_W ? SCREEN_W : x0 + bw;
+            if (sl < sh) { if (sl < dst->lo) dst->lo = sl; if (sh > dst->hi) dst->hi = sh; }
+        }
         u32 prio = a2 >> 10 & 3;
         gpu2d_feature(e, F_OBJ);
         if (mode == 1) gpu2d_feature(e, F_OBJ_SEMI);
