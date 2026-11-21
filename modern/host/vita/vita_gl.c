@@ -97,10 +97,12 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh);
 // ---- GPU compose -------------------------------------------------------------------------------------------------
 // The 2D bands hand over the frame's layers (gpu2d.h Gpu2dGc) and the GPU composes them with the 3D colour buffer
 // straight into the canvas texture (gpu2d_compose.h): no 3D readback, no CPU compose, no canvas upload.
+extern uint64_t host_plat_time_ns(void);
+unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
-static int sGcState, sGcSet;   // 0 untried, 1 ready, -1 unavailable
+static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
     glShaderSource(sh, 1, &src, NULL);
@@ -155,6 +157,17 @@ int vita_gl_gc_init(void) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         }
     }
+    // The bands write straight into the layer textures (both sets): nothing is uploaded per frame.
+    for (int set = 0; set < 2; set++) {
+        void *ptr[7];
+        for (int i = 0; i < 7; i++) {
+            glBindTexture(GL_TEXTURE_2D, sGcTex[set][i]);
+            ptr[i] = vglGetTexDataPointer(GL_TEXTURE_2D);
+            if (!ptr[i]) { fprintf(stderr, "vita_gl: GPU compose: no texture memory pointer\n"); return 0; }
+        }
+        uint16_t *bg[4] = {ptr[0], ptr[1], ptr[2], ptr[3]};
+        gpu2d_set_gc_buffers(set, bg, ptr[4], ptr[5], ptr[6]);
+    }
     glGenTextures(1, &sGcCanvas);
     glBindTexture(GL_TEXTURE_2D, sGcCanvas);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -178,20 +191,12 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     if (!sReady || sGcState <= 0) return;
     static int first = 1;
     if (first) fprintf(stderr, "vita_gl: GPU compose: first frame\n");
-    GLuint *t = sGcTex[sGcSet];
-    sGcSet ^= 1;
-    const void *data[6] = {gc->bg[0], gc->bg[1], gc->bg[2], gc->bg[3], gc->obj, gc->aux};
-    for (int i = 0; i < 6; i++) {
-        if (i < 5 && !(gc->used >> i & 1)) continue;   // a layer no line shows: never sampled
+    uint64_t t0 = host_plat_time_ns();
+    GLuint *t = sGcTex[gc->set & 1];   // the bands wrote this set's texture memory directly
+    for (int i = 0; i < 7; i++) {
         glActiveTexture(GL_TEXTURE0 + i);
         glBindTexture(GL_TEXTURE_2D, t[i]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, data[i]);
     }
-    for (int i = 0; i < 5; i++)
-        if (!(gc->used >> i & 1)) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, t[i]); }
-    glActiveTexture(GL_TEXTURE0 + 6);
-    glBindTexture(GL_TEXTURE_2D, t[6]);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GPU2D_GC_PAR, 192, GL_RGBA, GL_UNSIGNED_BYTE, gc->par);
     glActiveTexture(GL_TEXTURE0 + 7);
     glBindTexture(GL_TEXTURE_2D, t[7]);
     if (ovl) {
@@ -224,6 +229,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sGcAttr);
+    gVitaComposeNs += host_plat_time_ns() - t0;
     glUseProgram(0);
     glDepthMask(GL_TRUE);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
@@ -260,7 +266,10 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
                       dx, dy, dx + dw, dy + dh,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
+    uint64_t ts = host_plat_time_ns();
     vglSwapBuffers(GL_FALSE);
+    gVitaSwapNs += host_plat_time_ns() - ts;
+    gVitaPresents++;
 }
 
 void vita_gl_shutdown(void) {

@@ -1087,7 +1087,21 @@ static void ref_advance(Engine *e, int line) {
 }
 
 // ---- GPU compose: per-line layer output (see gpu2d.h) ----
-static Gpu2dGc sGc;
+static Gpu2dGc sGcSets[2], *sGcCur = &sGcSets[0];
+#define sGc (*sGcCur)
+void gpu2d_set_gc_buffers(int set, uint16_t *const bg[4], uint16_t *obj, uint16_t *aux, uint8_t *par) {
+    Gpu2dGc *g = &sGcSets[set & 1];
+    for (int n = 0; n < 4; n++) g->bg[n] = bg[n];
+    g->obj = obj; g->aux = aux; g->par = par; g->set = set & 1;
+}
+static void gc_buffers_default(Gpu2dGc *g, int set) {
+    if (g->par) return;
+    for (int n = 0; n < 4; n++) g->bg[n] = calloc(SCREEN_W * SCREEN_H, 2);
+    g->obj = calloc(SCREEN_W * SCREEN_H, 2);
+    g->aux = calloc(SCREEN_W * SCREEN_H, 2);
+    g->par = calloc(SCREEN_H, GPU2D_GC_PAR * 4);
+    g->set = set;
+}
 static void gc_test_dump(void);
 static int sGcOn, sGcFrame, sGcFrameDone;
 void gpu2d_set_gpu_compose(int on) { sGcOn = on; }
@@ -1096,7 +1110,7 @@ __attribute__((constructor)) static void gc_test_init(void) {
     if (getenv("ACWW_GCTEST") && getenv("ACWW_GCMODE") && atoi(getenv("ACWW_GCMODE"))) sGcOn = 1;
 }
 #endif
-const Gpu2dGc *gpu2d_gc_frame(void) { return sGcFrameDone ? &sGc : NULL; }
+const Gpu2dGc *gpu2d_gc_frame(void) { return sGcFrameDone ? sGcCur : NULL; }
 // Parameter texels per line: 0 = BG priorities (4 = not shown), 1 = first/second target layers, effect | sprites
 // on << 2 | 3D on << 3, EVY; 2 = EVA, EVB, master-brightness mode, factor; 3 = backdrop (6-bit r, g, b);
 // 4 = 3D horizontal offset + 256 (low, high byte).
@@ -1108,13 +1122,13 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     window_line(e, obj, mask);
     obj_mosaic_x(e, obj);
     const int has3d = (dispcnt & 8) && (dispcnt & 0x100) && in->lines3d;
-    u8 *p = sGc.par[line];
+    u8 p[GPU2D_GC_PAR * 4] = {0};
     for (int n = 0; n < 4; n++) {
         int on = (dispcnt & 0x100u << n) && (n == 0 && (dispcnt & 8) ? has3d : e->bgAny[n]);
         p[n] = on ? (u8)(reg16(e, REG_BGCNT + 2 * n) & 3) : 4;
         if (on && !(n == 0 && (dispcnt & 8))) {
             memcpy(sGc.bg[n] + line * SCREEN_W, e->bg[n], sizeof e->bg[n]);
-            sGc.used |= 1u << n;
+            __atomic_fetch_or(&sGc.used, 1u << n, __ATOMIC_RELAXED);
         }
     }
     u16 bldcnt = reg16(e, REG_BLDCNT), bldalpha = reg16(e, REG_BLDALPHA), mb = reg16(e, REG_MASTER_BRIGHT);
@@ -1132,7 +1146,9 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     s32 hofs3d = reg16(e, REG_BGHOFS) & 0x1ff;
     if (hofs3d & 0x100) hofs3d -= 0x200;
     p[16] = (u8)((hofs3d + 256) & 0xff); p[17] = (u8)((hofs3d + 256) >> 8); p[18] = p[19] = 0;
-    u16 *oc = sGc.obj + line * SCREEN_W, *ax = sGc.aux + line * SCREEN_W;
+    // (built here and copied out whole: the destination may be uncached GPU memory)
+    u16 oc[SCREEN_W], ax[SCREEN_W];
+    int anyObj = 0;
     for (int x = 0; x < SCREEN_W; x++) ax[x] = mask[x];
     memset(oc, 0, SCREEN_W * sizeof *oc);
     if (dispcnt & 0x1000) {
@@ -1140,9 +1156,13 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
             if (!obj->source[x]) continue;
             oc[x] = (u16)(obj_color(e, dispcnt, obj, x) | 0x8000);
             ax[x] |= (u16)((obj->prio[x] & 3) | (obj->kind[x] & 3) << 2 | (obj->alpha[x] & 15) << 4) << 8;
-            sGc.used |= 1u << 4;
+            anyObj = 1;
         }
     }
+    if (anyObj) __atomic_fetch_or(&sGc.used, 1u << 4, __ATOMIC_RELAXED);
+    memcpy(sGc.obj + line * SCREEN_W, oc, sizeof oc);
+    memcpy(sGc.aux + line * SCREEN_W, ax, sizeof ax);
+    memcpy(sGc.par + line * GPU2D_GC_PAR * 4, p, sizeof p);
     gpu2d_feature(e, (enum Feature)(F_MODE0 + (dispcnt & 7)));
     obj_mosaic_y(e, line);
 }
@@ -1344,7 +1364,17 @@ static void gc_test_dump(void) {
     if (!gc_test_want()) return;
     const u32 *l3 = sMtW[0].in ? sMtW[0].in->lines3d : NULL;
     static u32 zero[SCREEN_W * SCREEN_H];
-    gc_test_write("gc", &sGc, sizeof sGc, l3 ? l3 : zero, sizeof zero);
+    char path[512];
+    snprintf(path, sizeof path, "%s/gc_%u.bin", getenv("ACWW_GCTEST"), sFrame);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    for (int n = 0; n < 4; n++) fwrite(sGc.bg[n], 2, SCREEN_W * SCREEN_H, f);
+    fwrite(sGc.obj, 2, SCREEN_W * SCREEN_H, f);
+    fwrite(sGc.aux, 2, SCREEN_W * SCREEN_H, f);
+    fwrite(sGc.par, GPU2D_GC_PAR * 4, SCREEN_H, f);
+    fwrite(&sGc.used, 4, 1, f);
+    fwrite(l3 ? l3 : zero, 1, sizeof zero, f);
+    fclose(f);
 }
 // Validation hook: hash the finished engine-0 canvas so a threaded run can be byte-compared with a sync run.
 static void canvas_hash(void) {
@@ -1364,6 +1394,8 @@ void gpu2d_render_finish(void) {
     sGcFrame = sGcOn && !sDefer3d && gc_frame_ok();
     sGcFrameDone = 0;
     if (sGcFrame) {
+        sGcCur = &sGcSets[sGcCur == &sGcSets[0]];   // the other set: the GPU may still read the last one
+        gc_buffers_default(sGcCur, sGcCur == &sGcSets[1]);
         sGc.used = 0;
         render_engine0_mt_bands(NULL);
         sGcFrame = 0;

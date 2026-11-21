@@ -35,8 +35,12 @@ extern uint64_t host_plat_time_ns(void);
 static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls;
 unsigned long long vita_gl3d_stats(char *buf, int n) {
     unsigned long long c = sStCalls ? sStCalls : 1;
-    snprintf(buf, (size_t)n, "; 3d: readback %llu us, draw submit %llu us (of which texture decode %llu us, %llu uploads/frame)",
-             sStReadNs / c / 1000, sStSubmitNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c);
+    extern unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;
+    unsigned long long pc = gVitaPresents ? gVitaPresents : 1;
+    snprintf(buf, (size_t)n, "; 3d: draw submit %llu us (of which texture decode %llu us, %llu uploads/frame); "
+             "present: compose %llu us, swap %llu us",
+             sStSubmitNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
+    gVitaComposeNs = gVitaSwapNs = gVitaPresents = 0;
     sStReadNs = sStSubmitNs = sStTexNs = sStTexUploads = sStCalls = 0;
     return c;
 } 

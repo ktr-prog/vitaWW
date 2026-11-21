@@ -61,12 +61,16 @@ const Gpu2dGpuFrame *gpu2d_gpu_frame(void);
 // line's compose registers - and the GPU blends them with the 3D image (gpu2d_compose.h has the shader).
 enum { GPU2D_GC_PAR = 8 };   // parameter texels (RGBA8) per line
 typedef struct Gpu2dGc {
-    uint16_t bg[4][192 * 256];
-    uint16_t obj[192 * 256];   // sprite colour | 0x8000 where a sprite pixel is (0 elsewhere)
-    uint16_t aux[192 * 256];   // low byte: window mask; high byte: sprite priority | kind << 2 | alpha << 4
-    uint8_t par[192][GPU2D_GC_PAR * 4];
-    uint32_t used;             // bit n: BG n has an opaque pixel on some line; bit 4: sprites
+    uint16_t *bg[4];   // 256x192 each, row stride 256
+    uint16_t *obj;     // sprite colour | 0x8000 where a sprite pixel is (0 elsewhere)
+    uint16_t *aux;     // low byte: window mask; high byte: sprite priority | kind << 2 | alpha << 4
+    uint8_t *par;      // GPU2D_GC_PAR RGBA texels per line
+    uint32_t used;     // bit n: BG n has an opaque pixel on some line; bit 4: sprites
+    int set;           // which of the two buffer sets (they alternate per frame)
 } Gpu2dGc;
+// Where the bands write the layers: two sets, alternating per frame (the Vita points them straight at its texture
+// memory, so nothing is uploaded). Unset sets use internal memory.
+void gpu2d_set_gc_buffers(int set, uint16_t *const bg[4], uint16_t *obj, uint16_t *aux, uint8_t *par);
 void gpu2d_set_gpu_compose(int on);       // compose on the GPU from now on (frames it can handle)
 const Gpu2dGc *gpu2d_gc_frame(void);      // the finished frame's layers, or NULL when it was composed on the CPU
 
