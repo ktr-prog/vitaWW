@@ -110,7 +110,7 @@ static void open_audio(void) {
     want.freq = ACWW_AUDIO_RATE;
     want.format = AUDIO_S16SYS;
     want.channels = 2;
-    want.samples = getenv("ACWW_AUDIO_SAMPLES") ? (Uint16)atoi(getenv("ACWW_AUDIO_SAMPLES")) : 512;
+    want.samples = 512;
     want.callback = audio_callback;
     want.userdata = sShm;
 #if HOST_VITA
@@ -216,7 +216,7 @@ AcwwShm *frontend_backend_open(const char *argv0) {
                             );
 #endif
 #if HOST_VITA
-    int vsync = !(getenv("ACWW_VSYNC") && atoi(getenv("ACWW_VSYNC")) == 0);  // default on: the GXM renderer flips on it
+    int vsync = 1;  // the GXM renderer flips on it
 #else
     int vsync = getenv("ACWW_VSYNC") && atoi(getenv("ACWW_VSYNC"));
 #endif

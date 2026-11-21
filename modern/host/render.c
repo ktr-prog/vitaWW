@@ -41,7 +41,6 @@ extern void frontend_frame(void);
 // thread races ahead into the next frame. This hides the ~38ms render under the ~68ms CPU (frame ~108 -> ~75ms).
 static int sRenderThreadOn;
 static unsigned sRenderSkipped;
-static int sFrameSkip;                     // never wait for the render thread: undrawn frames are skipped
 static int sWorkerSpawned;
 static int sLastMt;                       // the previous render_frame() dispatched to the worker (present is the worker's)
 static pthread_t sWorker;
@@ -124,8 +123,8 @@ void render_init(void) {
     gpu3d_set_diagnostics(sCompare);
     {
         // GX command processing on its own core. Off for the comparison/self-test harnesses, which single-step
-        // the pipeline; ACWW_GXMT=0 turns it off, ACWW_GX_ASYNC picks the pipelined commit (the Vita default).
-        int on = sOwn3d && !sCompare && !sMelon && !(getenv("ACWW_GXMT") && !atoi(getenv("ACWW_GXMT")));
+        // the pipeline.
+        int on = sOwn3d && !sCompare && !sMelon;
         // Synchronous commit everywhere by default: the geometry committed at a vblank is the frame the game just
         // finished, paired with the texture/palette VRAM snapshotted at the same vblank. The pipelined commit
         // (ACWW_GX_ASYNC=1) can draw one frame's polygons with the next frame's palettes (wrong colours).
@@ -137,7 +136,6 @@ void render_init(void) {
 #else
         int async = 0;
 #endif
-        if (getenv("ACWW_GX_ASYNC")) async = atoi(getenv("ACWW_GX_ASYNC"));
         gpu3d_mt_enable(on, async);
     }
     if (getenv("ACWW_GPU2D_SELFTEST")) {
@@ -158,13 +156,10 @@ void render_init(void) {
         render_selftest3d(strtol(getenv("ACWW_RENDER_SELFTEST3D"), 0, 10));
     }
 #if HOST_VITA
-    sRenderThreadOn = !env_is("ACWW_RENDERTHREAD", "0");   // on by default on the Vita; ACWW_RENDERTHREAD=0 to disable
+    sRenderThreadOn = 1;
 #else
     sRenderThreadOn = getenv("ACWW_RENDERTHREAD") && atoi(getenv("ACWW_RENDERTHREAD"));  // host validation only
 #endif
-    // Frameskip is opt-in (ACWW_FRAMESKIP=1): a skipped vblank leaves its geometry uncommitted, so the next drawn
-    // frame pairs older polygons with newer texture/palette VRAM.
-    sFrameSkip = sRenderThreadOn && getenv("ACWW_FRAMESKIP") && atoi(getenv("ACWW_FRAMESKIP"));
     if (sRenderThreadOn) fprintf(stderr, "render: render thread active (overlaps 2D bands + 3D with the next frame's CPU)\n");
 }
 
@@ -647,8 +642,8 @@ static void *job2d_main(void *a) {
 static int job2d_start(void) {
     static int ok = -1;
     if (ok < 0) {
-        ok = !(getenv("ACWW_2D3D_PARALLEL") && atoi(getenv("ACWW_2D3D_PARALLEL")) == 0);
-        if (ok) {
+        ok = 1;
+        {
             pthread_t t;
             pthread_attr_t at;
             pthread_attr_init(&at);
@@ -701,7 +696,6 @@ static void render_worker_phase(void) {
         __atomic_fetch_add(&sWPresentNs, host_plat_time_ns() - tp, __ATOMIC_RELAXED);
     }
 #endif
-    { static int lag = -1; if (lag < 0) lag = getenv("ACWW_RT_LAG") ? atoi(getenv("ACWW_RT_LAG")) : 0; if (lag) usleep(lag * 1000); }   // stress knob
     __atomic_fetch_add(&sWorkerNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
 }
 
@@ -807,11 +801,9 @@ static void render_frame_mt(void) {
         if (best < 0) for (int k = 0; k < SNAPS; k++) if (best < 0 || snapTag[k] < snapTag[best]) best = k;
         slot = best;
     }
-    if (!snapMem[slot]) snapMem[slot] = malloc(host_vram_total());
-    sSnapBankMem = snapMem[slot];
     {
-        // Main-screen-only (the Vita): copy just the banks the engine-A 2D and the 3D read this frame.
-        // ACWW_SNAPALL=1 copies everything (as before).
+        // Main-screen-only (the Vita, and the host with ACWW_FORCEMAIN): per-bank copies of just the banks the
+        // engine-A 2D and the 3D read this frame, shared between slots while unchanged. Otherwise the whole block.
         static int mainOnly = -1;
         if (mainOnly < 0) {
 #if HOST_VITA
@@ -819,23 +811,24 @@ static void render_frame_mt(void) {
 #else
             mainOnly = getenv("ACWW_FORCEMAIN") && atoi(getenv("ACWW_FORCEMAIN"));
 #endif
-            if (getenv("ACWW_SNAPALL") && atoi(getenv("ACWW_SNAPALL"))) mainOnly = 0;
         }
-        extern void host_vram_snapshot_main(u8 *dst, int slot, int keepLcdc);
+        extern void host_vram_snapshot_banks(const u8 *out[9], int slot, int keepLcdc);
         extern int gpu2d_main_vram_display(void);
-        if (mainOnly) host_vram_snapshot_main(sSnapBankMem, slot, gpu2d_main_vram_display());
-        else host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
-        // Bank generations as of this snapshot, for the 3D texture sync (gpu3d_tex.h). ACWW_TEXGEN=0: unused.
+        if (mainOnly) host_vram_snapshot_banks(sSnapBank, slot, gpu2d_main_vram_display());
+        else {
+            if (!snapMem[slot]) snapMem[slot] = malloc(host_vram_total());
+            sSnapBankMem = snapMem[slot];
+            host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
+            for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
+        }
+        // Bank generations as of this snapshot, for the 3D texture sync (gpu3d_tex.h).
         extern u32 gG3BankGenFrame[9];
         extern int gG3BankGenValid;
         extern const u32 *host_vram_bank_gens(void);
-        static int texGen = -1;
-        if (texGen < 0) texGen = !(getenv("ACWW_TEXGEN") && atoi(getenv("ACWW_TEXGEN")) == 0);
         memcpy(gG3BankGenFrame, host_vram_bank_gens(), sizeof gG3BankGenFrame);
-        gG3BankGenValid = texGen;
+        gG3BankGenValid = 1;
         memcpy(snapGens[slot], gG3BankGenFrame, sizeof snapGens[slot]);
     }
-    for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
     {
         unsigned issued = gpu3d_swaps_issued();
         snapTag[slot] = issued != lastIssued ? issued : 0;   // the geometry frame finished in this DS frame
@@ -867,9 +860,7 @@ static void render_frame_mt(void) {
         extern int gHostCanvasRows;
         int aBottom = gpu2d_main_on_bottom();
         int above = gHostCanvasRows - (aBottom ? 192 : 384);
-        static int single = -1;
-        if (single < 0) single = !(getenv("ACWW_SINGLE") && atoi(getenv("ACWW_SINGLE")) == 0);
-        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0 && single, above);
+        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0, above);
     }
     {
         extern const u8 *host_vram_snapshot_dirty(void);
@@ -928,27 +919,11 @@ static void render_frame_mt(void) {
     }
 }
 
-// Frameskip: the render thread is still drawing the previous frame. Do not wait for it - run only the game's
-// per-line HBlank handlers (game-visible side effects) and let the game thread start the next frame. The geometry
-// is not committed either (the render thread is reading the current polygon list).
-static int render_worker_busy(void) {
-    if (!sWorkerSpawned) return 0;
-    pthread_mutex_lock(&sWMx);
-    int busy = !sWDone;
-    pthread_mutex_unlock(&sWMx);
-    return busy;
-}
-static void render_frame_skip(void) {
-    if (sOwn) for (int line = 0; line < 192; line++) host_hblank(line);
-    sRenderSkipped++;
-}
-
 void render_frame(void) {
     __atomic_fetch_add(&sVblankCount, 1, __ATOMIC_RELAXED);
     if (render_thread_applicable()) {
         sLastMt = 1;
-        if (sFrameSkip && render_worker_busy()) render_frame_skip();
-        else render_frame_mt();
+        render_frame_mt();
         return;
     }
     render_thread_sync();                   // a worker frame may still be in flight; finish it before a sync frame
@@ -993,7 +968,7 @@ static void render_frame_sync(void) {
         extern int gHostCanvasRows;
         int aBottom = gpu2d_main_on_bottom();
         int above = gHostCanvasRows - (aBottom ? 192 : 384);
-        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0 && !(getenv("ACWW_SINGLE") && atoi(getenv("ACWW_SINGLE")) == 0), above);
+        gpu3d_set_tall(gpu2d_tall_3d_ok() && above > 0, above);
     }
     if (sGpu3d) {
         uint64_t t3d = host_plat_time_ns();

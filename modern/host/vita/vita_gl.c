@@ -1,8 +1,7 @@
 // GPU rendering path for the Vita, via vitaGL (OpenGL ES over GXM).
 //
 // Goal: move the DS image onto the Vita GPU, the way the iOS/desktop builds use WebGPU/Metal. This file owns the
-// vitaGL context and the GPU present path, and is the default on the Vita (set ACWW_GL=0 for the SDL/GXM
-// software-blit renderer instead).
+// vitaGL context and the GPU present path, which the Vita always uses.
 //
 // Stage 1 (now): vitaGL owns the display and presents the composited DS canvas as a GPU-textured, letterboxed
 // image. It does this with glBlitFramebuffer, which in vitaGL uses PRECOMPILED blit/clear shaders - so the
@@ -30,11 +29,10 @@ static GLuint sTex;    // holds the uploaded canvas
 static GLuint sFbo;    // read source for the blit (canvas texture attached)
 static int sTexW, sTexH;
 
-// GPU is the default on the Vita. Only an explicit ACWW_GL=0 falls back to the SDL/GXM software-blit renderer.
+// The GPU path is always on on the Vita.
 int vita_gl_enabled(void) {
     if (sOn < 0) {
-        const char *e = getenv("ACWW_GL");
-        sOn = (e && atoi(e) == 0) ? 0 : 1;
+        sOn = 1;
     }
     return sOn;
 }

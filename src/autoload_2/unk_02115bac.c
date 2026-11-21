@@ -21,6 +21,7 @@ extern void MIi_DmaSetParams_noInt(u32 dmaNo, uptr src, uptr dest, u32 cnt);
 extern void MIi_DmaSetParams_wait(u32 dmaNo, uptr src, uptr dest, u32 cnt);
 
 #include "nitro/mi_gxdma.h"
+#include "nitro/dma_host.h"
 typedef MIGXDmaParams MIiGxDmaState;
 
 extern MIiGxDmaState data_027e0414;
@@ -34,6 +35,13 @@ void MI_SendGXCommandAsyncFast(u32 dmaNo, uptr src, u32 size, MIDmaCallback call
     }
     while (((volatile MIiGxDmaState *)&data_027e0414)->isBusy)
         ;
+    {   // host: the GX DMA completes at once (see HostGx_SendList)
+        MIi_CheckDma0SourceAddress(dmaNo, src, size, 0);
+        MI_WaitDma(dmaNo);
+        HostGx_SendList((const void *)src, size);
+        if (callback) callback(arg);
+        return;
+    }
     data_027e0414.isBusy = 1;
     data_027e0414.dmaNo = dmaNo;
     data_027e0414.callback = callback;

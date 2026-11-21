@@ -469,6 +469,13 @@ void MI_SendGXCommandAsync(u32 dmaNo, const void *src, u32 commandLength, void (
     }
     while (data_027e0414.isBusy) {
     }
+    // Host: send the whole list now and finish as MIi_DMACallback does (FIFO IRQ off, cond/handler unchanged).
+    MIi_CheckDma0SourceAddress(dmaNo, (uptr)src, commandLength, 0);
+    MI_WaitDma(dmaNo);
+    HostGx_SendList(src, commandLength);
+    (void)OS_DisableIrqMask(0x200000);
+    MIi_CallCallback(callback, arg);
+    return;
     while (!(G3X_GetCommandFifoStatus() & 2)) {
     }
     data_027e0414.isBusy = TRUE;

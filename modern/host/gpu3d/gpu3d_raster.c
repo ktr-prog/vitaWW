@@ -564,10 +564,8 @@ static void render_bands(void) {
     if (!init) {
         init = 1;
         long n = sysconf(_SC_NPROCESSORS_ONLN);
-        const char *e = getenv("ACWW_GPU3D_THREADS");
-        if (e) n = atoi(e);
 #if HOST_VITA
-        else if (n < 3) n = 3;  // the Vita has 3 usable Cortex-A9 cores; sysconf under-reports, so parallelize anyway
+        if (n < 3) n = 3;  // the Vita has 3 usable Cortex-A9 cores; sysconf under-reports, so parallelize anyway
 #endif
         sBands = n < 1 ? 1 : n > MAX_BANDS ? MAX_BANDS : (int)n;
         for (int b = 1; b < sBands; b++)
@@ -597,11 +595,9 @@ void g3_render(void) {
     }
     if (timing) clock_gettime(CLOCK_MONOTONIC, &t0);
     sR = &gG3Render;
-    static int lazy = -1;
-    if (lazy < 0) lazy = !(getenv("ACWW_TEXLAZY") && atoi(getenv("ACWW_TEXLAZY")) == 0);
     static int lazyTest = -1;   // host check of the lazy path with the software rasterizer (ACWW_TEXLAZY_TEST=1)
     if (lazyTest < 0) lazyTest = getenv("ACWW_TEXLAZY_TEST") && atoi(getenv("ACWW_TEXLAZY_TEST"));
-    if (sWgpu && lazy) g3_tex_setup_lazy();   // the GL renderer syncs the textures it draws (gpu3d_tex_sync_for)
+    if (sWgpu) g3_tex_setup_lazy();   // the GL renderer syncs the textures it draws (gpu3d_tex_sync_for)
     else if (lazyTest) {
         g3_tex_setup_lazy();
         for (int i = 0; i < sR->npoly; i++) g3_tex_sync_for(sR->poly[i]->texparam, sR->poly[i]->texpal);

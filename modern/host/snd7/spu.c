@@ -229,13 +229,8 @@ static s32 run_channel(int ch) {
     }
     u32 per = 0x10000u - r->tmr;
     // Voices played faster than the output rate: the windowed-sinc FIR (cleaner than the DS) is most of the mixing
-    // cost; the Vita uses the hardware's own sample-and-hold instead (ACWW_AUDIO_FIR=1 restores the filter).
-    static int fir = -1;
-    if (fir < 0) {
-        fir = !HOST_VITA_AUDIO;
-        const char *e = getenv("ACWW_AUDIO_FIR");
-        if (e) fir = atoi(e) != 0;
-    }
+    // cost; the Vita uses the hardware's own sample-and-hold instead.
+    const int fir = !HOST_VITA_AUDIO;
     s32 v = fir && per < TIMER_STEP && format_of(ch) != 3 ? filtered(s, r->tmr, per) : s->cur;
     return (v << kVolShift[r->cnt >> 8 & 3]) * (s32)(r->cnt & 0x7f);
 }

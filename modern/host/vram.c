@@ -1,6 +1,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "host.h"
 #include "host_mem.h"
@@ -126,11 +127,9 @@ void host_vram_snapshot_live(u8 *dst) {
 }
 // Bank generations: bumped whenever a bank's contents may have changed (see host_vram_control and the snapshot).
 enum { SNAP_SLOTS = 4 };
-static u32 sBankGen[9], sSnapGen[SNAP_SLOTS][9];
-static u8 sSnapHave[SNAP_SLOTS][9];
-static const u8 *sGenDst[SNAP_SLOTS];
+static u32 sBankGen[9];
 unsigned gHostStateLoads;   // bumped by host_state_load (savestate.c); kept across loads
-HOST_STATE_KEEP(gHostStateLoads) HOST_STATE_KEEP(sBankGen) HOST_STATE_KEEP(sSnapGen) HOST_STATE_KEEP(sSnapHave) HOST_STATE_KEEP(sGenDst)
+HOST_STATE_KEEP(gHostStateLoads) HOST_STATE_KEEP(sBankGen)
 const u32 *host_vram_bank_gens(void) { return sBankGen; }
 // Main-screen-only renderer (the Vita): the snapshot only needs the banks the engine-A 2D and the 3D read - engine-A
 // BG/OBJ and their extended palettes, textures and texture palettes - plus LCDC banks A-D when engine A displays
@@ -149,43 +148,54 @@ static int bank_needed(int i, u8 c, int keepLcdc) {
     }
     return 1;
 }
-// slot: which of the caller's snapshot buffers dst is (0..SNAP_SLOTS-1); each remembers what it already holds.
-void host_vram_snapshot_main(u8 *dst, int slot, int keepLcdc) {
-    u8 need[9];
+// Main-screen snapshot for the render thread, per bank. Each bank has a small pool of copies tagged with the bank
+// generation they hold; a snapshot slot points at one copy per bank. Copies are shared between slots, so a bank that
+// has not changed (textures between uploads) is never copied again, however many slots are in flight; a changed bank
+// is copied once into a copy no other slot uses. out[i] receives bank i's copy for this slot.
+enum { POOL_N = SNAP_SLOTS + 1 };
+static struct { u8 *mem; u32 gen; u8 valid, refs; } sPool[9][POOL_N];
+static signed char sSlotBuf[SNAP_SLOTS][9];
+static u8 *sZeroBank;
+HOST_STATE_KEEP(sPool) HOST_STATE_KEEP(sSlotBuf) HOST_STATE_KEEP(sZeroBank)
+void host_vram_snapshot_banks(const u8 *out[9], int slot, int keepLcdc) {
     static unsigned seenLoads;
+    static int inited;
     slot &= SNAP_SLOTS - 1;
+    if (!inited) { inited = 1; memset(sSlotBuf, -1, sizeof sSlotBuf); }
     if (seenLoads != gHostStateLoads) {   // a state load: nothing is known
         seenLoads = gHostStateLoads;
-        memset(sSnapHave, 0, sizeof sSnapHave);
-        for (int i = 0; i < 9; i++) sBankGen[i]++;
+        for (int i = 0; i < 9; i++) { sBankGen[i]++; for (int k = 0; k < POOL_N; k++) sPool[i][k].valid = 0; }
     }
-    if (dst != sGenDst[slot]) { sGenDst[slot] = dst; memset(sSnapHave[slot], 0, 9); }
-    u8 *have = sSnapHave[slot];
-    u32 *sgen = sSnapGen[slot];
-    for (int i = 0; i < 9; i++) {
-        need[i] = (u8)bank_needed(i, sCnt[i], keepLcdc);
-        // A bank the CPU can address now may have been written since the last snapshot: new generation. A bank it
-        // cannot address (textures, texture palettes, extended palettes) keeps its contents until its next remap,
-        // so when the snapshot already holds this generation, copying it again would copy the same bytes.
-        if (bank_address(i, sCnt[i])) sBankGen[i]++;
-        if (!need[i]) { have[i] = 0; continue; }
-        if (have[i] && sgen[i] == sBankGen[i]) need[i] = 0;   // already in this buffer
-        else { have[i] = 1; sgen[i] = sBankGen[i]; }
-    }
-    static u8 covered[BANK_TOTAL / GRANULE];
-    memset(covered, 0, sizeof covered);
+    if (!sZeroBank) sZeroBank = calloc(1, 0x20000);
+    const u8 *src[BANK_TOTAL / GRANULE];
+    for (u32 k = 0; k < BANK_TOTAL / GRANULE; k++) src[k] = sBanks + k * GRANULE;
     for (int g = 0; g < NGRAN; g++)
-        if (sGran[g].bank >= 0) {
-            u32 o = sOffset[sGran[g].bank] + sGran[g].off;
-            covered[o / GRANULE] = 1;
-            if (need[sGran[g].bank]) memcpy(dst + o, sGran[g].win, GRANULE);
-        }
+        if (sGran[g].bank >= 0) src[(sOffset[sGran[g].bank] + sGran[g].off) / GRANULE] = sGran[g].win;
     for (int i = 0; i < 9; i++) {
-        if (!need[i]) continue;
-        for (u32 off = 0; off < kSize[i]; off += GRANULE) {
-            u32 o = sOffset[i] + off;
-            if (!covered[o / GRANULE]) memcpy(dst + o, sBanks + o, GRANULE);
+        // A bank the CPU can address now may have been written since the last snapshot: new generation. A bank it
+        // cannot address (textures, texture palettes, extended palettes) keeps its contents until its next remap.
+        if (bank_address(i, sCnt[i])) sBankGen[i]++;
+        int cur = sSlotBuf[slot][i];
+        if (!bank_needed(i, sCnt[i], keepLcdc)) {   // nothing reads it this frame: keep whatever the slot had
+            out[i] = cur >= 0 ? sPool[i][cur].mem : sZeroBank;
+            continue;
         }
+        if (cur >= 0) sPool[i][cur].refs &= (u8)~(1u << slot);
+        int pick = -1;
+        for (int k = 0; k < POOL_N; k++)
+            if (sPool[i][k].valid && sPool[i][k].gen == sBankGen[i]) { pick = k; break; }
+        if (pick < 0) {
+            for (int k = 0; k < POOL_N && pick < 0; k++) if (!sPool[i][k].refs) pick = k;
+            if (pick < 0) pick = 0;   // cannot happen (POOL_N > slots)
+            if (!sPool[i][pick].mem) sPool[i][pick].mem = malloc(kSize[i]);
+            u8 *d = sPool[i][pick].mem;
+            for (u32 off = 0; off < kSize[i]; off += GRANULE) memcpy(d + off, src[(sOffset[i] + off) / GRANULE], GRANULE);
+            sPool[i][pick].valid = 1;
+            sPool[i][pick].gen = sBankGen[i];
+        }
+        sPool[i][pick].refs |= (u8)(1u << slot);
+        sSlotBuf[slot][i] = (signed char)pick;
+        out[i] = sPool[i][pick].mem;
     }
 }
 // Changed 1 KB blocks of the last host_vram_snapshot_live(), indexed by bank-block offset / 1024.

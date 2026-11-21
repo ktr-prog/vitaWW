@@ -560,6 +560,16 @@ static void dma_run_body(int ch) {
     if (!(cnt >> 25 & 1) || ((cnt >> 27 & 7) == 0)) R32(base + 8) = cnt & ~0x80000000u;
     if (cnt >> 30 & 1) host_irq_raise(1u << (8 + ch));
 }
+// MI_SendGXCommandAsync / MI_SendGXCommandAsyncFast: the SDK feeds a display list to the GX FIFO with chained DMA
+// driven by FIFO-underhalf IRQs (one IRQ delivery + DMA set-up per 472-byte chunk). The FIFO here never fills, so
+// the whole list goes in at once and the completion runs right away - the same end state without the IRQ chain.
+static void gx_send_list_body(const void *src, unsigned int bytes) {
+    extern void gpu3d_write_block(u32 addr, const u32 *src, u32 n);
+    if (gHostGxStageN) HostGx_StageFlush();
+    gpu3d_write_block(0x04000400, (const u32 *)src, bytes >> 2);
+    sGxWrites += bytes >> 2;
+}
+void HostGx_SendList(const void *src, unsigned int bytes) { HOST_PHASE(PH_DMA, gx_send_list_body(src, bytes)); }
 static void dma_control_written(int ch) {
     u32 cnt = R32(0x040000b0 + ch * 12 + 8);
     if (!(cnt >> 31)) return;

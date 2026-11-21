@@ -330,7 +330,6 @@ int gpu2d_main_vram_display(void) { return (reg32(&sEngine[0], REG_DISPCNT) >> 1
 // over the line from back to front, and a hit pushes the current top down to second, so after all layers the top
 // two are the first two opaque layers in front-to-back order - what the general loop finds per pixel. Then one
 // pass blends. This replaces a per-pixel walk over the layer list with a type dispatch on every entry.
-static int g2dFast = -1;   // ACWW_2DFAST=0: use the general loop (A/B check)
 
 static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const u8 *mask, const u8 *order, int layers,
                               int has3d, s32 hofs3d, const u32 *line3d, u32 backdrop, u32 effect, u32 first,
@@ -557,8 +556,7 @@ static void compose_line(Engine *e, int line, const u32 *line3d, u32 *dst) {
     if (evy > 16) evy = 16;
     u32 backdrop = rgb6(pal16(e->palette, 0));
     u32 effectsUsed = 0;
-    if (g2dFast < 0) g2dFast = !(getenv("ACWW_2DFAST") && atoi(getenv("ACWW_2DFAST")) == 0);
-    if (g2dFast && e->num == 0 && !sSingle && !defer3d && !top3d && !sDiagnostics) {
+    if (e->num == 0 && !sSingle && !defer3d && !top3d && !sDiagnostics) {
         compose_line_fast(e, dispcnt, obj, mask, order, layers, has3d, hofs3d, line3d, backdrop, effect, first, second,
                           eva, evb, evy, dst, &effectsUsed);
         goto features;
@@ -1239,8 +1237,6 @@ void gpu2d_set_defer_bands(int on) {
 #if HOST_VITA
         if (on) s2dNB = 2;   // render thread + one helper: cores 1+2 (core 0 is the game thread's)
 #endif
-        const char *v = getenv("ACWW_2DBANDS");
-        if (v && atoi(v) >= 1 && atoi(v) <= N2DBANDS) s2dNB = atoi(v);
     }
     sDeferBands = on;
 }
@@ -1280,8 +1276,7 @@ static int render_engine0_mt(const Gpu2dFrameInput *in) {
 void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     sGpu = in->gpu;
     sDefer3d = in->defer3d || sGpu;
-    static int off = -1;
-    if (off < 0) off = getenv("ACWW_SINGLE") && atoi(getenv("ACWW_SINGLE")) == 0;
+    const int off = 0;
 #if HOST_VITA
     const int mainOnly = 1;  // the Vita shows only the main screen: never render the top screen (engine 1)
 #else

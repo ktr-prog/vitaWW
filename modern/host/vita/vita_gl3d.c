@@ -220,8 +220,6 @@ void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no s
 #define BATCH_V 0xC000  // vertices per draw: vitaGL's glDrawArrays index limit (MAX_IDX_NUMBER)
 
 static const G3RenderState *sSortR;
-static float sCol6[64];
-  // c / 63.0f for each 6-bit colour channel value (filled on first use)
 static int cmp_tex(const void *a, const void *b) {
     const G3Polygon *pa = sSortR->poly[*(const int *)a], *pb = sSortR->poly[*(const int *)b];
     uint64_t ka = (uint64_t)pa->texparam << 32 | pa->texpal;
@@ -233,7 +231,6 @@ static int cmp_tex(const void *a, const void *b) {
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
-    if (sCol6[63] == 0.0f) for (int c = 0; c < 64; c++) sCol6[c] = c / 63.0f;
     {   // lazy texture setup: sync the VRAM ranges of every texture drawn this frame (sets the change flags)
         uint32_t lastTp = 0, lastPal = 0;
         int have = 0;
@@ -255,18 +252,9 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     if (sPrevDraw >= 0) {
         glBindFramebuffer(GL_FRAMEBUFFER, sFbo[sPrevDraw]);
         static u8 rb[VW * VH * 4];
-        // ACWW_READBACK=gpu: GPU transfer into main RAM (vglReadPixels) - measured slower on the Vita (~9 ms vs ~4 ms:
-        // the transfer waits behind queued GPU work and the uncached reads are slow), so glReadPixels is the default.
-        static int gpuRb = -1;
-        static u8 *gbuf;
-        if (gpuRb < 0) {
-            const char *e = getenv("ACWW_READBACK");
-            gpuRb = e && !strcmp(e, "gpu");
-            if (gpuRb && !(gbuf = vglAlloc(VW * VH * 4, VGL_MEM_RAM))) gpuRb = 0;
-        }
+        // (glReadPixels: a GPU transfer into main RAM measured slower here, ~9 ms vs ~4 ms)
         const u8 *rbs = rb;
-        if (gpuRb) { vglReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, gbuf); rbs = gbuf; }
-        else glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, rb);
+        glReadPixels(0, 0, VW, VH, GL_RGBA, GL_UNSIGNED_BYTE, rb);
         for (int y = 0; y < VH; y++) {
             const u32 *src = (const u32 *)(rbs + (VH - 1 - y) * VW * 4);
             u32 *dst = out + y * VW;
@@ -336,26 +324,19 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // polygon uses the same identity projection, there is no per-object matrix load, so all polygons batch into
     // one glDrawArrays per run sharing texture+blend - ~2400 draw calls collapse to a handful. Polys arrive
     // pre-culled from the CPU facing test, so GL culling stays off.
-    static float bPos[BATCH_V][4], bCol[BATCH_V][4], bUv[BATCH_V][2];
-    // Indexed batches (default): each polygon's 3-4 vertices once (a quad was 6 expanded vertices), colours as
-    // bytes, plus a 16-bit fan index list - vitaGL copies about half the bytes into GPU memory per draw.
-    // ACWW_GLIDX=0: the expanded float batches as before.
+    // Indexed batches: each polygon's 3-4 vertices once, colours as bytes, plus a 16-bit fan index list.
+    static float bPos[BATCH_V][4], bUv[BATCH_V][2];
     static u8 bCol8[BATCH_V][4];
     static u16 bIdx[BATCH_V * 3];
-    static int useIdx = -1;
     static u8 sCol8[64];
-    if (useIdx < 0) {
-        useIdx = !(getenv("ACWW_GLIDX") && atoi(getenv("ACWW_GLIDX")) == 0);
-        for (int c = 0; c < 64; c++) sCol8[c] = (u8)((c * 255 + 31) / 63);
-        fprintf(stderr, "vita_gl3d: %s vertex batches\n", useIdx ? "indexed" : "expanded");
-    }
+    static int col8Init;
+    if (!col8Init) { col8Init = 1; for (int c = 0; c < 64; c++) sCol8[c] = (u8)((c * 255 + 31) / 63); }
     int bn = 0, bi = 0, haveState = 0, curBlend = -1;
     GLuint curTex = 0;
 #define GL3D_FLUSH() do { \
-        if (useIdx) { if (bi) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_UNSIGNED_BYTE, 0, bCol8); \
-            glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawElements(GL_TRIANGLES, bi, GL_UNSIGNED_SHORT, bIdx); } bn = bi = 0; } \
-        else if (bn) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_FLOAT, 0, bCol); \
-            glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawArrays(GL_TRIANGLES, 0, bn); bn = 0; } } while (0)
+        if (bi) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_UNSIGNED_BYTE, 0, bCol8); \
+            glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawElements(GL_TRIANGLES, bi, GL_UNSIGNED_SHORT, bIdx); } \
+        bn = bi = 0; } while (0)
     // Render opaque polygons sorted by texture (same texture batches into one draw, cutting GXM texture-bind
     // flushes - the dominant 3D render cost when the scene interleaves many textures). Depth test resolves the
     // opaque image regardless of draw order. Translucent polygons follow in submission order (order matters).
@@ -389,7 +370,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         if (p->nv < 3) continue;
         GLuint tex = sPolyTex[oi];
         int blend = p->translucent ? 1 : 0;
-        int full = useIdx ? bn + p->nv > BATCH_V || bi + (p->nv - 2) * 3 > BATCH_V * 3 : bn + (p->nv - 2) * 3 > BATCH_V;
+        int full = bn + p->nv > BATCH_V || bi + (p->nv - 2) * 3 > BATCH_V * 3;
         if (!haveState || tex != curTex || blend != curBlend || full) {
             GL3D_FLUSH();
             if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); } else glDisable(GL_TEXTURE_2D);
@@ -402,12 +383,11 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         // colours come from a table built with the old expression; 1/(16*tw) and 1/(16*th) are exact powers of
         // two, so multiplying is bit-identical to dividing by 16 and then by tw/th; alpha is per polygon.
         const float su = 1.0f / (16.0f * tw), sv = 1.0f / (16.0f * th);
-        const float va = p->translucent ? (p->attr >> 16 & 31) / 31.0f : 1.0f;
-        float vp[16][4], vc[16][4], vu[16][2];
+        const u8 a8 = p->translucent ? (u8)(((p->attr >> 16 & 31) * 255 + 15) / 31) : 255;
         for (int i = 0; i < p->nv; i++) {
             const G3VHot *v = p->hv[0] ? p->hv[i] : (const G3VHot *)0;
             G3VHot tmp;
-            if (!v) {   // slow geometry path (ACWW_G3FAST=0): same fields from the full vertex
+            if (!v) {   // (no lean-vertex pool memory): same fields from the full vertex
                 const G3Vertex *f = p->v[i];
                 memcpy(tmp.pos, f->pos, sizeof tmp.pos); memcpy(tmp.color, f->color, sizeof tmp.color);
                 memcpy(tmp.tex, f->tex, sizeof tmp.tex);
@@ -415,42 +395,16 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             }
             // DS clip-space position (pos[]=NDC*w); GL does the divide/viewport/depth and clips the frustum.
             // v->color is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel.
-            vp[i][0] = (float)v->pos[0]; vp[i][1] = (float)v->pos[1]; vp[i][2] = (float)v->pos[2]; vp[i][3] = (float)v->pos[3];
-            vc[i][0] = sCol6[(v->color[0] >> 3) & 63]; vc[i][1] = sCol6[(v->color[1] >> 3) & 63];
-            vc[i][2] = sCol6[(v->color[2] >> 3) & 63];
-            vc[i][3] = va;
-            vu[i][0] = (float)v->tex[0] * su;
-            vu[i][1] = (float)v->tex[1] * sv;
+            const int o = bn + i;
+            bPos[o][0] = (float)v->pos[0]; bPos[o][1] = (float)v->pos[1]; bPos[o][2] = (float)v->pos[2];
+            bPos[o][3] = (float)v->pos[3];
+            bCol8[o][0] = sCol8[(v->color[0] >> 3) & 63]; bCol8[o][1] = sCol8[(v->color[1] >> 3) & 63];
+            bCol8[o][2] = sCol8[(v->color[2] >> 3) & 63]; bCol8[o][3] = a8;
+            bUv[o][0] = (float)v->tex[0] * su;
+            bUv[o][1] = (float)v->tex[1] * sv;
         }
-        if (useIdx) {
-            u8 a8 = p->translucent ? (u8)(((p->attr >> 16 & 31) * 255 + 15) / 31) : 255;
-            for (int i = 0; i < p->nv; i++) {
-                const G3VHot *v = p->hv[0] ? p->hv[i] : (const G3VHot *)0;
-                G3VHot tmp;
-                if (!v) {
-                    const G3Vertex *f = p->v[i];
-                    memcpy(tmp.color, f->color, sizeof tmp.color);
-                    v = &tmp;
-                }
-                int o = bn + i;
-                bPos[o][0] = vp[i][0]; bPos[o][1] = vp[i][1]; bPos[o][2] = vp[i][2]; bPos[o][3] = vp[i][3];
-                bCol8[o][0] = sCol8[(v->color[0] >> 3) & 63]; bCol8[o][1] = sCol8[(v->color[1] >> 3) & 63];
-                bCol8[o][2] = sCol8[(v->color[2] >> 3) & 63]; bCol8[o][3] = a8;
-                bUv[o][0] = vu[i][0]; bUv[o][1] = vu[i][1];
-            }
-            for (int i = 1; i + 1 < p->nv; i++) { bIdx[bi++] = (u16)bn; bIdx[bi++] = (u16)(bn + i); bIdx[bi++] = (u16)(bn + i + 1); }
-            bn += p->nv;
-            continue;
-        }
-        for (int i = 1; i + 1 < p->nv; i++) {   // fan -> triangles: (0, i, i+1)
-            const int idx[3] = {0, i, i + 1};
-            for (int j = 0; j < 3; j++, bn++) {
-                int s = idx[j];
-                bPos[bn][0] = vp[s][0]; bPos[bn][1] = vp[s][1]; bPos[bn][2] = vp[s][2]; bPos[bn][3] = vp[s][3];
-                bCol[bn][0] = vc[s][0]; bCol[bn][1] = vc[s][1]; bCol[bn][2] = vc[s][2]; bCol[bn][3] = vc[s][3];
-                bUv[bn][0] = vu[s][0]; bUv[bn][1] = vu[s][1];
-            }
-        }
+        for (int i = 1; i + 1 < p->nv; i++) { bIdx[bi++] = (u16)bn; bIdx[bi++] = (u16)(bn + i); bIdx[bi++] = (u16)(bn + i + 1); }
+        bn += p->nv;
     }
     GL3D_FLUSH();
 #undef GL3D_FLUSH
