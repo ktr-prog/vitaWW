@@ -379,59 +379,92 @@ static void compose_line_fast(Engine *e, u32 dispcnt, const ObjLine *obj, const 
             return;
         }
     }
-    u32 tc[SCREEN_W], sc[SCREEN_W];
-    u8 tl[SCREEN_W], sl[SCREEN_W], ta[SCREEN_W];
-    for (int x = 0; x < SCREEN_W; x++) { tc[x] = sc[x] = backdrop; tl[x] = LAYER_BACKDROP; sl[x] = LAYER_NONE; }
-#define PUSH(x) do { sc[x] = tc[x]; sl[x] = tl[x]; } while (0)
+    // General case, layer-major and four pixels at a time (GCC vector types: NEON on the Vita, SSE on a PC).
+    // Each pixel keeps its top and second candidates packed in one word: colour (6 bits per channel in bytes
+    // 0-2) | 3D alpha << 24 (0 = not a 3D pixel) | layer << 29.
+    typedef u32 v4u __attribute__((vector_size(16)));
+    typedef u16 v4h __attribute__((vector_size(8)));
+    typedef u8 v4b __attribute__((vector_size(4)));
+#define LD8(p) ({ v4b b_; memcpy(&b_, (p), 4); __builtin_convertvector(b_, v4u); })
+#define LD16(p) ({ v4h h_; memcpy(&h_, (p), 8); __builtin_convertvector(h_, v4u); })
+#define LD32(p) ({ v4u w_; memcpy(&w_, (p), 16); w_; })
+#define ST32(p, v) do { v4u w_ = (v); memcpy((p), &w_, 16); } while (0)
+    u32 tc[SCREEN_W] __attribute__((aligned(16))), sc[SCREEN_W] __attribute__((aligned(16)));
+    {
+        u32 t0 = backdrop | (u32)LAYER_BACKDROP << 29, s0 = backdrop | (u32)LAYER_NONE << 29;
+        for (int x = 0; x < SCREEN_W; x++) { tc[x] = t0; sc[x] = s0; }
+    }
+    u32 objc[SCREEN_W] __attribute__((aligned(16)));
+    u8 objp[SCREEN_W] __attribute__((aligned(16)));
+    if (objPrio) {
+        for (int x = 0; x < SCREEN_W; x++) {
+            if ((mask[x] & 0x10) && obj->source[x]) {
+                objp[x] = obj->prio[x];
+                objc[x] = rgb6(obj_color(e, dispcnt, obj, x)) | (u32)LAYER_OBJ << 29;
+            } else { objp[x] = 0xff; objc[x] = 0; }
+        }
+    }
     for (int k = layers - 1; k >= 0; k--) {
         int n = order[k];
         if (n >= OBJ_ORDER) {
-            u8 p = (u8)(n - OBJ_ORDER);
+            u32 p = (u32)(n - OBJ_ORDER);
             if (!(objPrio >> p & 1)) continue;
-            for (int x = 0; x < SCREEN_W; x++)
-                if ((mask[x] & 0x10) && obj->source[x] && obj->prio[x] == p) {
-                    PUSH(x);
-                    tc[x] = rgb6(obj_color(e, dispcnt, obj, x)); tl[x] = LAYER_OBJ;
-                }
+            for (int x = 0; x < SCREEN_W; x += 4) {
+                v4u c = (v4u)(LD8(objp + x) == p);
+                v4u t = LD32(tc + x), s2 = LD32(sc + x);
+                ST32(sc + x, (c & t) | (~c & s2));
+                ST32(tc + x, (c & LD32(objc + x)) | (~c & t));
+            }
         } else if (n == 0 && has3d) {
+            u32 l3b[SCREEN_W] __attribute__((aligned(16)));
             int lo = hofs3d < 0 ? -hofs3d : 0, hi = SCREEN_W - (hofs3d > 0 ? hofs3d : 0);
-            const u32 *l3 = line3d + hofs3d;
-            for (int x = lo; x < hi; x++) {
-                u32 c = l3[x], a = c >> 24 & 0x1f;
-                if (!a || !(mask[x] & 1)) continue;
-                PUSH(x);
-                tc[x] = c & 0x3f3f3f; tl[x] = LAYER_BG0 | L3D; ta[x] = (u8)a;
+            memset(l3b, 0, sizeof l3b);
+            if (hi > lo) memcpy(l3b + lo, line3d + hofs3d + lo, (size_t)(hi - lo) * sizeof(u32));
+            for (int x = 0; x < SCREEN_W; x += 4) {
+                v4u c3 = LD32(l3b + x), a = c3 >> 24 & 0x1f;
+                v4u c = (v4u)(a != 0) & (v4u)((LD8(mask + x) & 1) != 0);
+                v4u nc = (c3 & 0x3f3f3f) | a << 24;
+                v4u t = LD32(tc + x), s2 = LD32(sc + x);
+                ST32(sc + x, (c & t) | (~c & s2));
+                ST32(tc + x, (c & nc) | (~c & t));
             }
         } else {
             if (!e->bgAny[n]) continue;   // fully transparent on this line
             const u16 *bg = e->bg[n];
-            u8 bit = (u8)(1u << n);
-            for (int x = 0; x < SCREEN_W; x++)
-                if ((bg[x] & PIX_OPAQUE) && (mask[x] & bit)) {
-                    PUSH(x);
-                    tc[x] = rgb6(bg[x]); tl[x] = (u8)n;
-                }
+            u32 bit = 1u << n, lay = (u32)n << 29;
+            for (int x = 0; x < SCREEN_W; x += 4) {
+                v4u b = LD16(bg + x);
+                v4u c = (v4u)((b & PIX_OPAQUE) != 0) & (v4u)((LD8(mask + x) & bit) != 0);
+                v4u nc = (b & 0x1f) << 1 | (b >> 5 & 0x1f) << 9 | (b >> 10 & 0x1f) << 17 | lay;
+                v4u t = LD32(tc + x), s2 = LD32(sc + x);
+                ST32(sc + x, (c & t) | (~c & s2));
+                ST32(tc + x, (c & nc) | (~c & t));
+            }
         }
     }
-#undef PUSH
+#undef LD8
+#undef LD16
+#undef LD32
+#undef ST32
     u32 used = 0;
     for (int x = 0; x < SCREEN_W; x++) {
-        u32 col0 = tc[x], out = col0, eff = EFF_NONE;
-        u32 t = tl[x], lay0 = t & 0x7f;
-        int below2nd = (second >> (sl[x] & 7)) & 1;
+        u32 t = tc[x], s2 = sc[x];
+        u32 col0 = t & 0x3f3f3f, out = col0, eff = EFF_NONE, lay0 = t >> 29, a3 = t >> 24 & 0x1f;
+        u32 scol = s2 & 0x3f3f3f;
+        int below2nd = (second >> (s2 >> 29)) & 1;
         if (lay0 == LAYER_OBJ && obj->kind[x] != OBJ_NORMAL && below2nd) {
             if (obj->kind[x] == OBJ_BITMAP) {
-                out = blend(col0, sc[x], obj->alpha[x] + 1u, 15u - obj->alpha[x]);
+                out = blend(col0, scol, obj->alpha[x] + 1u, 15u - obj->alpha[x]);
                 eff = EFF_BITMAP_OBJ;
             } else {
-                out = blend(col0, sc[x], eva, evb);
+                out = blend(col0, scol, eva, evb);
                 eff = EFF_SEMI_OBJ;
             }
-        } else if ((t & L3D) && below2nd) {
-            if (ta[x] != 31) out = blend3d(col0, sc[x], ta[x]);   // alpha 31: blend3d returns col0 exactly
+        } else if (a3 && below2nd) {
+            if (a3 != 31) out = blend3d(col0, scol, a3);   // alpha 31: blend3d returns col0 exactly
             eff = EFF_3D;
         } else if ((mask[x] & 0x20) && ((first >> lay0) & 1)) {
-            if (effect == 1 && below2nd) { out = blend(col0, sc[x], eva, evb); eff = EFF_ALPHA; }
+            if (effect == 1 && below2nd) { out = blend(col0, scol, eva, evb); eff = EFF_ALPHA; }
             else if (effect == 2) { out = brighten(col0, evy, 8); eff = EFF_UP; }
             else if (effect == 3) { out = darken(col0, evy, 7); eff = EFF_DOWN; }
         }
