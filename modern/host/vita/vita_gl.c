@@ -19,6 +19,8 @@
 #include <vitaGL.h>
 
 #include "vita.h"
+#include "../gpu2d/gpu2d.h"
+#include "../gpu2d/gpu2d_compose.h"
 
 #define SCREEN_W 960
 #define SCREEN_H 544
@@ -89,13 +91,146 @@ static void ensure_tex(int w, int h, const void *pixels) {
     }
 }
 
+// Blit the canvas texture (sTex, via sFbo) to the screen, scaled to FIT, and flip.
+static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh);
+
+// ---- GPU compose -------------------------------------------------------------------------------------------------
+// The 2D bands hand over the frame's layers (gpu2d.h Gpu2dGc) and the GPU composes them with the 3D colour buffer
+// straight into the canvas texture (gpu2d_compose.h): no 3D readback, no CPU compose, no canvas upload.
+int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
+static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
+static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
+static int sGcState, sGcSet;   // 0 untried, 1 ready, -1 unavailable
+static GLuint gc_shader(GLenum type, const char *src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024] = "";
+        glGetShaderInfoLog(sh, sizeof log, NULL, log);
+        fprintf(stderr, "vita_gl: compose shader failed to compile: %s\n", log);
+        return 0;
+    }
+    return sh;
+}
+int vita_gl_gc_init(void) {
+    if (sGcState) return sGcState > 0;
+    sGcState = -1;
+    if (!sReady) return 0;
+    GLuint vs = gc_shader(GL_VERTEX_SHADER, kGcVertexShader), fs = gc_shader(GL_FRAGMENT_SHADER, kGcFragmentShader);
+    if (!vs || !fs) return 0;
+    sGcProg = glCreateProgram();
+    glAttachShader(sGcProg, vs);
+    glAttachShader(sGcProg, fs);
+    glLinkProgram(sGcProg);
+    GLint ok = 0;
+    glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
+    if (!ok) { fprintf(stderr, "vita_gl: compose program failed to link\n"); return 0; }
+    sGcAttr = glGetAttribLocation(sGcProg, "aPos");
+    sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
+    sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
+    glUseProgram(sGcProg);
+    static const char *const kNames[9] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d"};
+    for (int i = 0; i < 9; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
+    glUseProgram(0);
+    for (int set = 0; set < 2; set++) {
+        glGenTextures(8, sGcTex[set]);
+        for (int i = 0; i < 8; i++) {
+            glBindTexture(GL_TEXTURE_2D, sGcTex[set][i]);
+            if (i < 6) glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, 256, 192, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, NULL);
+            else if (i == 6) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GPU2D_GC_PAR, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            else glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 16, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        }
+    }
+    glGenTextures(1, &sGcCanvas);
+    glBindTexture(GL_TEXTURE_2D, sGcCanvas);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &sGcFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sGcCanvas, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    sGcState = 1;
+    gVitaGc = 1;
+    fprintf(stderr, "vita_gl: GPU compose on (2D layers + 3D blended on the GPU)\n");
+    return 1;
+}
+
+// Compose gc + the 3D colour buffer tex3d (0: none yet) into the canvas texture and present it. ovl: the FPS
+// overlay rows (256x16, alpha byte 0 = overlay pixel) or NULL.
+void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) {
+    if (!sReady || sGcState <= 0) return;
+    GLuint *t = sGcTex[sGcSet];
+    sGcSet ^= 1;
+    const void *data[6] = {gc->bg[0], gc->bg[1], gc->bg[2], gc->bg[3], gc->obj, gc->aux};
+    for (int i = 0; i < 6; i++) {
+        if (i < 5 && !(gc->used >> i & 1)) continue;   // a layer no line shows: never sampled
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, t[i]);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, data[i]);
+    }
+    for (int i = 0; i < 5; i++)
+        if (!(gc->used >> i & 1)) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(GL_TEXTURE_2D, t[i]); }
+    glActiveTexture(GL_TEXTURE0 + 6);
+    glBindTexture(GL_TEXTURE_2D, t[6]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, GPU2D_GC_PAR, 192, GL_RGBA, GL_UNSIGNED_BYTE, gc->par);
+    glActiveTexture(GL_TEXTURE0 + 7);
+    glBindTexture(GL_TEXTURE_2D, t[7]);
+    if (ovl) {
+        static uint8_t o[256 * 16 * 4];
+        for (int i = 0; i < 256 * 16; i++) {
+            uint32_t v = ovl[i];
+            o[i * 4] = (uint8_t)(v >> 16); o[i * 4 + 1] = (uint8_t)(v >> 8); o[i * 4 + 2] = (uint8_t)v;
+            o[i * 4 + 3] = (v >> 24) ? 0 : 255;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 16, GL_RGBA, GL_UNSIGNED_BYTE, o);
+    }
+    glActiveTexture(GL_TEXTURE0 + 8);
+    glBindTexture(GL_TEXTURE_2D, tex3d);
+    glActiveTexture(GL_TEXTURE0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);   // the RGBA canvas texture is its colour attachment
+    glViewport(0, 0, 256, 192);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_ALPHA_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glDepthMask(GL_FALSE);
+    glUseProgram(sGcProg);
+    glUniform1f(sGcHave3d, tex3d ? 1.0f : 0.0f);
+    glUniform1f(sGcOvlOn, ovl ? 1.0f : 0.0f);
+    static const float kQuad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableVertexAttribArray((GLuint)sGcAttr);
+    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)sGcAttr);
+    glUseProgram(0);
+    glDepthMask(GL_TRUE);
+    glViewport(0, 0, SCREEN_W, SCREEN_H);
+    blit_canvas(sGcFbo, 0, 0, 256, 192);
+}
+
 // Present one frame: upload the composited DS canvas (XRGB8888 == GL_BGRA bytes, a zero-conversion upload) and
 // blit the sub-rectangle [sx,sy,sw,sh] of it to the screen, scaled to FIT (letterbox, 4:3, black bars).
 void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int sx, int sy, int sw, int sh) {
     if (!sReady) return;
 
     ensure_tex(canvas_w, canvas_h, pixels);
+    blit_canvas(sFbo, sx, sy, sw, sh);
+}
 
+static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
     // FIT: largest scale that still fits both axes (letterbox)
     float scale = (float)SCREEN_W / sw;
     if ((float)SCREEN_H / sh < scale) scale = (float)SCREEN_H / sh;
@@ -108,7 +243,7 @@ void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, sFbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
     // vitaGL flips V when reading an FBO as a texture, which would show the canvas upside-down; invert the source
     // Y range (srcY0=bottom, srcY1=top) to cancel that flip so row 0 of the canvas lands at the top of the screen.
     glBlitFramebuffer(sx, sy + sh, sx + sw, sy,

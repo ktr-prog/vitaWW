@@ -215,7 +215,9 @@ int g3w_init(void *device, void *queue, int scale) {
                            // GXM render time than the ~13ms CPU transform they removed.
     return 1;
 }
-void *g3w_picture(void) { return 0; }   // readback path only (out buffer), no shared picture
+void *g3w_picture(void) { return 0; }
+// The colour texture of the last frame drawn (GPU compose samples it), 0 before the first.
+unsigned vita_gl3d_frame_tex(void) { return sReady && sPrevDraw >= 0 ? sColorTex[sPrevDraw] : 0; }   // readback path only (out buffer), no shared picture
 
 #define BATCH_V 0xC000  // vertices per draw: vitaGL's glDrawArrays index limit (MAX_IDX_NUMBER)
 
@@ -249,7 +251,9 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
     // frame. By now the GPU has long finished those draws (a whole frame has passed), so glReadPixels does not
     // stall - the ~18ms the CPU used to spend waiting for the GPU is gone. Costs one frame of extra 3D latency.
-    if (sPrevDraw >= 0) {
+    extern int gVitaGc;   // GPU compose: the 2D/3D blend samples the colour buffer on the GPU, nothing to read
+    if (gVitaGc) {
+    } else if (sPrevDraw >= 0) {
         glBindFramebuffer(GL_FRAMEBUFFER, sFbo[sPrevDraw]);
         static u8 rb[VW * VH * 4];
         // (glReadPixels: a GPU transfer into main RAM measured slower here, ~9 ms vs ~4 ms)

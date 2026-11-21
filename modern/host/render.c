@@ -689,10 +689,23 @@ static void render_worker_phase(void) {
         uint64_t tp = host_plat_time_ns();
         extern const uint32_t *gpu2d_canvas(int *rows);
         extern void vita_gl_present_canvas(const void *, int, int, int, int, int, int);
-        int rows = 0;
-        const uint32_t *c = gpu2d_canvas(&rows);
-        if (c && rows >= 192 && rows <= 640) overlay_fps((uint32_t *)c);   // the canvas is rebuilt every frame
-        if (c && rows >= 192 && rows <= 640) vita_gl_present_canvas(c, 256, rows, 0, 0, 256, rows);
+        extern int vita_gl_gc_init(void);
+        extern void vita_gl_present_gc(const Gpu2dGc *, unsigned, const uint32_t *);
+        extern unsigned vita_gl3d_frame_tex(void);
+        static int gcTried;
+        if (!gcTried) { gcTried = 1; if (sGpu3d && vita_gl_gc_init()) gpu2d_set_gpu_compose(1); }
+        const Gpu2dGc *gc = gpu2d_gc_frame();
+        if (gc) {   // composed on the GPU: the 2D layers + this frame's 3D colour buffer
+            static uint32_t ovl[256 * 16];
+            for (int i = 0; i < 256 * 16; i++) ovl[i] = 0x01000000u;   // (alpha byte 0 = an overlay pixel)
+            overlay_fps(ovl);
+            vita_gl_present_gc(gc, vita_gl3d_frame_tex(), ovl);
+        } else {
+            int rows = 0;
+            const uint32_t *c = gpu2d_canvas(&rows);
+            if (c && rows >= 192 && rows <= 640) overlay_fps((uint32_t *)c);   // the canvas is rebuilt every frame
+            if (c && rows >= 192 && rows <= 640) vita_gl_present_canvas(c, 256, rows, 0, 0, 256, rows);
+        }
         __atomic_fetch_add(&sWPresentNs, host_plat_time_ns() - tp, __ATOMIC_RELAXED);
     }
 #endif

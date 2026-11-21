@@ -56,6 +56,20 @@ typedef struct Gpu2dGpuFrame {
 } Gpu2dGpuFrame;
 const Gpu2dGpuFrame *gpu2d_gpu_frame(void);
 
+// GPU compose (the Vita): instead of compositing on the CPU, the bands write each line's layers - the four BG
+// lines and the sprite colours as raw DS colours (bit 15 = opaque), the window mask + sprite attributes, and the
+// line's compose registers - and the GPU blends them with the 3D image (gpu2d_compose.h has the shader).
+enum { GPU2D_GC_PAR = 8 };   // parameter texels (RGBA8) per line
+typedef struct Gpu2dGc {
+    uint16_t bg[4][192 * 256];
+    uint16_t obj[192 * 256];   // sprite colour | 0x8000 where a sprite pixel is (0 elsewhere)
+    uint16_t aux[192 * 256];   // low byte: window mask; high byte: sprite priority | kind << 2 | alpha << 4
+    uint8_t par[192][GPU2D_GC_PAR * 4];
+    uint32_t used;             // bit n: BG n has an opaque pixel on some line; bit 4: sprites
+} Gpu2dGc;
+void gpu2d_set_gpu_compose(int on);       // compose on the GPU from now on (frames it can handle)
+const Gpu2dGc *gpu2d_gc_frame(void);      // the finished frame's layers, or NULL when it was composed on the CPU
+
 void gpu2d_set_diagnostics(int on);
 void gpu2d_describe_pixel(int screen, int x, int y, char *buf, size_t size);
 void gpu2d_print_features(void);
