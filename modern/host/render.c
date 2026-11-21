@@ -919,7 +919,7 @@ static void render_frame_mt(void) {
             unsigned long long pres = __atomic_exchange_n(&sWPresentNs, 0, __ATOMIC_RELAXED) / 60000;
 #if HOST_VITA
             extern unsigned long long vita_gl3d_stats(char *buf, int n);
-            char g3[160];
+            char g3[320];
             vita_gl3d_stats(g3, sizeof g3);
 #else
             const char *g3 = "";
