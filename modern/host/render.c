@@ -905,6 +905,11 @@ static void render_frame_mt(void) {
         }
     } else sDraw3d = 1;
     sHoCommitNs += host_plat_time_ns() - c0;
+    {   // this frame's hand-off, for the pacing report's longest frame (hw.c)
+        extern unsigned long long gHoFrameWaitNs, gHoFrameNs;
+        gHoFrameWaitNs = h1 - h0;
+        gHoFrameNs = host_plat_time_ns() - h0;
+    }
     render_worker_kick();
     if (++sRenderFrames >= 60) {
         extern unsigned long long gpu3d_mt_skipped(void);

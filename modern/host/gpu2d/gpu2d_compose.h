@@ -7,7 +7,8 @@
 //   alpha = byte >> 3), DS line y in row 191 - y as the GL renderer leaves it; uOvl the FPS overlay rows.
 // It is drawn over a uW x 192 target (uW = 256, or wider for a 16:9 screen): gl_FragCoord gives the pixel, row =
 // DS line. Wider than 256: the 3D layer (rendered with a 16:9 camera) is stretched across the whole width, the 2D
-// layers stay 1:1 in the middle 256 columns; to their sides there is no 2D (window mask: BG0 + effects only). (Identifiers avoid s, t, st,
+// layers stay 1:1 in the middle 256 columns; to their sides there is no 2D (window mask: BG0 + effects only), and
+// during the iris wipe (uPar texel 5: radius, on) the circle continues there (outside it: black, as the wipe). (Identifiers avoid s, t, st,
 // ts, ss, tt: vitaGL's GLSL-to-Cg header defines them as macros.)
 #ifndef GPU2D_COMPOSE_H
 #define GPU2D_COMPOSE_H
@@ -60,7 +61,14 @@ static const char kGcVertexShader[] =
     "  vec3 bd = vec3(by(p3.r), by(p3.g), by(p3.b));\n" \
     "  float hofs = by(p4.r) + by(p4.g) * 256.0 - 256.0;\n" \
     "  vec4 ax = texture2D(uAux, uv);\n" \
-    "  float m = in2d > 0.5 ? by(ax.r) : 33.0, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
+    "  float sideM = 33.0;\n" \
+    "  vec4 p5 = texture2D(uPar, vec2(5.5 / 8.0, py));\n" \
+    "  if (in2d < 0.5 && by(p5.b) > 0.5) {\n" \
+    "    float ir = by(p5.r) + by(p5.g) * 256.0, dd = floor(abs(2.0 * y + 1.0 - 192.0) / 2.0);\n" \
+    "    float hr = dd <= ir ? floor(sqrt(ir * ir - dd * dd)) : -1.0;\n" \
+    "    if (!(hr >= 0.0 && x >= 128.0 - hr && x < 128.0 + hr)) return vec4(0.0, 0.0, 0.0, 1.0);\n" \
+    "  }\n" \
+    "  float m = in2d > 0.5 ? by(ax.r) : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
     "  float k; vec3 c;\n" \

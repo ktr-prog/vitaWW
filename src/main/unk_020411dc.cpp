@@ -197,7 +197,12 @@ extern "C" void IrisWipe_Update() {
     } else {
 #ifdef HOST
         s32 rows = gHostCanvasRows < 0xc0 ? 0xc0 : gHostCanvasRows;
+#if HOST_VITA
+        // the circle opens across the whole 16:9 screen (341 columns at the DS's 192 lines), not just the 4:3 middle
+        s32 reach = 171 * 171 + (rows / 2) * (rows / 2), rr = 1;
+#else
         s32 reach = 0x80 * 0x80 + (rows / 2) * (rows / 2), rr = 1;
+#endif
         while (rr * rr < reach) rr++;
         s32 h = ((0x1000 - v) * rr) >> 12;
         gHostIrisRadius = h;

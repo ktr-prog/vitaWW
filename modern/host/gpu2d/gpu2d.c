@@ -792,6 +792,7 @@ enum { CANVAS_MAX = 640 };
 static u32 sCanvas[SCREEN_W * CANVAS_MAX];
 static int sCanvasRows;
 int gHostIrisRadius = -1;
+static int sIrisSnap = -1;   // gHostIrisRadius as the frame's prepass saw it (the GPU compose's wide-screen iris)
 const uint32_t *gpu2d_canvas(int *rows) {
     *rows = sCanvasRows;
     return sCanvasRows ? sCanvas : NULL;
@@ -1147,6 +1148,9 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     s32 hofs3d = reg16(e, REG_BGHOFS) & 0x1ff;
     if (hofs3d & 0x100) hofs3d -= 0x200;
     p[16] = (u8)((hofs3d + 256) & 0xff); p[17] = (u8)((hofs3d + 256) >> 8); p[18] = p[19] = 0;
+    // The iris wipe's circle (radius in pixels from the screen centre) while window 0 is on: a wider canvas than
+    // the DS's 256 columns continues the circle beside the 2D layers.
+    if (sIrisSnap >= 0 && (dispcnt & 0x2000)) { p[20] = (u8)(sIrisSnap & 0xff); p[21] = (u8)(sIrisSnap >> 8); p[22] = 1; }
     // (built here and copied out whole: the destination may be uncached GPU memory)
     u16 oc[SCREEN_W], ax[SCREEN_W];
     int anyObj = 0;
@@ -1245,6 +1249,7 @@ static int sMtPending;   // a prepass ran in deferred mode and is waiting for it
 
 static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
+    sIrisSnap = gHostIrisRadius;
     for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
     int bi = 0;
     for (int line = 0; line < SCREEN_H; line++) {
