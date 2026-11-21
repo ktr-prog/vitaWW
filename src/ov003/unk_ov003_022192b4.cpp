@@ -4036,7 +4036,7 @@ void FieldObj_DrawUnits(O *o, BlockMap *g) {
         l.A = gCameraLookAt;
         FieldPos_SnapToUnitCenter(&l.C, &l.A);
         FieldPos_ToUnit(&l.x, &l.z, &l.C);
-#ifdef HOST
+#if defined(HOST) && !HOST_VITA   // (the Vita: the original draw distance)
         enum { HALF_W = 18, BACK = 28, MAX_OBJS = 0x3f0 };
 enum { FAR_BACK = 0x1c200 * 2, FAR_FRONT = 0x8200 * 2, NEAR_BACK = 0x14a00 * 2, NEAR_FRONT = 0x6400 * 2 };
 #else

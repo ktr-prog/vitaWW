@@ -1580,7 +1580,7 @@ BOOL BuildingActor::isOffscreen() {
             dx = -dx;
         }
         s32 dz = position.z - g->z;
-#ifdef HOST
+#if defined(HOST) && !HOST_VITA   // (the Vita: the original draw distance)
         if (dx > getViewRangeX() * 2 || dz > getViewRangeFront() * 2 || dz < -getViewRangeBack() * 2) {
 #else
         if (dx > getViewRangeX() || dz > getViewRangeFront() || dz < -getViewRangeBack()) {
