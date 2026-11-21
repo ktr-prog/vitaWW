@@ -1071,6 +1071,7 @@ static void classic_compose(const Gpu2dFrameInput *in) {
 static Engine s2dBandEng[N2DBANDS];
 static u8 s2dRegSnap[SCREEN_H][REG_SIZE];   // per-line register state (hblank can change scroll/etc. per scanline)
 static u8 s2dPalSnap[SCREEN_H][0x400];       // per-line palette (hblank can write palette per scanline: sky/water)
+static const u8 *s2dPalLine[SCREEN_H];       // each line's palette: its own snapshot, or the previous line's if equal
 typedef struct { s32 refX[2], refY[2]; int refLine; u8 refWritten[2], winActive[2]; int objMosaicLine, objMosaicCount; } Snap2d;
 typedef struct { const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; u32 *canvas; } Band2d;
 
@@ -1211,7 +1212,7 @@ static void band2d_run(Band2d *w) {
     e->objCandOn = 1;
     for (int line = w->lo; line < w->hi; line++) {
         memcpy(e->regs, s2dRegSnap[line], REG_SIZE);   // per-line registers (as they were when this line rendered)
-        e->palette = s2dPalSnap[line];                 // per-line palette
+        e->palette = s2dPalLine[line];                 // per-line palette
         window_vertical(e, line);
         if (line == 0 && e->haveNextLine0) e->obj = e->objNextLine0;
         else if (line == 0) memset(&e->obj, 0, sizeof e->obj);
@@ -1256,7 +1257,9 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
             bi++;
         }
         memcpy(s2dRegSnap[line], e->regs, REG_SIZE);   // capture registers for this line before hblank mutates them
-        memcpy(s2dPalSnap[line], e->palette, 0x400);   // capture palette for this line (hblank sky/water gradients)
+        // capture palette for this line (hblank sky/water gradients); an unchanged palette shares the line above's
+        if (line && !memcmp(s2dPalLine[line - 1], e->palette, 0x400)) s2dPalLine[line] = s2dPalLine[line - 1];
+        else { memcpy(s2dPalSnap[line], e->palette, 0x400); s2dPalLine[line] = s2dPalSnap[line]; }
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
@@ -1279,7 +1282,7 @@ static void *band2d_helper(void *arg) {
     int b = (int)(intptr_t)arg;
 #if HOST_VITA
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
-    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
+    sceKernelChangeThreadCpuAffinityMask(0, 0x70000);   // cores 1+2, + core 0 while the game thread is idle
 #endif
     unsigned seen = 0;
     for (;;) {

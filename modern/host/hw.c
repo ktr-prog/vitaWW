@@ -121,6 +121,8 @@ static void phase_report(void) {
 }
 static int sFast = -1;
 static u64 sNextFrame;
+static unsigned sLateFrames;        // frames that missed their 1/60 s slot (since the last report)
+static u64 sWorstFrameNs, sPaceLast;   // longest frame-to-frame time (since the last report)
 static int sPaused;
 static void host_pace_frame(void) {
     {
@@ -145,8 +147,11 @@ static void host_pace_frame(void) {
     u64 now = host_plat_time_ns();
     if (sNextFrame == 0) sNextFrame = now;
     sNextFrame += 16666666 + (++sub % 3 == 0 ? 2 : 0);
+    if (sPaceLast && now - sPaceLast > sWorstFrameNs) sWorstFrameNs = now - sPaceLast;
+    if (now > sNextFrame + 500000) sLateFrames++;   // (0.5 ms of slack: timer jitter is not a dropped frame)
     if (now > sNextFrame) sNextFrame = now;   // late: start the next frame's period from now
     HOST_PHASE(PH_PACE, host_plat_sleep_until_ns(sNextFrame));
+    sPaceLast = host_plat_time_ns();
 }
 
 static u32 sHeartbeat, sHeartbeatFrame;
@@ -320,6 +325,9 @@ static void run_events_body(void) {
                     gpu3d_wait_stats(wb, sizeof wb, 60);
                     fprintf(stderr, "%s\n", wb);
                 }
+                fprintf(stderr, "frame pacing (last 60 frames): %u late, longest frame %llu us\n", sLateFrames,
+                        (unsigned long long)(sWorstFrameNs / 1000));
+                sLateFrames = 0; sWorstFrameNs = 0;
                 sCpuNs = sRenderNs = sPresentNs = 0; sBreakN = 0;
             }
         }
