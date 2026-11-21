@@ -1281,7 +1281,7 @@ static void *band2d_helper(void *arg) {
     int b = (int)(intptr_t)arg;
 #if HOST_VITA
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
-    sceKernelChangeThreadCpuAffinityMask(0, 0x70000);   // cores 1+2, + core 0 while the game thread is idle
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
 #endif
     unsigned seen = 0;
     for (;;) {

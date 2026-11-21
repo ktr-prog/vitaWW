@@ -625,9 +625,7 @@ static void *job2d_main(void *a) {
     (void)a;
 #if HOST_VITA
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
-    // Cores 1+2, and core 0 whenever the game thread (higher priority, see render_frame_mt) is idle - waiting or
-    // in its frame-pacing sleep - so render work also gets the game core's slack.
-    sceKernelChangeThreadCpuAffinityMask(0, 0x70000);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
 #endif
     for (;;) {
         pthread_mutex_lock(&s2dJobMx);
@@ -721,9 +719,7 @@ static void *render_worker_main(void *a) {
     (void)a;
 #if HOST_VITA
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
-    // Cores 1+2, and core 0 whenever the game thread (higher priority, see render_frame_mt) is idle - waiting or
-    // in its frame-pacing sleep - so render work also gets the game core's slack.
-    sceKernelChangeThreadCpuAffinityMask(0, 0x70000);
+    sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
 #endif
     for (;;) {
         pthread_mutex_lock(&sWMx);
@@ -789,13 +785,11 @@ static void render_frame_sync(void);
 static void render_frame_mt(void) {
 #if HOST_VITA
     {
-        // The game thread gets core 0 at the highest priority; the GX worker shares cores 1+2 with the render thread
-        // and the 2D band helper, which may also use core 0 while the game thread is idle.
+        // The game thread gets core 0 to itself; the GX worker, render thread and 2D band helper share cores 1+2.
         // Done here (after start-up) so library threads created during init keep their default masks.
         static int pinned;
         extern int sceKernelChangeThreadCpuAffinityMask(int, int);
-        // Priority above the render-side threads (159), which may also run on core 0 while this thread is idle:
-        // they only get core 0 when the game thread waits or sleeps, and it takes the core back at once.
+        // (Priority above the render-side threads' 159.)
         extern int sceKernelChangeThreadPriority(int, int);
         if (!pinned) { pinned = 1; sceKernelChangeThreadCpuAffinityMask(0, 0x10000); sceKernelChangeThreadPriority(0, 128); }
     }

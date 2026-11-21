@@ -1355,8 +1355,19 @@ static int do_swap(void);
 // One pass-through command on the worker: the per-vertex commands inline (execute()'s big frame and its
 // diagnostics checks are most of their cost there), anything else through execute(). Same effects as execute().
 static inline __attribute__((always_inline)) void w_cmd(u32 c, const u32 *p) {
-    if (c >= 0x20 && c <= 0x28 && c != 0x21 && !sFeaturesOn && sCmdLog < 0) {
+    if (c >= 0x20 && c <= 0x28 && !sFeaturesOn && sCmdLog < 0) {
         switch (c) {
+        case 0x21:   // NORMAL: as execute() (lighting through the per-normal cache)
+            sNormal[0] = sx10(p[0]);
+            sNormal[1] = sx10(p[0] >> 10);
+            sNormal[2] = sx10(p[0] >> 20);
+            if ((sTexParam >> 30) == 2) {
+                for (int i = 0; i < 2; i++)
+                    sTexCoord[i] = (s16)((((s64)sNormal[0] * gTexM->m[i] + (s64)sNormal[1] * gTexM->m[4 + i] +
+                                           (s64)sNormal[2] * gTexM->m[8 + i]) >> 24) + sTexRaw[i]);
+            }
+            lit_cached(p[0] & 0x3fffffff);
+            break;
         case 0x20:
             sVtxColor[0] = p[0] & 31; sVtxColor[1] = p[0] >> 5 & 31; sVtxColor[2] = p[0] >> 10 & 31;
             sCurLightRec = -1;
@@ -1430,7 +1441,7 @@ static void *mt_worker(void *arg) {
                 park = sFlushPending;
                 continue;
             }
-            if (c >= 0x20 && c <= 0x28 && c != 0x21 && !sFeaturesOn && sCmdLog < 0) {
+            if (c >= 0x20 && c <= 0x28 && !sFeaturesOn && sCmdLog < 0) {
                 w_cmd(c, p);
                 r += 1 + n;
                 continue;
