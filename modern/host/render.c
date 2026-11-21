@@ -51,6 +51,7 @@ static int sWReady, sWDone = 1;           // handshake: work posted / work finis
 static u8 *sSnapBankMem;                  // VRAM snapshot (host_vram_total() bytes)
 static u8 sSnapPal[0x800], sSnapOam[0x800];
 static const u8 *sSnapBank[9];
+static int sDraw3d = 1;   // the render thread rasterizes the committed geometry this frame (pipelined: only new ones)
 static Gpu2dFrameInput sWorkIn;
 
 static int sOwn;
@@ -128,7 +129,14 @@ void render_init(void) {
         // Synchronous commit everywhere by default: the geometry committed at a vblank is the frame the game just
         // finished, paired with the texture/palette VRAM snapshotted at the same vblank. The pipelined commit
         // (ACWW_GX_ASYNC=1) can draw one frame's polygons with the next frame's palettes (wrong colours).
+        // The Vita defaults to the pipelined commit: the game thread no longer waits at the vblank for the worker
+        // (~3 ms a frame). Each geometry frame is drawn with the VRAM snapshot taken at its own vblank (render.c
+        // keeps several), so late geometry still gets its own textures/palettes.
+#if HOST_VITA
+        int async = 1;
+#else
         int async = 0;
+#endif
         if (getenv("ACWW_GX_ASYNC")) async = atoi(getenv("ACWW_GX_ASYNC"));
         gpu3d_mt_enable(on, async);
     }
@@ -667,7 +675,7 @@ static void render_worker_phase(void) {
         gpu2d_render_finish();             // 2D bands + canvas from the per-line/VRAM snapshots
         __atomic_fetch_add(&sWBandsNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
     }
-    if (sGpu3d) {
+    if (sGpu3d && sDraw3d) {
         uint64_t t3d = host_plat_time_ns();
         gpu3d_render_committed();
         sRender3dNs += host_plat_time_ns() - t3d;
@@ -774,7 +782,30 @@ static void render_frame_mt(void) {
     uint64_t h0 = host_plat_time_ns();
     render_thread_sync();
     uint64_t h1 = host_plat_time_ns();
-    if (!sSnapBankMem) sSnapBankMem = malloc(host_vram_total());
+    // VRAM snapshot buffers. Synchronous commit: one. Pipelined: a few, each tagged with the geometry frame
+    // (SWAP_BUFFERS count) issued in the DS frame it was taken at; a buffer is reused once its geometry frame has
+    // been drawn (or it has none).
+    enum { SNAPS = 4 };
+    static u8 *snapMem[SNAPS];
+    static unsigned snapTag[SNAPS], lastIssued, lastSwapped;
+    static u8 snapCnt[SNAPS][9];
+    static u32 snapGens[SNAPS][9];
+    static const u8 *snapBanks[SNAPS][9];
+    extern unsigned gpu3d_commit_swapped(void), gpu3d_swaps_issued(void);
+    extern int gpu3d_pipelined(void);
+    extern void gpu3d_bind_banks(const uint8_t *const bank[9], const uint8_t cnt[9]);
+    extern u8 gG3VramCnt[9];
+    const int piped = gpu3d_pipelined();
+    int slot = 0;
+    if (piped) {
+        int best = -1;
+        for (int k = 0; k < SNAPS; k++)
+            if (snapTag[k] <= lastSwapped && (best < 0 || snapTag[k] < snapTag[best])) best = k;
+        if (best < 0) for (int k = 0; k < SNAPS; k++) if (best < 0 || snapTag[k] < snapTag[best]) best = k;
+        slot = best;
+    }
+    if (!snapMem[slot]) snapMem[slot] = malloc(host_vram_total());
+    sSnapBankMem = snapMem[slot];
     {
         // Main-screen-only (the Vita): copy just the banks the engine-A 2D and the 3D read this frame.
         // ACWW_SNAPALL=1 copies everything (as before).
@@ -787,9 +818,9 @@ static void render_frame_mt(void) {
 #endif
             if (getenv("ACWW_SNAPALL") && atoi(getenv("ACWW_SNAPALL"))) mainOnly = 0;
         }
-        extern void host_vram_snapshot_main(u8 *dst, int keepLcdc);
+        extern void host_vram_snapshot_main(u8 *dst, int slot, int keepLcdc);
         extern int gpu2d_main_vram_display(void);
-        if (mainOnly) host_vram_snapshot_main(sSnapBankMem, gpu2d_main_vram_display());
+        if (mainOnly) host_vram_snapshot_main(sSnapBankMem, slot, gpu2d_main_vram_display());
         else host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
         // Bank generations as of this snapshot, for the 3D texture sync (gpu3d_tex.h). ACWW_TEXGEN=0: unused.
         extern u32 gG3BankGenFrame[9];
@@ -799,8 +830,16 @@ static void render_frame_mt(void) {
         if (texGen < 0) texGen = !(getenv("ACWW_TEXGEN") && atoi(getenv("ACWW_TEXGEN")) == 0);
         memcpy(gG3BankGenFrame, host_vram_bank_gens(), sizeof gG3BankGenFrame);
         gG3BankGenValid = texGen;
+        memcpy(snapGens[slot], gG3BankGenFrame, sizeof snapGens[slot]);
     }
     for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
+    {
+        unsigned issued = gpu3d_swaps_issued();
+        snapTag[slot] = issued != lastIssued ? issued : 0;   // the geometry frame finished in this DS frame
+        lastIssued = issued;
+        memcpy(snapCnt[slot], gG3VramCnt, sizeof snapCnt[slot]);
+        memcpy(snapBanks[slot], sSnapBank, sizeof snapBanks[slot]);
+    }
     memcpy(sSnapPal, gHostPltt, sizeof sSnapPal);
     memcpy(sSnapOam, gHostOam, sizeof sSnapOam);
     const u32 *lines3d = sOwn3d ? gpu3d_lines() : s3d;
@@ -838,6 +877,21 @@ static void render_frame_mt(void) {
     }
     uint64_t c0 = host_plat_time_ns();
     gpu3d_commit(sSnapBank);                // swap geometry + bind snapshot texture banks (no rasterization)
+    if (piped) {
+        // Draw 3D only when a new geometry frame came in, with the snapshot taken when that frame was finished.
+        unsigned sw = gpu3d_commit_swapped();
+        sDraw3d = sw != 0;
+        if (sw) {
+            lastSwapped = sw;
+            for (int k = 0; k < SNAPS; k++)
+                if (snapTag[k] == sw && snapMem[k]) {
+                    extern u32 gG3BankGenFrame[9];
+                    gpu3d_bind_banks(snapBanks[k], snapCnt[k]);
+                    memcpy(gG3BankGenFrame, snapGens[k], sizeof gG3BankGenFrame);
+                    break;
+                }
+        }
+    } else sDraw3d = 1;
     sHoCommitNs += host_plat_time_ns() - c0;
     render_worker_kick();
     if (++sRenderFrames >= 60) {

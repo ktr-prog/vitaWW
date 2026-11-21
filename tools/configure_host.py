@@ -255,6 +255,9 @@ if VITA:
     # don't apply; the only real risk is code size vs the fixed .data pin at 0x81a00000, which CI's vita-elf-create
     # step would catch before any device ever sees the build.
     GAME_FLAGS = GAME_FLAGS.replace(" -O2", " -O3")
+    # No frame pointer on the Vita: every call in the (call-heavy) decomp otherwise sets one up, and r7/r11 go back
+    # to the register allocator. Nothing on the Vita walks frame pointers (only a PC network-debug helper does).
+    GAME_FLAGS = GAME_FLAGS.replace(" -fno-omit-frame-pointer", " -fomit-frame-pointer")
 if not HOST64 and not VITA:
     # small structs returned in memory, as mwcc does: kept while the i386 build is the reference (its captures were
     # taken with it); the 64-bit builds use the platform ABI (clang supports the flag only on i386). The Vita's ARM
@@ -401,7 +404,7 @@ elif X64:
 elif VITA:
     # VitaSDK's arm-vita-eabi GCC and newlib; no melonDS. -Wl,-q keeps the relocations vita-elf-create needs.
     # The game thread's stack switch (coro_switch.S) has an ARMv7 path. The CPU renderers draw into SDL textures.
-    HOST_FLAGS = (f"{VITA_ARCH} -O3 -fno-strict-aliasing -g -fno-omit-frame-pointer -ffp-contract=off -Wall -std=gnu11 -DHOST "
+    HOST_FLAGS = (f"{VITA_ARCH} -O3 -fno-strict-aliasing -g -fomit-frame-pointer -ffp-contract=off -Wall -std=gnu11 -DHOST "
                   "-DHOST_VITA=1 -Iinclude" + FRONTEND_FLAG)
     # -Wl,-q keeps the relocations vita-elf-create needs. (The big DS memory blocks are runtime-allocated on the
     # Vita, HOST_MEM_RUNTIME_ALIGN, so the static .bss stays small and vita-elf-create can lay the velf out.)

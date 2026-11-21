@@ -125,9 +125,10 @@ void host_vram_snapshot_live(u8 *dst) {
         if (!covered[o / GRANULE]) snap_granule(dst, sBanks + o, o, full);
 }
 // Bank generations: bumped whenever a bank's contents may have changed (see host_vram_control and the snapshot).
-static u32 sBankGen[9], sSnapGen[9];
-static u8 sSnapHave[9];
-static const u8 *sGenDst;
+enum { SNAP_SLOTS = 4 };
+static u32 sBankGen[9], sSnapGen[SNAP_SLOTS][9];
+static u8 sSnapHave[SNAP_SLOTS][9];
+static const u8 *sGenDst[SNAP_SLOTS];
 unsigned gHostStateLoads;   // bumped by host_state_load (savestate.c); kept across loads
 HOST_STATE_KEEP(gHostStateLoads) HOST_STATE_KEEP(sBankGen) HOST_STATE_KEEP(sSnapGen) HOST_STATE_KEEP(sSnapHave) HOST_STATE_KEEP(sGenDst)
 const u32 *host_vram_bank_gens(void) { return sBankGen; }
@@ -148,23 +149,28 @@ static int bank_needed(int i, u8 c, int keepLcdc) {
     }
     return 1;
 }
-void host_vram_snapshot_main(u8 *dst, int keepLcdc) {
+// slot: which of the caller's snapshot buffers dst is (0..SNAP_SLOTS-1); each remembers what it already holds.
+void host_vram_snapshot_main(u8 *dst, int slot, int keepLcdc) {
     u8 need[9];
     static unsigned seenLoads;
-    if (dst != sGenDst || seenLoads != gHostStateLoads) {   // new buffer or a state load: nothing is known
-        sGenDst = dst;
+    slot &= SNAP_SLOTS - 1;
+    if (seenLoads != gHostStateLoads) {   // a state load: nothing is known
         seenLoads = gHostStateLoads;
-        for (int i = 0; i < 9; i++) { sSnapHave[i] = 0; sBankGen[i]++; }
+        memset(sSnapHave, 0, sizeof sSnapHave);
+        for (int i = 0; i < 9; i++) sBankGen[i]++;
     }
+    if (dst != sGenDst[slot]) { sGenDst[slot] = dst; memset(sSnapHave[slot], 0, 9); }
+    u8 *have = sSnapHave[slot];
+    u32 *sgen = sSnapGen[slot];
     for (int i = 0; i < 9; i++) {
         need[i] = (u8)bank_needed(i, sCnt[i], keepLcdc);
         // A bank the CPU can address now may have been written since the last snapshot: new generation. A bank it
         // cannot address (textures, texture palettes, extended palettes) keeps its contents until its next remap,
         // so when the snapshot already holds this generation, copying it again would copy the same bytes.
         if (bank_address(i, sCnt[i])) sBankGen[i]++;
-        if (!need[i]) { sSnapHave[i] = 0; continue; }
-        if (sSnapHave[i] && sSnapGen[i] == sBankGen[i]) need[i] = 0;   // already in the snapshot
-        else { sSnapHave[i] = 1; sSnapGen[i] = sBankGen[i]; }
+        if (!need[i]) { have[i] = 0; continue; }
+        if (have[i] && sgen[i] == sBankGen[i]) need[i] = 0;   // already in this buffer
+        else { have[i] = 1; sgen[i] = sBankGen[i]; }
     }
     static u8 covered[BANK_TOTAL / GRANULE];
     memset(covered, 0, sizeof covered);

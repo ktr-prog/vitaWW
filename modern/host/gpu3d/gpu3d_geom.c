@@ -1283,6 +1283,7 @@ static void execute(u8 cmd, const u32 *p) {
 // commit does not wait for the worker, so geometry runs one frame pipelined and overlaps the render phase too.
 enum { MTQ_N = 1 << 19, MTQ_M = MTQ_N - 1 };   // ring size in words (~16 heavy frames)
 static u32 *sMtQ;
+static int sRawOpen;   // raw GX FIFO run open in the ring (see "raw GX FIFO")
 // Free-running word positions. The game thread fills up to sMtWLocal and publishes sMtW in batches (MTQ_BATCH
 // words, or at any sync/commit) so the two cores do not trade a cache line on every command; the worker likewise
 // publishes sMtR per batch. Each published index sits on its own cache line.
@@ -1314,6 +1315,46 @@ static void mt_pause(int *spins) {
     else usleep(100);   // idle: sleep instead of spinning so the core goes to the render thread / 2D band
 }
 static void gpu3d_write16_now(uint32_t addr, uint16_t v);
+// Worker side of the raw FIFO forwarding (see "raw GX FIFO" below): the packed-command decoder, run on the worker.
+// Matrix commands and the tests were already executed by the game thread (the worker gets the matrices through
+// the 0xf1/0xf2 snapshots placed in the stream); everything else executes here exactly as before.
+static u32 wPackCmds, wParams[32];
+static int wPackLeft, wParamsLeft, wCnt;
+static const u32 kZeroParams[32];
+static void w_exec(u8 c, const u32 *p) {
+    if (c >= 0x10 && c <= 0x1c) return;
+    if (c == 0x70 || c == 0x72) return;
+    if (c == 0x71) { sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); sVtx[2] = (s16)p[1]; return; }   // result: game thread
+    if (!is_command(c)) return;
+    execute(c, p);
+}
+static void w_advance(void) {
+    while (wPackLeft > 0) {
+        u8 c = wPackCmds & 0xff;
+        if (wPackCmds == 0) { wPackLeft = 0; break; }
+        if (kParams[c]) { wParamsLeft = kParams[c]; wCnt = 0; return; }
+        if (c) w_exec(c, kZeroParams);
+        wPackCmds >>= 8;
+        wPackLeft--;
+    }
+    wParamsLeft = 0;
+}
+static inline void w_word(u32 v) {
+    if (wParamsLeft == 0) {
+        if (v == 0) return;
+        wPackCmds = v;
+        wPackLeft = 4;
+        w_advance();
+        return;
+    }
+    wParams[wCnt++] = v;
+    if (--wParamsLeft == 0) {
+        w_exec(wPackCmds & 0xff, wParams);
+        wPackCmds >>= 8;
+        wPackLeft--;
+        w_advance();
+    }
+}
 static void *mt_worker(void *arg) {
     (void)arg;
 #if HOST_VITA
@@ -1333,6 +1374,12 @@ static void *mt_worker(void *arg) {
         int park = 0;
         while (r != w && !park) {
             u32 h = sMtQ[r & MTQ_M], c = h & 0xff, n = h >> 8;
+            if (c == 0xf3) {   // raw GX FIFO words: decode here (w_word)
+                for (u32 i = 0; i < n; i++) w_word(sMtQ[(r + 1 + i) & MTQ_M]);
+                r += 1 + n;
+                park = sFlushPending;
+                continue;
+            }
             const u32 *p = &sMtQ[(r + 1) & MTQ_M];
             if (((r + 1) & MTQ_M) + n > MTQ_N) {
                 for (u32 i = 0; i < n; i++) tmp[i] = sMtQ[(r + 1 + i) & MTQ_M];
@@ -1386,8 +1433,10 @@ void gpu3d_wait_stats(char *buf, int n, int frames) {
              sMtWaitNs[3] / frames / 1000);
     memset(sMtWaitNs, 0, sizeof sMtWaitNs); memset(sMtWaitN, 0, sizeof sMtWaitN); sBoxTests = 0;
 }
+static void raw_close(int publishNow);
 static void mt_sync_body(void) {
     int s = 0;
+    raw_close(1);
     mt_publish();
     while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWDone && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
 }
@@ -1407,7 +1456,7 @@ static int mt_reserve(u32 words) {
     gHostPhase = ph;
     return 1;
 }
-static inline void mt_command_done(int publishNow) {
+static inline __attribute__((always_inline)) void mt_command_done(int publishNow) {
     sMtWDone = sMtWLocal;
     if (publishNow || sMtWDone - sMtW >= MTQ_BATCH) __atomic_store_n(&sMtW, sMtWDone, __ATOMIC_RELEASE);
 }
@@ -1461,7 +1510,8 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
 static u32 sStrLeft;   // parameters still to come for the command being streamed
 static int sStrMode;   // 0: none, 1: streaming into the ring, 2: dropping (ring full behind a pending swap)
 static inline int mt_streamable(u8 c) {
-    return !sMtAsync && ((c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60);
+    // (Not while the pipelined mode is dropping a frame's vertices: mt_dispatch does the dropping.)
+    return !sMtSkip && ((c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60);
 }
 static void mt_stream_begin(u8 c, u32 n) {
     if (sMtCvDirty) {   // the worker needs the matrices current before this command (as mt_dispatch does)
@@ -1487,11 +1537,19 @@ static inline __attribute__((always_inline)) void mt_stream_param(u32 param) {
     }
 }
 static void mt_entry(u8 cmd, u32 param) {
+    if (sRawOpen) raw_close(0);   // command-port write after raw FIFO words: keep the order
     if (sStrMode) { mt_stream_param(param); return; }
     if (sExecCmd < 0) {
         int need = kParams[cmd];
         if (need && mt_streamable(cmd)) {
             sExecCmd = cmd;
+            if (!sMtCvDirty && !sMtTexDirty && sMtWLocal - sMtRSeen + (u32)need + 1 <= MTQ_N) {   // common case inline
+                sStrLeft = (u32)need;
+                sMtQ[sMtWLocal++ & MTQ_M] = cmd | (u32)need << 8;
+                sStrMode = 1;
+                mt_stream_param(param);
+                return;
+            }
             mt_stream_begin(cmd, (u32)need);
             mt_stream_param(param);   // this entry carries the first parameter
             return;
@@ -1552,6 +1610,115 @@ static inline __attribute__((always_inline)) void gxfifo_write_mt(u32 v) {
         }
     }
 }
+// Worker mode, a write to a GX command port (0x04000440-0x5ff: the game's immediate G3_* calls - most of the GX
+// words). Same as fifo_put -> mt_entry (the non-worker drain() after it has nothing to do in worker mode), with
+// the one-parameter pass-through case written straight into the ring.
+static inline __attribute__((always_inline)) void gx_port_mt(u8 c, u32 v) {
+    if (sRawOpen) raw_close(0);
+    if (kParams[c] == 1 && sStrMode == 0 && sExecCmd < 0 && !sMtCvDirty && !sMtTexDirty && mt_streamable(c) &&
+        sMtWLocal - sMtRSeen + 2 <= MTQ_N) {
+        u32 w = sMtWLocal;
+        sMtQ[w & MTQ_M] = c | 1u << 8;
+        sMtQ[(w + 1) & MTQ_M] = v;
+        sMtWLocal = w + 2;
+        mt_command_done(0);
+        return;
+    }
+    mt_entry(c, v);
+}
+// ---- raw GX FIFO ---------------------------------------------------------------------------------------------
+// The game thread no longer decodes GX FIFO words into per-command ring records. It copies the raw words into
+// the ring (runs of up to RAW_MAX words, record 0xf3) and only follows the packing to find the commands it must
+// execute itself: matrix commands (it keeps the matrix stack: GXSTAT, matrix reads, tests) and BOX/POS/VEC_TEST
+// (answered here). Before the first parameter of any other command, if a matrix changed, it ends the run and
+// inserts the matrix snapshot (0xf1/0xf2) - so the worker, which decodes the same words in the same order
+// (w_word), executes that command with the right matrices. A SWAP_BUFFERS ends its run, so the worker parks
+// exactly after it. Synchronous commit only (the pipelined mode's frameskip keeps the record path).
+enum { RAW_MAX = 256 };
+static int sRawOn;
+static u32 sRawHdr, sRawN;
+static u32 gPackCmds, gParams[32];
+static int gPackLeft, gParamsLeft, gCnt, gLocal;
+static u8 gCmd;
+HOST_STATE_KEEP(sRawOn) HOST_STATE_KEEP(sRawOpen) HOST_STATE_KEEP(sRawHdr) HOST_STATE_KEEP(sRawN) HOST_STATE_KEEP(gPackCmds)
+HOST_STATE_KEEP(gPackLeft) HOST_STATE_KEEP(gParamsLeft) HOST_STATE_KEEP(wPackCmds) HOST_STATE_KEEP(wPackLeft) HOST_STATE_KEEP(wParamsLeft)
+static void raw_close(int publishNow) {
+    if (!sRawOpen) { if (publishNow) mt_publish(); return; }
+    sMtQ[sRawHdr & MTQ_M] = 0xf3 | sRawN << 8;
+    sRawOpen = 0;
+    mt_command_done(publishNow);
+}
+static inline void raw_put(u32 v) {
+    if (!sRawOpen) {
+        if (!mt_reserve(RAW_MAX + 1)) return;   // (only when the ring is full behind a parked swap: async mode)
+        sRawHdr = sMtWLocal++;
+        sRawN = 0;
+        sRawOpen = 1;
+    }
+    sMtQ[sMtWLocal++ & MTQ_M] = v;
+    if (++sRawN == RAW_MAX) raw_close(0);
+}
+static void raw_snapshots(void) {
+    raw_close(0);
+    if (sMtCvDirty) {
+        u32 b[32];
+        update_clip();
+        memcpy(b, sClip.m, sizeof sClip.m);
+        memcpy(b + 16, sVec.m, sizeof sVec.m);
+        mt_push(0xf1, b, 32);
+        sMtCvDirty = 0;
+    }
+    if (sMtTexDirty) { mt_push(0xf2, (const u32 *)sTex.m, 16); sMtTexDirty = 0; }
+}
+static void raw_begin(u8 c) {
+    gCmd = c;
+    gLocal = (c >= 0x10 && c <= 0x1c) || (c >= 0x70 && c <= 0x72);
+    if (!gLocal && (sMtCvDirty | sMtTexDirty)) raw_snapshots();
+}
+static void raw_cmd_done(u8 c, const u32 *p) {
+    if (c >= 0x10 && c <= 0x1c) {
+        execute(c, p);
+        if (c == 0x12 || c >= 0x14) { if (sMtxMode == 3) sMtTexDirty = 1; else sMtCvDirty = 1; }
+    } else if (c == 0x70) { sBoxTests++; box_test(p); }
+    else if (c == 0x72) vec_test(p[0]);
+    else if (c == 0x71) {
+        update_clip();
+        s64 x = (s16)p[0], y = (s16)(p[0] >> 16), z = (s16)p[1];
+        for (int i = 0; i < 4; i++)
+            sPosResult[i] = (s32)((x * sClip.m[i] + y * sClip.m[4 + i] + z * sClip.m[8 + i] + 0x1000 * (s64)sClip.m[12 + i]) >> 12);
+    } else if (c == 0x50) { sMtSwapsQueued++; raw_close(1); }
+}
+static void raw_advance(void) {
+    while (gPackLeft > 0) {
+        u8 c = gPackCmds & 0xff;
+        if (gPackCmds == 0) { gPackLeft = 0; break; }
+        raw_begin(c);
+        if (kParams[c]) { gParamsLeft = kParams[c]; gCnt = 0; return; }
+        raw_cmd_done(c, kZeroParams);
+        gPackCmds >>= 8;
+        gPackLeft--;
+    }
+    gParamsLeft = 0;
+}
+static inline void gx_raw_word(u32 v) {
+    if (gParamsLeft == 0) {
+        raw_put(v);
+        if (v == 0) return;
+        gPackCmds = v;
+        gPackLeft = 4;
+        raw_advance();
+        return;
+    }
+    if (gLocal) gParams[gCnt++] = v;
+    raw_put(v);
+    if (--gParamsLeft == 0) {
+        if (gLocal || gCmd == 0x50) raw_cmd_done(gCmd, gParams);
+        gPackCmds >>= 8;
+        gPackLeft--;
+        raw_advance();
+    }
+}
+
 // Called once at start-up, before any command. async: the vblank commit does not wait for the worker.
 void gpu3d_mt_enable(int on, int async) {
     if (!on || sMtStarted) return;
@@ -1565,8 +1732,12 @@ void gpu3d_mt_enable(int on, int async) {
     sMtAsync = async;
     gClipM = &wClip; gVecM = &wVec; gTexM = &wTex;
     sMtCvDirty = sMtTexDirty = 1;
+    // Raw FIFO forwarding: measured (host, -O3) to save the game thread ~1% while adding ~25% to the worker, so
+    // opt-in (ACWW_GXRAW=1).
+    sRawOn = !async && getenv("ACWW_GXRAW") && atoi(getenv("ACWW_GXRAW"));
     sMT = 1;
-    fprintf(stderr, "gpu3d: GX worker thread on (%s commit)\n", async ? "pipelined" : "synchronous");
+    fprintf(stderr, "gpu3d: GX worker thread on (%s commit%s)\n", async ? "pipelined" : "synchronous",
+            sRawOn ? ", raw FIFO to the worker" : "");
 }
 unsigned long long gpu3d_mt_skipped(void) { unsigned long long n = sMtSkipped; sMtSkipped = 0; return n; }
 unsigned long long gpu3d_mt_busy_ns(void) { return __atomic_exchange_n(&sMtBusyNs, 0, __ATOMIC_RELAXED); }
@@ -1709,7 +1880,8 @@ static void gpu3d_write16_now(uint32_t addr, uint16_t v) {
     else if (addr >= 0x04000400 && addr < 0x04000600) { /* (the host writes these 32-bit) */ }
 }
 void gpu3d_write32(uint32_t addr, uint32_t v) {
-    if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) { gxfifo_write_mt(v); return; }   // worker mode, GX FIFO
+    if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) { if (sRawOn) gx_raw_word(v); else gxfifo_write_mt(v); return; }   // worker mode, GX FIFO
+    if (sMT && sGeomOn && addr - 0x04000440u < 0x1c0u) { gx_port_mt((u8)((addr - 0x04000400u) >> 2), v); return; }   // command ports
     if (addr >= 0x04000400 && addr < 0x04000600 && !sGeomOn) { g3_feature(F_GEOM_OFF_WRITE); return; }
     if (addr >= 0x04000400 && addr < 0x04000440) gxfifo_write(v);
     else if (addr >= 0x04000440 && addr < 0x04000600) {
@@ -1746,7 +1918,8 @@ static u32 gxstat(void) {
 // A block of words to one GX port (display-list DMA): the per-word loop runs here, fully inlined in worker mode.
 void gpu3d_write_block(uint32_t addr, const uint32_t *src, uint32_t n) {
     if (sMT && sGeomOn && addr - 0x04000400u < 0x40u) {
-        for (uint32_t i = 0; i < n; i++) gxfifo_write_mt(src[i]);
+        if (sRawOn) for (uint32_t i = 0; i < n; i++) gx_raw_word(src[i]);
+        else for (uint32_t i = 0; i < n; i++) gxfifo_write_mt(src[i]);
         return;
     }
     for (uint32_t i = 0; i < n; i++) gpu3d_write32(addr, src[i]);
@@ -1776,6 +1949,17 @@ uint32_t gpu3d_read32(uint32_t addr) {
 // Commit the frame's geometry (main thread): bind the texture banks, run feature flags, and swap the double-
 // buffered polygon RAM so gG3Render points at the finished bank. Executes no rasterization, so it can run on the
 // main thread at the frame boundary while the render thread rasterizes the previously-committed geometry.
+// Pipelined commit support (render.c): which geometry frame (1-based count of SWAP_BUFFERS) the last commit
+// swapped in (0: none), how many SWAP_BUFFERS the game has issued, and re-binding the texture banks + VRAMCNT
+// of the VRAM snapshot that belongs to that geometry frame.
+static unsigned sCommitSwapped;
+unsigned gpu3d_commit_swapped(void) { return sCommitSwapped; }
+unsigned gpu3d_swaps_issued(void) { return sMtSwapsQueued; }
+int gpu3d_pipelined(void) { return sMT && sMtAsync; }
+void gpu3d_bind_banks(const uint8_t *const bank[9], const uint8_t cnt[9]) {
+    gG3Banks = bank;
+    memcpy(gG3VramCntFrame, cnt, sizeof gG3VramCntFrame);
+}
 void gpu3d_commit(const uint8_t *const bank[9]) {
     gG3Banks = bank;
     memcpy(gG3VramCntFrame, gG3VramCnt, sizeof gG3VramCntFrame);   // pairs with the bank snapshot
@@ -1797,11 +1981,14 @@ void gpu3d_commit(const uint8_t *const bank[9]) {
         // Synchronous: wait for the worker, exactly like the single-threaded path. Pipelined: never wait - swap
         // if the worker has a finished frame parked, otherwise keep showing the previous one (frameskip above
         // keeps the backlog bounded).
+        raw_close(1);
         mt_publish();
         if (!sMtAsync) mt_sync_r(2);
+        sCommitSwapped = 0;
         if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) {
             do_swap();
             sMtSwapsDone++;
+            sCommitSwapped = sMtSwapsDone;
             __atomic_store_n(&sMtParked, 0, __ATOMIC_RELEASE);
         }
         return;
