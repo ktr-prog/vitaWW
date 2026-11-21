@@ -39,6 +39,13 @@ static u8 sImgWasActive[4], sPalWasActive[8];
 enum { G3_TEX_BLK = 1024 };
 u8 gG3TexDirtyImg[4 * IMG_SLOT / G3_TEX_BLK], gG3TexDirtyPal[8 * PAL_SLOT / G3_TEX_BLK];
 static u8 sTexMerge[IMG_SLOT] __attribute__((aligned(16)));
+// Per flat block: which bank (and offset) at which generation it was last brought up to date from. A texture or
+// texture-palette bank cannot be written by the CPU while it is mapped as one, so while the same single bank
+// feeds the slot at the same generation (host_vram_bank_gens, as of the snapshot) the block is known to be
+// current and the compare is skipped. 0 = unknown. ACWW_TEXGEN=0 always compares.
+u32 gG3BankGenFrame[9];
+int gG3BankGenValid;
+static u64 sImgBlkKey[4 * IMG_SLOT / G3_TEX_BLK], sPalBlkKey[8 * PAL_SLOT / G3_TEX_BLK];
 
 // Bring d (n bytes) up to date with src block by block: compare, copy only changed blocks, flag them. Most frames
 // only a few blocks of texture VRAM change, so this reads the data once instead of copying all of it every frame.
@@ -106,6 +113,8 @@ static void g3_tex_map(void) {
 }
 static void g3_tex_setup(void) {
     g3_tex_map();
+    memset(sImgBlkKey, 0, sizeof sImgBlkKey);   // the full setup rewrites the flat images itself
+    memset(sPalBlkKey, 0, sizeof sPalBlkKey);
     memset(gG3TexDirtyImg, 0, sizeof gG3TexDirtyImg);
     memset(gG3TexDirtyPal, 0, sizeof gG3TexDirtyPal);
     for (int s = 0; s < 4; s++)
@@ -122,6 +131,10 @@ static void g3_tex_setup(void) {
 // comparing all 640 KB of texture VRAM every frame. Change flags are set for synced blocks that changed; a cached
 // texture not drawn this frame is checked when it is next drawn.
 static u8 sSyncedImg[4 * IMG_SLOT / G3_TEX_BLK], sSyncedPal[8 * PAL_SLOT / G3_TEX_BLK];
+static inline u64 g3_blk_key(const s32 *src, int nsrc) {
+    if (nsrc != 1 || !gG3BankGenValid) return 0;
+    return (u64)((u32)src[0] + 1) << 32 | gG3BankGenFrame[src[0] >> 20];
+}
 static const u8 kZeroBlk[G3_TEX_BLK] __attribute__((aligned(16)));
 static void g3_tex_setup_lazy(void) {
     g3_tex_map();
@@ -152,7 +165,10 @@ static void g3_sync_img(u32 a, u32 n) {
         u32 b = (first + i) % NB, s = b / PER;
         if (sSyncedImg[b]) continue;
         sSyncedImg[b] = 1;
+        u64 key = g3_blk_key(sImgSrc[s], sNImg[s]);
+        if (key && sImgBlkKey[b] == key) continue;
         g3_sync_block(sImgFlat + b * G3_TEX_BLK, sImg[s], sNImg[s], (b % PER) * G3_TEX_BLK, &gG3TexDirtyImg[b]);
+        sImgBlkKey[b] = key;
     }
 }
 static void g3_sync_pal(u32 a, u32 n) {
@@ -165,7 +181,10 @@ static void g3_sync_pal(u32 a, u32 n) {
         u32 b = (first + i) % NB, s = b / PER;
         if (sSyncedPal[b]) continue;
         sSyncedPal[b] = 1;
+        u64 key = g3_blk_key(sPalSrc[s], sNPal[s]);
+        if (key && sPalBlkKey[b] == key) continue;
         g3_sync_block(sPalFlat + b * G3_TEX_BLK, sPal[s], sNPal[s], (b % PER) * G3_TEX_BLK, &gG3TexDirtyPal[b]);
+        sPalBlkKey[b] = key;
     }
 }
 // VRAM byte ranges one texture reads: texels, the 4x4-compressed palette indices, and its palette.

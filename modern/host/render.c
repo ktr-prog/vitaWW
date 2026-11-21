@@ -775,7 +775,31 @@ static void render_frame_mt(void) {
     render_thread_sync();
     uint64_t h1 = host_plat_time_ns();
     if (!sSnapBankMem) sSnapBankMem = malloc(host_vram_total());
-    host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
+    {
+        // Main-screen-only (the Vita): copy just the banks the engine-A 2D and the 3D read this frame.
+        // ACWW_SNAPALL=1 copies everything (as before).
+        static int mainOnly = -1;
+        if (mainOnly < 0) {
+#if HOST_VITA
+            mainOnly = 1;
+#else
+            mainOnly = getenv("ACWW_FORCEMAIN") && atoi(getenv("ACWW_FORCEMAIN"));
+#endif
+            if (getenv("ACWW_SNAPALL") && atoi(getenv("ACWW_SNAPALL"))) mainOnly = 0;
+        }
+        extern void host_vram_snapshot_main(u8 *dst, int keepLcdc);
+        extern int gpu2d_main_vram_display(void);
+        if (mainOnly) host_vram_snapshot_main(sSnapBankMem, gpu2d_main_vram_display());
+        else host_vram_snapshot_live(sSnapBankMem);   // one pass: equivalent to host_vram_flush() + host_vram_snapshot()
+        // Bank generations as of this snapshot, for the 3D texture sync (gpu3d_tex.h). ACWW_TEXGEN=0: unused.
+        extern u32 gG3BankGenFrame[9];
+        extern int gG3BankGenValid;
+        extern const u32 *host_vram_bank_gens(void);
+        static int texGen = -1;
+        if (texGen < 0) texGen = !(getenv("ACWW_TEXGEN") && atoi(getenv("ACWW_TEXGEN")) == 0);
+        memcpy(gG3BankGenFrame, host_vram_bank_gens(), sizeof gG3BankGenFrame);
+        gG3BankGenValid = texGen;
+    }
     for (int i = 0; i < 9; i++) sSnapBank[i] = sSnapBankMem + host_vram_bank_offset(i);
     memcpy(sSnapPal, gHostPltt, sizeof sSnapPal);
     memcpy(sSnapOam, gHostOam, sizeof sSnapOam);

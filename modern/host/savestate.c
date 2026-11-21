@@ -533,12 +533,14 @@ static int load_file(void) {
     return 1;
 }
 
+extern unsigned gHostStateLoads;   // vram.c
 int host_state_load(void **gameSp) {
     if (!ranges_fine()) { message("SAVE STATES ARE OFF IN THIS BUILD"); return 0; }
     uint64_t t0 = host_plat_time_ns();
     unsigned long long frame = host_frame();
     if (!sSnap && !load_file()) return 0;
     if (!restore(gameSp)) { message("NO MEMORY FOR A STATE"); return 0; }
+    gHostStateLoads++;   // caches keyed on VRAM bank generations start over (vram.c)
     fprintf(stderr, "savestate: loaded at frame %llu: back to frame %llu, %.1f ms\n", frame,
             (unsigned long long)host_frame(), (double)(host_plat_time_ns() - t0) / 1e6);
     message("STATE LOADED");

@@ -322,6 +322,8 @@ int gpu2d_tall_3d_ok(void) {
     return (d & 8) && (d & 0x100) && !(d & 0x80);
 }
 int gpu2d_main_on_bottom(void) { return 1; }
+// Engine A shows a VRAM bank directly (display mode 2): the LCDC banks must be in the render snapshot.
+int gpu2d_main_vram_display(void) { return (reg32(&sEngine[0], REG_DISPCNT) >> 16 & 3) == 2; }
 
 // Engine-0 compose for the main-screen-only path (the Vita): no dual-screen bookkeeping, no deferred 3D, no
 // diagnostics. Same result as the general loop in compose_line, organised layer-major: each layer is walked once

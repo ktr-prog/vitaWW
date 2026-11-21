@@ -4,6 +4,7 @@
 
 #include "host.h"
 #include "host_mem.h"
+#include "savestate.h"
 
 enum { BANK_TOTAL = 0xa4000, GRANULE = 0x4000 };
 static const u32 kSize[9] = {0x20000, 0x20000, 0x20000, 0x20000, 0x10000, 0x4000, 0x4000, 0x8000, 0x4000};
@@ -123,6 +124,64 @@ void host_vram_snapshot_live(u8 *dst) {
     for (u32 o = 0; o < BANK_TOTAL; o += GRANULE)
         if (!covered[o / GRANULE]) snap_granule(dst, sBanks + o, o, full);
 }
+// Bank generations: bumped whenever a bank's contents may have changed (see host_vram_control and the snapshot).
+static u32 sBankGen[9], sSnapGen[9];
+static u8 sSnapHave[9];
+static const u8 *sGenDst;
+unsigned gHostStateLoads;   // bumped by host_state_load (savestate.c); kept across loads
+HOST_STATE_KEEP(gHostStateLoads) HOST_STATE_KEEP(sBankGen) HOST_STATE_KEEP(sSnapGen) HOST_STATE_KEEP(sSnapHave) HOST_STATE_KEEP(sGenDst)
+const u32 *host_vram_bank_gens(void) { return sBankGen; }
+// Main-screen-only renderer (the Vita): the snapshot only needs the banks the engine-A 2D and the 3D read - engine-A
+// BG/OBJ and their extended palettes, textures and texture palettes - plus LCDC banks A-D when engine A displays
+// VRAM directly (keepLcdc). Banks mapped to the sub engine (never rendered there), to the ARM7, to LCDC, or
+// disabled are not copied; their snapshot bytes are simply stale and nothing reads them this frame. Unknown
+// mappings are copied.
+static int bank_needed(int i, u8 c, int keepLcdc) {
+    if (!(c & 0x80)) return 0;
+    u32 mst = c & 7;
+    switch (i) {
+    case 0: case 1: return (mst & 3) != 0 || keepLcdc;
+    case 2: case 3: return mst == 0 ? keepLcdc : mst != 2 && mst != 4;
+    case 4: return mst != 0;
+    case 5: case 6: return mst != 0;
+    case 7: case 8: return 0;   // sub engine BG/OBJ/extended palettes, or LCDC
+    }
+    return 1;
+}
+void host_vram_snapshot_main(u8 *dst, int keepLcdc) {
+    u8 need[9];
+    static unsigned seenLoads;
+    if (dst != sGenDst || seenLoads != gHostStateLoads) {   // new buffer or a state load: nothing is known
+        sGenDst = dst;
+        seenLoads = gHostStateLoads;
+        for (int i = 0; i < 9; i++) { sSnapHave[i] = 0; sBankGen[i]++; }
+    }
+    for (int i = 0; i < 9; i++) {
+        need[i] = (u8)bank_needed(i, sCnt[i], keepLcdc);
+        // A bank the CPU can address now may have been written since the last snapshot: new generation. A bank it
+        // cannot address (textures, texture palettes, extended palettes) keeps its contents until its next remap,
+        // so when the snapshot already holds this generation, copying it again would copy the same bytes.
+        if (bank_address(i, sCnt[i])) sBankGen[i]++;
+        if (!need[i]) { sSnapHave[i] = 0; continue; }
+        if (sSnapHave[i] && sSnapGen[i] == sBankGen[i]) need[i] = 0;   // already in the snapshot
+        else { sSnapHave[i] = 1; sSnapGen[i] = sBankGen[i]; }
+    }
+    static u8 covered[BANK_TOTAL / GRANULE];
+    memset(covered, 0, sizeof covered);
+    for (int g = 0; g < NGRAN; g++)
+        if (sGran[g].bank >= 0) {
+            u32 o = sOffset[sGran[g].bank] + sGran[g].off;
+            covered[o / GRANULE] = 1;
+            if (need[sGran[g].bank]) memcpy(dst + o, sGran[g].win, GRANULE);
+        }
+    for (int i = 0; i < 9; i++) {
+        if (!need[i]) continue;
+        for (u32 off = 0; off < kSize[i]; off += GRANULE) {
+            u32 o = sOffset[i] + off;
+            if (!covered[o / GRANULE]) memcpy(dst + o, sBanks + o, GRANULE);
+        }
+    }
+}
 // Changed 1 KB blocks of the last host_vram_snapshot_live(), indexed by bank-block offset / 1024.
 const u8 *host_vram_snapshot_dirty(void) { return sSnapDirty; }
 
@@ -196,6 +255,7 @@ void host_vram_control(u32 addr, u8 value) {
     if (i < 0 || i > 8 || addr == 0x04000247) return;
     if (sCnt[i] == value) return;
     sCnt[i] = value;
+    sBankGen[i]++;   // the bank's contents can change only while the CPU can address it, i.e. around a remap
     HOST_PHASE(PH_VRAM, remap());
 }
 
