@@ -119,8 +119,13 @@ int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
     sGcState = -1;
     if (!sReady) return 0;
-    GLuint vs = gc_shader(GL_VERTEX_SHADER, kGcVertexShader), fs = gc_shader(GL_FRAGMENT_SHADER, kGcFragmentShader);
+    // Cg sources compiled as is (GL_CG_*: not through vitaGL's GLSL translator). Each step is logged, so a
+    // failure on a device shows where it happened.
+    fprintf(stderr, "vita_gl: GPU compose: compiling shaders\n");
+    GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, kGcVertexShaderCg);
+    GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, kGcFragmentShaderCg) : 0;
     if (!vs || !fs) return 0;
+    fprintf(stderr, "vita_gl: GPU compose: linking\n");
     sGcProg = glCreateProgram();
     glAttachShader(sGcProg, vs);
     glAttachShader(sGcProg, fs);
@@ -129,6 +134,8 @@ int vita_gl_gc_init(void) {
     glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
     if (!ok) { fprintf(stderr, "vita_gl: compose program failed to link\n"); return 0; }
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
+    fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
+    if (sGcAttr < 0) return 0;
     sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     glUseProgram(sGcProg);
@@ -169,6 +176,8 @@ int vita_gl_gc_init(void) {
 // overlay rows (256x16, alpha byte 0 = overlay pixel) or NULL.
 void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) {
     if (!sReady || sGcState <= 0) return;
+    static int first = 1;
+    if (first) fprintf(stderr, "vita_gl: GPU compose: first frame\n");
     GLuint *t = sGcTex[sGcSet];
     sGcSet ^= 1;
     const void *data[6] = {gc->bg[0], gc->bg[1], gc->bg[2], gc->bg[3], gc->obj, gc->aux};
@@ -219,6 +228,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glDepthMask(GL_TRUE);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     blit_canvas(sGcFbo, 0, 0, 256, 192);
+    if (first) { first = 0; fprintf(stderr, "vita_gl: GPU compose: first frame presented\n"); }
 }
 
 // Present one frame: upload the composited DS canvas (XRGB8888 == GL_BGRA bytes, a zero-conversion upload) and
