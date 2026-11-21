@@ -77,7 +77,8 @@ static G3Polygon sPolyRam[2][MAX_POLYGONS];
 static int sBank;
 static int sNumVerts, sNumPolys, sNumOpaque;
 static int sRamOverflow;
-G3RenderState gG3Render;
+static G3RenderState sRS[2];   // per polygon bank
+G3RenderState *gG3RenderP = &sRS[0];
 const uint8_t *const *gG3Banks;
 
 static u64 sFeatureFrame[F_COUNT];
@@ -867,7 +868,9 @@ static void submit_polygon_fast(void) {
     if (strip) sStripValid = 1;
     // One-dot polygons: the slow GL path never computes screen x/y (they stay 0), so every polygon counts as one
     // dot there and only the depth test below decides. Same here, from the same normalised w.
-    if (!(attr & (1u << 13))) {
+    // (The normalised w is below 0x10000, so with DISP_1DOT_DEPTH >= 0x80 - the usual 0x7fff - nothing can be
+    // hidden: skip the test.)
+    if (!(attr & (1u << 13)) && ((s32)sDot1Depth << 9) / 0x200 * 0x200 < 0xffff) {
         int ws = 0;
         for (int i = 0; i < nv; i++) { u32 w = (u32)v[i]->pos[3]; while ((w >> ws) && ws < 32) ws += 4; }
         s32 wmin = 0x7fffffff;
@@ -1088,11 +1091,11 @@ void gpu3d_debug_history(void) {
     }
     fprintf(stderr, "\n");
 }
+static long sCmdLog = -2;   // ACWW_GPU3D_CMDLOG=<frame> (read at the first command)
 static void execute(u8 cmd, const u32 *p) {
-    {
-        static long f = -2;
-        if (f == -2) f = getenv("ACWW_GPU3D_CMDLOG") ? atol(getenv("ACWW_GPU3D_CMDLOG")) : -1;
-        if (f >= 0 && sFrame == (u64)f) fprintf(stderr, "cmdlog %02x %08x tex %08x vin %d\n", cmd, p[0], sTexParam, sVtxInPoly);
+    if (sCmdLog != -1) {
+        if (sCmdLog == -2) sCmdLog = getenv("ACWW_GPU3D_CMDLOG") ? atol(getenv("ACWW_GPU3D_CMDLOG")) : -1;
+        if (sCmdLog >= 0 && sFrame == (u64)sCmdLog) fprintf(stderr, "cmdlog %02x %08x tex %08x vin %d\n", cmd, p[0], sTexParam, sVtxInPoly);
     }
     g3_feature(F_CMD + (cmd & 0x7f));
     // Lighting inputs changed. With the GX worker, matrix commands run on the game thread and the worker sees the
@@ -1295,6 +1298,11 @@ static u32 sMtW __attribute__((aligned(64)));
 static u32 sMtR __attribute__((aligned(64)));
 static int sMtPad __attribute__((aligned(64), unused));
 static int sMtParked;             // worker executed SWAP_BUFFERS and waits for the commit
+// Pipelined mode: polygon bank ownership. FREE: the worker may build into it. BUILT: a finished frame waiting
+// for a commit. COMMITTED: picked by the vblank commit; the render thread owns it until it has drawn it.
+enum { BANK_FREE, BANK_BUILT, BANK_COMMITTED };
+static int sBankSt[2], sCommittedBank = -1, sWorkerWaitBank;
+static unsigned sBankTag[2], sWorkerSwaps, sFramesDropped;
 static int sMtAsync, sMtStarted;
 static u32 sMtSwapsQueued, sMtSwapsDone;
 static int sMtCvDirty, sMtTexDirty;
@@ -1385,6 +1393,7 @@ static inline void w_word(u32 v) {
         w_advance();
     }
 }
+static int do_swap(void);
 static void *mt_worker(void *arg) {
     (void)arg;
 #if HOST_VITA
@@ -1419,6 +1428,43 @@ static void *mt_worker(void *arg) {
                 for (u32 i = 0; i < n; i++) tmp[i] = sMtQ[(r + 1 + i) & MTQ_M];
                 p = tmp;
             }
+            if (c >= 0x20 && c <= 0x28 && c != 0x21 && !sFeaturesOn && sCmdLog < 0) {
+                // The per-vertex commands, inline (execute()'s big frame and its diagnostics checks are most of
+                // their cost there). Same effects as execute().
+                switch (c) {
+                case 0x20:
+                    sVtxColor[0] = p[0] & 31; sVtxColor[1] = p[0] >> 5 & 31; sVtxColor[2] = p[0] >> 10 & 31;
+                    sCurLightRec = -1;
+                    break;
+                case 0x22:
+                    sTexRaw[0] = (s16)p[0];
+                    sTexRaw[1] = (s16)(p[0] >> 16);
+                    if ((sTexParam >> 30) == 1) {
+                        for (int i2 = 0; i2 < 2; i2++)
+                            sTexCoord[i2] = (s16)(((s64)sTexRaw[0] * gTexM->m[i2] + (s64)sTexRaw[1] * gTexM->m[4 + i2] +
+                                                   gTexM->m[8 + i2] + gTexM->m[12 + i2]) >> 12);
+                    } else { sTexCoord[0] = sTexRaw[0]; sTexCoord[1] = sTexRaw[1]; }
+                    break;
+                case 0x23: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); sVtx[2] = (s16)p[1]; submit_vertex(); break;
+                case 0x24:
+                    sVtx[0] = (s16)((p[0] & 0x3ff) << 6);
+                    sVtx[1] = (s16)((p[0] >> 10 & 0x3ff) << 6);
+                    sVtx[2] = (s16)((p[0] >> 20 & 0x3ff) << 6);
+                    submit_vertex();
+                    break;
+                case 0x25: sVtx[0] = (s16)p[0]; sVtx[1] = (s16)(p[0] >> 16); submit_vertex(); break;
+                case 0x26: sVtx[0] = (s16)p[0]; sVtx[2] = (s16)(p[0] >> 16); submit_vertex(); break;
+                case 0x27: sVtx[1] = (s16)p[0]; sVtx[2] = (s16)(p[0] >> 16); submit_vertex(); break;
+                case 0x28:
+                    sVtx[0] += (s16)((p[0] & 0x3ff) << 6) >> 6;
+                    sVtx[1] += (s16)((p[0] >> 10 & 0x3ff) << 6) >> 6;
+                    sVtx[2] += (s16)((p[0] >> 20 & 0x3ff) << 6) >> 6;
+                    submit_vertex();
+                    break;
+                }
+                r += 1 + n;
+                continue;
+            }
             switch (c) {
             case 0xf0: gpu3d_write16_now(p[0], (u16)p[1]); break;
             case 0xf1: memcpy(wClip.m, p, sizeof wClip.m); memcpy(wVec.m, p + 16, sizeof wVec.m); sLitGen++; break;
@@ -1428,6 +1474,25 @@ static void *mt_worker(void *arg) {
             }
             r += 1 + n;
             park = sFlushPending;
+        }
+        if (park && sMtAsync) {
+            // Pipelined: no parking until the vblank. Finish the frame into its bank (the commit picks up the
+            // newest finished one) and go on with the next frame in the other bank as soon as the render thread
+            // no longer holds it.
+            int b = do_swap();
+            sBankTag[b] = __atomic_add_fetch(&sWorkerSwaps, 1, __ATOMIC_SEQ_CST);
+            __atomic_store_n(&sBankSt[b], BANK_BUILT, __ATOMIC_SEQ_CST);
+            int nb = sBank, s2 = 0;
+            if (__atomic_load_n(&sBankSt[nb], __ATOMIC_ACQUIRE) != BANK_FREE) {
+                __atomic_store_n(&sWorkerWaitBank, 1, __ATOMIC_SEQ_CST);
+                __atomic_store_n(&sMtR, r, __ATOMIC_RELEASE);   // (what was consumed so far is visible)
+                while (__atomic_load_n(&sBankSt[nb], __ATOMIC_ACQUIRE) != BANK_FREE) {
+                    if (++s2 < 32) sched_yield();
+                    else usleep(200);
+                }
+                __atomic_store_n(&sWorkerWaitBank, 0, __ATOMIC_SEQ_CST);
+            }
+            park = 0;
         }
         __atomic_fetch_add(&sMtBusyNs, host_plat_time_ns() - t0, __ATOMIC_RELAXED);
         // Park before publishing R so a game thread that sees the queue drained also sees the pending swap.
@@ -1476,7 +1541,8 @@ static void mt_sync_body(void) {
     if (gHostGxStageN) HostGx_StageFlush();
     raw_close(1);
     mt_publish();
-    while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWDone && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) mt_pause(&s);
+    while (__atomic_load_n(&sMtR, __ATOMIC_ACQUIRE) != sMtWDone && !__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&sWorkerWaitBank, __ATOMIC_ACQUIRE)) mt_pause(&s);
 }
 // Make room for `words` more words; 0 = the ring is full behind a pending swap (drop the command, as a full FIFO
 // would).
@@ -1488,7 +1554,10 @@ static int mt_reserve(u32 words) {
     mt_publish();
     gHostPhase = 6;   // ring full: waiting for the worker
     while (w - (sMtRSeen = __atomic_load_n(&sMtR, __ATOMIC_ACQUIRE)) + words > MTQ_N) {
-        if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) { gHostPhase = ph; return 0; }
+        if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE) || __atomic_load_n(&sWorkerWaitBank, __ATOMIC_ACQUIRE)) {
+            gHostPhase = ph;
+            return 0;
+        }
         mt_pause(&s);
     }
     gHostPhase = ph;
@@ -1537,7 +1606,7 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
     if (c == 0x50) {
         if (sMtSkip) sMtSkipped++;
         else { sMtSwapsQueued++; mt_push(c, p, (u32)n); }
-        sMtSkip = sMtAsync && sMtSwapsQueued - sMtSwapsDone >= 3;
+        sMtSkip = sMtAsync && sMtSwapsQueued - __atomic_load_n(&sWorkerSwaps, __ATOMIC_ACQUIRE) >= 3;
         return;
     }
     mt_push(c, p, (u32)n);
@@ -1807,8 +1876,11 @@ static int cmp_poly(const void *a, const void *b) {
     if (p->sortKey != q->sortKey) return p->sortKey < q->sortKey ? -1 : 1;
     return p->index - q->index;
 }
-static void do_swap(void) {
-    G3RenderState *r = &gG3Render;
+// Finish the frame in the current polygon bank: fill that bank's render state and start the other bank. Returns
+// the finished bank; the caller points gG3RenderP at it when it commits it (the pipelined worker does not).
+static int do_swap(void) {
+    const int fin = sBank;
+    G3RenderState *r = &sRS[sBank];
     r->npoly = sNumPolys;
     r->wbuffer = sFlushParam >> 1 & 1;
     r->manualSort = sFlushParam & 1;
@@ -1867,6 +1939,7 @@ static void do_swap(void) {
     sPoolN = 0;
     sStripValid = 0;
     sFlushPending = 0;
+    return fin;
 }
 
 void gpu3d_reset(void) {
@@ -1953,6 +2026,7 @@ void gpu3d_write32(uint32_t addr, uint32_t v) {
     drain();
 }
 
+int gpu3d_fifo_irq_level(void) { u32 m = sGxStat >> 30; return m == 1 || m == 2; }   // as gxstat() >> 30
 static u32 gxstat(void) {
     u32 s = sGxStat & (2u | 0x8000u | 0xc0000000u);
     if (sTestQueued) s |= 1;
@@ -2056,7 +2130,16 @@ uint32_t gpu3d_read32(uint32_t addr) {
     }
     if (sMT) { if (addr == 0x04000604) mt_sync_r(1); }
     else drain();
-    if (addr == 0x04000600) return gxstat();
+    if (addr == 0x04000600) {
+        u32 st = gxstat();
+        static int on = -1; static unsigned busy, notHalf, notEmpty, tst, tot;
+        if (on < 0) on = getenv("ACWW_GXREADLOG") != 0;
+        if (on) {
+            busy += st >> 27 & 1; notHalf += !(st >> 25 & 1); notEmpty += !(st >> 26 & 1); tst += st & 1;
+            if (++tot % 100000 == 0) fprintf(stderr, "gxstat: %u reads, busy %u, fifo>=half %u, fifo not empty %u, test busy %u\n", tot, busy, notHalf, notEmpty, tst);
+        }
+        return st;
+    }
     if (addr == 0x04000604) { g3_feature(F_READ_RAMCOUNT); return (u32)sNumPolys | (u32)sNumVerts << 16; }
     if (addr == 0x04000320) { g3_feature(F_READ_RDLINES); return 46; }
     if (addr >= 0x04000620 && addr < 0x04000630) { g3_feature(F_READ_POSRESULT); return (u32)sPosResult[(addr - 0x04000620) / 4]; }
@@ -2115,8 +2198,27 @@ void gpu3d_commit(const uint8_t *const bank[9]) {
         mt_publish();
         if (!sMtAsync) mt_sync_r(2);
         sCommitSwapped = 0;
+        if (sMtAsync) {
+            // Take the newest finished frame (an older unpicked one is dropped and its bank freed).
+            int pick = -1;
+            for (int b = 0; b < 2; b++)
+                if (__atomic_load_n(&sBankSt[b], __ATOMIC_ACQUIRE) == BANK_BUILT && (pick < 0 || sBankTag[b] > sBankTag[pick])) pick = b;
+            if (pick >= 0) {
+                for (int b = 0; b < 2; b++)
+                    if (b != pick && __atomic_load_n(&sBankSt[b], __ATOMIC_ACQUIRE) == BANK_BUILT) {
+                        __atomic_store_n(&sBankSt[b], BANK_FREE, __ATOMIC_RELEASE);
+                        sFramesDropped++;
+                    }
+                gG3RenderP = &sRS[pick];
+                sCommittedBank = pick;
+                __atomic_store_n(&sBankSt[pick], BANK_COMMITTED, __ATOMIC_RELEASE);
+                sCommitSwapped = sBankTag[pick];
+                sMtSwapsDone = sBankTag[pick];
+            }
+            return;
+        }
         if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) {
-            do_swap();
+            gG3RenderP = &sRS[do_swap()];
             sMtSwapsDone++;
             sCommitSwapped = sMtSwapsDone;
             __atomic_store_n(&sMtParked, 0, __ATOMIC_RELEASE);
@@ -2125,13 +2227,25 @@ void gpu3d_commit(const uint8_t *const bank[9]) {
         return;
     }
     if (sFlushPending) {
-        do_swap();
+        gG3RenderP = &sRS[do_swap()];
         drain();
     }
 }
 
 // Rasterize the committed geometry (render thread). Reads gG3Render + the texture banks bound in gpu3d_commit().
-void gpu3d_render_committed(void) { g3_render(); }
+void gpu3d_release_committed(void) {   // (render thread, when it does not draw the committed frame)
+    if (sCommittedBank >= 0) {
+        __atomic_store_n(&sBankSt[sCommittedBank], BANK_FREE, __ATOMIC_RELEASE);
+        sCommittedBank = -1;
+    }
+}
+void gpu3d_render_committed(void) {
+    g3_render();
+    if (sCommittedBank >= 0) {   // pipelined: drawn - the worker may build into this bank again
+        __atomic_store_n(&sBankSt[sCommittedBank], BANK_FREE, __ATOMIC_RELEASE);
+        sCommittedBank = -1;
+    }
+}
 
 void gpu3d_frame(const uint8_t *const bank[9]) {
     gpu3d_commit(bank);

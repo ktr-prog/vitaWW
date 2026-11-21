@@ -73,7 +73,9 @@ typedef struct G3RenderState {
     int yofs;
 } G3RenderState;
 
-extern G3RenderState gG3Render;
+// The committed frame's render state (one per polygon bank; the commit points this at the frame to draw).
+extern G3RenderState *gG3RenderP;
+#define gG3Render (*gG3RenderP)
 extern const uint8_t *const *gG3Banks;
 extern u8 gG3VramCnt[9];
 extern const uint8_t *const *gG3BankDirtyFrame;   // gpu3d_set_bank_dirty() as of the last commit, or NULL

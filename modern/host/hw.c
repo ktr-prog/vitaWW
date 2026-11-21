@@ -875,9 +875,28 @@ void HostGx_WriteBlock(u32 addr, const u32 *src, u32 n) {
     gpu3d_write_block(addr, src, n);
     gHostPhase = ph;
 }
+// IME / IE (0x04000208, 0x04000210): ~1500 accesses a frame in town (every OS_DisableInterrupts /
+// OS_RestoreInterrupts pair). Same effects as the general path - poll accounting, spin check, IRQ delivery - minus
+// the diagnostics bookkeeping (io_note: ring, histogram, trace) and the register dispatch, which has nothing for
+// them. Only when no diagnostics are on.
+static inline int io_irqreg_fast(u32 a, unsigned size) {
+    return (a == 0x04000208 || a == 0x04000210) && size <= 4 && sHBlankLine < 0 && sIoTrace == 0 && sIoHist == 0;
+}
 unsigned long long HostIo_Read(uintptr_t addr, unsigned int size) {
     u32 a = (u32)addr;
     if (gHostGxStageN) HostGx_StageFlush();
+    if (io_irqreg_fast(a, size)) {
+        unsigned char ph = gHostPhase;
+        if (ph == PH_GAME) gHostPhase = PH_IO;
+        sIoCount++;
+        u32 cost = io_read_cost(a);
+        if (cost) { sCycles += cost; run_events(); }
+        else io_spin_check();
+        unsigned long long v = size == 1 ? *host_io(a) : size == 2 ? *(u16 *)host_io(a) : *(u32 *)host_io(a);
+        io_access_done();
+        gHostPhase = ph;
+        return v;
+    }
     if (sHBlankLine >= 0)
         return size == 8 ? io_load(a, 4) | (unsigned long long)io_load(a + 4, 4) << 32 : io_load(a, size);
     unsigned char ph = gHostPhase;
@@ -912,6 +931,18 @@ unsigned long long HostIo_Write(uintptr_t addr, unsigned int size, unsigned long
         gHostPhase = PH_GX;
         gpu3d_write32(a, (u32)v);
         gpu3d_write32(a + 4, (u32)(v >> 32));
+        gHostPhase = ph;
+        return v;
+    }
+    if (io_irqreg_fast(a, size)) {
+        unsigned char ph = gHostPhase;
+        if (ph == PH_GAME) gHostPhase = PH_IO;
+        sIoCount++;
+        if (size == 1) *host_io(a) = (u8)v;
+        else if (size == 2) *(u16 *)host_io(a) = (u16)v;
+        else *(u32 *)host_io(a) = (u32)v;
+        if (!sTimingLegacy) { sPollAddr = ~0u; io_spin_check(); }
+        io_access_done();
         gHostPhase = ph;
         return v;
     }

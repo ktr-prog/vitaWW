@@ -309,8 +309,10 @@ u32 render_read32(u32 addr) {
 }
 int render_gx_fifo_irq_level(void) {
     if (!sOwn3d) return melon_gx_fifo_irq_level();
-    u32 mode = gpu3d_read32(0x04000600) >> 30;
-    return mode == 1 || mode == 2;
+    // Asked on every IRQ check (after every I/O access): only GXSTAT's FIFO-IRQ mode bits, read directly instead
+    // of a full GXSTAT read (store-queue flush, diagnostics, the whole status word) - same answer.
+    extern int gpu3d_fifo_irq_level(void);
+    return gpu3d_fifo_irq_level();
 }
 void render_debug(void) { if (sMelon) melon_debug(); }
 
@@ -675,6 +677,7 @@ static void render_worker_phase(void) {
         gpu2d_render_finish();             // 2D bands + canvas from the per-line/VRAM snapshots
         __atomic_fetch_add(&sWBandsNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
     }
+    if (!(sGpu3d && sDraw3d)) { extern void gpu3d_release_committed(void); gpu3d_release_committed(); }
     if (sGpu3d && sDraw3d) {
         uint64_t t3d = host_plat_time_ns();
         gpu3d_render_committed();
