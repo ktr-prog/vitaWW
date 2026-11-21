@@ -46,11 +46,15 @@ static u8 sWinBgA[0x80000] __attribute__((aligned(0x80000)));
 static u8 sWinBgB[0x20000] __attribute__((aligned(0x20000)));
 static u8 sWinObjA[0x40000] __attribute__((aligned(0x40000)));
 static u8 sWinObjB[0x20000] __attribute__((aligned(0x20000)));
-static u8 sWinLcdc[0xa4000] __attribute__((aligned(0x20000)));
-static u8 *const sWinMem[NWIN] = {sWinBgA, sWinBgB, sWinObjA, sWinObjB, sWinLcdc};
+static u8 *const sWinMem[NWIN] = {sWinBgA, sWinBgB, sWinObjA, sWinObjB, sBanks};
 #endif
 
 enum { NGRAN = (0x80000 + 0x20000 + 0x40000 + 0x20000 + 0xa4000) / GRANULE };
+// The LCDC window (0x06800000-0x068a3fff) lays the banks out exactly as the bank storage does (A-D 128 KB each,
+// E, F, G, H, I), so it IS the bank storage: a bank mapped to LCDC is read and written in place, and mapping a
+// bank to or from LCDC (what the game does around every texture upload) moves no data. Granules from LCDC_G0 on
+// are that window; remap/flush skip them. (Unmapped LCDC addresses show the bank's data instead of zeros.)
+enum { LCDC_G0 = (0x80000 + 0x20000 + 0x40000 + 0x20000) / GRANULE };
 static struct { u8 *win; s32 bank; u32 off; } sGran[NGRAN];
 
 static u32 bank_address(int i, u8 c) {
@@ -212,7 +216,7 @@ static int granule(u32 a) {
 }
 
 void host_vram_flush(void) {
-    for (int g = 0; g < NGRAN; g++)
+    for (int g = 0; g < LCDC_G0; g++)
         if (sGran[g].bank >= 0) memcpy(sBanks + sOffset[sGran[g].bank] + sGran[g].off, sGran[g].win, GRANULE);
 }
 
@@ -237,9 +241,9 @@ static void remap(void) {
         }
     }
 #define CHANGED(g) (old[g].bank != sGran[g].bank || (sGran[g].bank >= 0 && old[g].off != sGran[g].off))
-    for (int g = 0; g < NGRAN; g++)   // all saves before any load: a bank can move to other granules
+    for (int g = 0; g < LCDC_G0; g++)   // all saves before any load: a bank can move to other granules
         if (CHANGED(g) && old[g].bank >= 0) memcpy(sBanks + sOffset[old[g].bank] + old[g].off, sGran[g].win, GRANULE);
-    for (int g = 0; g < NGRAN; g++) {
+    for (int g = 0; g < LCDC_G0; g++) {
         if (!CHANGED(g)) continue;
         if (sGran[g].bank >= 0) memcpy(sGran[g].win, sBanks + sOffset[sGran[g].bank] + sGran[g].off, GRANULE);
         else memset(sGran[g].win, 0, GRANULE);
@@ -260,7 +264,7 @@ static void remap_full(void) {
             sGran[g].off = off;
         }
     }
-    for (int g = 0; g < NGRAN; g++) {
+    for (int g = 0; g < LCDC_G0; g++) {
         if (sGran[g].bank >= 0) memcpy(sGran[g].win, sBanks + sOffset[sGran[g].bank] + sGran[g].off, GRANULE);
         else memset(sGran[g].win, 0, GRANULE);
     }
@@ -287,7 +291,8 @@ void *HostVram_CpuPtr(unsigned int a) {
 void host_vram_init(void) {
 #if HOST_MEM_RUNTIME_ALIGN
     sBanksBlock = HostMem_AlignedBlock(sizeof sBanks, 0x20000);
-    for (unsigned w = 0; w < NWIN; w++) sWinMem[w] = HostMem_AlignedBlock(kWindows[w].size, kWindows[w].align);
+    for (unsigned w = 0; w + 1 < NWIN; w++) sWinMem[w] = HostMem_AlignedBlock(kWindows[w].size, kWindows[w].align);
+    sWinMem[NWIN - 1] = sBanks;   // the LCDC window is the bank storage
 #endif
     u32 total = 0;
     for (int i = 0; i < 9; i++) { sOffset[i] = total; total += kSize[i]; }

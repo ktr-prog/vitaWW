@@ -1551,7 +1551,9 @@ static void mt_push(u32 c, const u32 *p, u32 n) {
     if (!mt_reserve(n + 1)) return;
     u32 w = sMtWLocal;
     sMtQ[w & MTQ_M] = c | n << 8;
-    for (u32 i = 0; i < n; i++) sMtQ[(w + 1 + i) & MTQ_M] = p[i];
+    u32 wi = (w + 1) & MTQ_M;
+    if (wi + n <= MTQ_N) memcpy(&sMtQ[wi], p, n * sizeof(u32));
+    else for (u32 i = 0; i < n; i++) sMtQ[(w + 1 + i) & MTQ_M] = p[i];
     sMtWLocal = w + n + 1;
     mt_command_done(c == 0x50);
 }
@@ -1946,7 +1948,7 @@ static void fifo_block_mt(const u32 *src, u32 n) {
     while (i < n) {
         u32 cmds = sPackCmds, strLeft = sStrLeft, w = sMtWLocal;
         int left = sPackLeft, pleft = sPackParamsLeft, strMode = sStrMode, execCmd = sExecCmd;
-        const u32 rseen = sMtRSeen;
+        u32 rseen = sMtRSeen;
         int blocked = sMtCvDirty | sMtTexDirty | sMtSkip;
         int slow = 0;
         for (; i < n; i++) {
@@ -1999,6 +2001,18 @@ static void fifo_block_mt(const u32 *src, u32 n) {
                         sMtWDone = w;
                         if (w - sMtW >= MTQ_BATCH) mt_publish_w(w);
                     }
+                } else if (strMode == 0 && execCmd < 0 && !fast_pass(c) && i + kParams[c] <= n) {
+                    // A command the game thread executes (matrix commands, tests, the swap) with all its
+                    // parameters in this block: dispatched straight from the block (as mt_entry does once it has
+                    // collected them), instead of collecting them word by word through the general path.
+                    u32 k = kParams[c];
+                    sMtWLocal = w;
+                    mt_dispatch(c, src + i, (int)k);
+                    w = sMtWLocal;
+                    rseen = sMtRSeen;
+                    blocked = sMtCvDirty | sMtTexDirty | sMtSkip;
+                    i += k - 1;
+                    pleft = 1;
                 } else if (strMode == 0 && execCmd < 0) {
                     u32 k = kParams[c];
                     if (blocked || !fast_pass(c) ||

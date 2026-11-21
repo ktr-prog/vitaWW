@@ -215,22 +215,61 @@ static void next_sample(int ch) {
     }
 }
 
+// Without the FIR (the Vita), only the last of the input samples a voice advances over during one output sample
+// matters, so a voice played much faster than the output rate (PSG tones, pitched-up PCM) skips ahead to it
+// instead of stepping one input sample at a time: the same position, timer, noise register and current sample
+// as the step-by-step loop. Not near a PCM voice's end (looping or stopping) or for ADPCM (every nibble is
+// decoded): those take the loop. m = the number of steps the loop would take (>= 2 here).
+static void skip_ahead(int ch, const SpuChannelRegs *r, ChState *s) {
+    u32 per = 0x10000u - r->tmr;
+    if (s->timer - 0x10000u < per) return;   // one step: the loop
+    u32 m = (s->timer - 0x10000u) / per + 1;
+    u32 fmt = format_of(ch);
+    s32 last = (s32)((u32)s->pos + m);        // the position after the m steps
+    if (fmt == 3) {
+        if (last >= 0) {
+            if (ch >= 8 && ch <= 13) {
+                u32 duty = r->cnt >> 24 & 7;
+                s->cur = duty != 7 && (u32)(7 - (last & 7)) <= duty ? 0x7fff : -0x7fff;
+            } else if (ch >= 14) {
+                u32 steps = s->pos >= 0 ? m : (u32)last + 1;
+                u16 l = s->lfsr;
+                s32 cur = s->cur;
+                for (u32 i = 0; i < steps; i++) {
+                    if (l & 1) { l = (u16)(l >> 1 ^ 0x6000); cur = -0x7fff; }
+                    else { l >>= 1; cur = 0x7fff; }
+                }
+                s->lfsr = l;
+                s->cur = cur;
+            } else s->cur = 0;
+        }
+    } else if (fmt == 0 || fmt == 1) {
+        if (s->pos < 0) return;
+        u64 total = (u64)r->pnt * 4 + (u64)r->len * 4;
+        if ((u64)(u32)last * (fmt == 1 ? 2 : 1) >= total) return;   // reaches the end: the loop
+        s->cur = fmt == 0 ? rd8(r, (u32)last) << 8 : rd16(r, (u32)last * 2);
+    } else return;
+    s->pos = last;
+    s->timer -= m * per;
+}
+
 static s32 run_channel(int ch) {
     SpuChannelRegs *r = &spu_ch[ch];
     if (!(r->cnt & 0x80000000u)) return 0;
     if (format_of(ch) != 3 && ((u32)r->pnt + r->len) * 4 < 16) return 0;
     ChState *s = &sCh[ch];
+    // Voices played faster than the output rate: the windowed-sinc FIR (cleaner than the DS) is most of the mixing
+    // cost; the Vita uses the hardware's own sample-and-hold instead (and keeps no FIR history).
+    const int fir = !HOST_VITA_AUDIO;
     s->timer += TIMER_STEP;
+    if (!fir && s->timer >= 0x10000) skip_ahead(ch, r, s);
     while (s->timer >= 0x10000) {
         s->timer = r->tmr + (s->timer - 0x10000);
         next_sample(ch);
         if (!(r->cnt & 0x80000000u)) break;
-        s->hist[s->hn++ & (FIR_HIST - 1)] = (s16)(s->cur < -0x8000 ? -0x8000 : s->cur > 0x7fff ? 0x7fff : s->cur);
+        if (fir) s->hist[s->hn++ & (FIR_HIST - 1)] = (s16)(s->cur < -0x8000 ? -0x8000 : s->cur > 0x7fff ? 0x7fff : s->cur);
     }
     u32 per = 0x10000u - r->tmr;
-    // Voices played faster than the output rate: the windowed-sinc FIR (cleaner than the DS) is most of the mixing
-    // cost; the Vita uses the hardware's own sample-and-hold instead.
-    const int fir = !HOST_VITA_AUDIO;
     s32 v = fir && per < TIMER_STEP && format_of(ch) != 3 ? filtered(s, r->tmr, per) : s->cur;
     return (v << kVolShift[r->cnt >> 8 & 3]) * (s32)(r->cnt & 0x7f);
 }
