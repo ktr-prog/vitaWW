@@ -117,58 +117,6 @@ static GLuint gc_shader(GLenum type, const char *src) {
     }
     return sh;
 }
-// A Cg program (GL_CG_* shaders), compiled on the first start only: the linked program is kept in ux0:data/vitaWW
-// (keyed by a hash of the sources) and loaded from there on later starts. 0 on failure (logged).
-GLuint vita_gl_cached_program(const char *vsSrc, const char *fsSrc, const char *tag) {
-    unsigned long long h = 1469598103934665603ull;
-    for (const char *q = vsSrc; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
-    for (const char *q = fsSrc; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
-    char path[128];
-    snprintf(path, sizeof path, "ux0:data/vitaWW/%s-%016llx.bin", tag, h);
-    GLuint prog = glCreateProgram();
-    FILE *cf = fopen(path, "rb");
-    if (cf) {
-        fseek(cf, 0, SEEK_END);
-        long len = ftell(cf);
-        fseek(cf, 0, SEEK_SET);
-        void *bin = len > 0 ? malloc((size_t)len) : NULL;
-        int ok = 0;
-        if (bin && fread(bin, 1, (size_t)len, cf) == (size_t)len) {
-            glProgramBinary(prog, 0, bin, (GLsizei)len);
-            GLint st = 0;
-            glGetProgramiv(prog, GL_LINK_STATUS, &st);
-            ok = st != 0;
-        }
-        free(bin);
-        fclose(cf);
-        if (ok) { fprintf(stderr, "vita_gl: %s shaders loaded from the cache\n", tag); return prog; }
-        glDeleteProgram(prog);
-        prog = glCreateProgram();
-    }
-    fprintf(stderr, "vita_gl: compiling %s shaders (first start only)\n", tag);
-    GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, vsSrc);
-    GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, fsSrc) : 0;
-    if (!vs || !fs) { fprintf(stderr, "vita_gl: %s shaders failed to compile\n", tag); return 0; }
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-    GLint st = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &st);
-    if (!st) { fprintf(stderr, "vita_gl: %s program failed to link\n", tag); return 0; }
-    GLint len = 0;
-    glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
-    void *bin = len > 0 ? malloc((size_t)len) : NULL;
-    if (bin) {
-        GLsizei got = 0;
-        GLenum fmt = 0;
-        glGetProgramBinary(prog, len, &got, &fmt, bin);
-        FILE *wf = got > 0 ? fopen(path, "wb") : NULL;
-        if (wf) { fwrite(bin, 1, (size_t)got, wf); fclose(wf); }
-        free(bin);
-    }
-    return prog;
-}
-
 int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
     sGcState = -1;

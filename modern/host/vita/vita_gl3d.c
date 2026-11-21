@@ -10,7 +10,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <stddef.h>
 #include <string.h>
 
 #include <vitaGL.h>
@@ -33,15 +32,15 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 
 // Timing split of g3w_render, reported on the "render thread split" line.
 extern uint64_t host_plat_time_ns(void);
-static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws;
+static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws, sStGlNs, sStResolveNs;
 unsigned long long vita_gl3d_stats(char *buf, int n) {
     unsigned long long c = sStCalls ? sStCalls : 1;
     extern unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;
     unsigned long long pc = gVitaPresents ? gVitaPresents : 1;
-    snprintf(buf, (size_t)n, "; 3d: draw submit %llu us (of which texture decode %llu us, %llu uploads/frame, %llu draws/frame); "
+    snprintf(buf, (size_t)n, "; 3d: draw submit %llu us (of which textures %llu us [decode %llu us, %llu uploads/frame], glDrawElements %llu us, %llu draws/frame); "
              "present: compose %llu us, swap %llu us",
-             sStSubmitNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
-    sStDraws = 0;
+             sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStGlNs / c / 1000, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
+    sStDraws = sStGlNs = sStResolveNs = 0;
     gVitaComposeNs = gVitaSwapNs = gVitaPresents = 0;
     sStReadNs = sStSubmitNs = sStTexNs = sStTexUploads = sStCalls = 0;
     return c;
@@ -236,55 +235,6 @@ static int cmp_tex(const void *a, const void *b) {
     return 0;
 }
 
-// ---- lean draw path: one small custom program + the frame's vertices and indices in two buffers ----------------
-// vitaGL's fixed-function pipeline does a lot of work per draw call (shader variant lookup, matrix uniforms,
-// copying the client arrays). Here the whole frame's vertices go to the GPU in one buffer upload, and each batch
-// is one indexed draw from it with a tiny shader: clip-space position as is, colour, texture coordinate scaled per
-// batch, texture modulate and the alpha test. Same output as the fixed-function draw.
-static const char kLeanVs[] =
-    "void main(float4 aPos, float4 aCol, float2 aUv, uniform float2 uUvScale,\n"
-    "          out float4 oPos : POSITION, out float4 oCol : TEXCOORD1, out float2 oUv : TEXCOORD0) {\n"
-    "  oPos = aPos; oCol = aCol; oUv = aUv * uUvScale;\n"
-    "}\n";
-static const char kLeanFs[] =
-    "float4 main(float4 vCol : TEXCOORD1, float2 vUv : TEXCOORD0, uniform sampler2D uTex, uniform float uTexOn,\n"
-    "            uniform float uAref) : COLOR {\n"
-    "  float4 c = vCol;\n"
-    "  if (uTexOn > 0.5) c = c * tex2D(uTex, vUv);\n"
-    "  if (c.a <= uAref) discard;\n"
-    "  return c;\n"
-    "}\n";
-extern GLuint vita_gl_cached_program(const char *vs, const char *fs, const char *tag);
-static GLuint sLeanProg, sLeanVbo, sLeanIbo;
-static GLint sLeanPos = -1, sLeanCol = -1, sLeanUv = -1, sLeanUvScale = -1, sLeanTexOn = -1, sLeanAref = -1;
-static int sLeanState;   // 0 untried, 1 ready, -1 unavailable (fixed-function path)
-static int lean_init(void) {
-    if (sLeanState) return sLeanState > 0;
-    sLeanState = -1;
-    sLeanProg = vita_gl_cached_program(kLeanVs, kLeanFs, "draw3d");
-    if (!sLeanProg) return 0;
-    sLeanPos = glGetAttribLocation(sLeanProg, "aPos");
-    sLeanCol = glGetAttribLocation(sLeanProg, "aCol");
-    sLeanUv = glGetAttribLocation(sLeanProg, "aUv");
-    sLeanUvScale = glGetUniformLocation(sLeanProg, "uUvScale");
-    sLeanTexOn = glGetUniformLocation(sLeanProg, "uTexOn");
-    sLeanAref = glGetUniformLocation(sLeanProg, "uAref");
-    if (sLeanPos < 0 || sLeanCol < 0 || sLeanUv < 0) {
-        fprintf(stderr, "vita_gl3d: lean draw path: attributes not found (%d %d %d)\n", (int)sLeanPos, (int)sLeanCol, (int)sLeanUv);
-        return 0;
-    }
-    glUseProgram(sLeanProg);
-    glUniform1i(glGetUniformLocation(sLeanProg, "uTex"), 0);
-    glUseProgram(0);
-    glGenBuffers(1, &sLeanVbo);
-    glGenBuffers(1, &sLeanIbo);
-    sLeanState = 1;
-    fprintf(stderr, "vita_gl3d: lean draw path on (custom shader, one vertex buffer per frame)\n");
-    return 1;
-}
-typedef struct { float p[4]; u8 c[4]; s16 t[2]; } LeanVtx;   // 24 bytes
-typedef struct { GLuint tex; int blend; float su, sv; u32 v0, i0, ni; } LeanBatch;
-
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
@@ -394,7 +344,9 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     GLuint curTex = 0;
 #define GL3D_FLUSH() do { \
         if (bi) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_UNSIGNED_BYTE, 0, bCol8); \
-            glTexCoordPointer(2, GL_FLOAT, 0, bUv); glDrawElements(GL_TRIANGLES, bi, GL_UNSIGNED_SHORT, bIdx); } \
+            glTexCoordPointer(2, GL_FLOAT, 0, bUv); \
+            uint64_t tg_ = host_plat_time_ns(); glDrawElements(GL_TRIANGLES, bi, GL_UNSIGNED_SHORT, bIdx); \
+            sStGlNs += host_plat_time_ns() - tg_; sStDraws++; } \
         bn = bi = 0; } while (0)
     // Render opaque polygons sorted by texture (same texture batches into one draw, cutting GXM texture-bind
     // flushes - the dominant 3D render cost when the scene interleaves many textures). Depth test resolves the
@@ -419,101 +371,12 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // rebinds GL_TEXTURE_2D; doing that inside the draw loop made the batch still pending for the previous
     // texture draw with the newly uploaded one (wrong textures for a frame whenever a texture was uploaded).
     static GLuint sPolyTex[8192];
+    uint64_t tRes = host_plat_time_ns();
     for (int oi = 0; oi < nOrd; oi++) {
         const G3Polygon *p = r->poly[sOrder[oi]];
         sPolyTex[oi] = tex_for(p->texparam, p->texpal);
     }
-    if (lean_init()) {
-        static LeanVtx lv[8192 * 4];
-        static u16 li[8192 * 6];
-        static LeanBatch lb[8192];
-        int nb = 0;
-        u32 nv = 0, ni = 0;
-        LeanBatch *cur = NULL;
-        for (int oi = 0; oi < nOrd; oi++) {
-            const G3Polygon *p = r->poly[sOrder[oi]];
-            if (p->nv < 3) continue;
-            GLuint tex = sPolyTex[oi];
-            int blend = p->translucent ? 1 : 0;
-            if (!cur || tex != cur->tex || blend != cur->blend || nv - cur->v0 + p->nv > 0xC000) {
-                int tw = 8 << (p->texparam >> 20 & 7), th = 8 << (p->texparam >> 23 & 7);
-                cur = &lb[nb++];
-                cur->tex = tex; cur->blend = blend; cur->su = 1.0f / (16.0f * tw); cur->sv = 1.0f / (16.0f * th);
-                cur->v0 = nv; cur->i0 = ni; cur->ni = 0;
-            }
-            const u8 a8 = p->translucent ? (u8)(((p->attr >> 16 & 31) * 255 + 15) / 31) : 255;
-            u32 base = nv - cur->v0;
-            for (int i = 0; i < p->nv; i++) {
-                const G3VHot *v = p->hv[0] ? p->hv[i] : (const G3VHot *)0;
-                G3VHot tmp;
-                if (!v) {
-                    const G3Vertex *f = p->v[i];
-                    memcpy(tmp.pos, f->pos, sizeof tmp.pos); memcpy(tmp.color, f->color, sizeof tmp.color);
-                    memcpy(tmp.tex, f->tex, sizeof tmp.tex);
-                    v = &tmp;
-                }
-                LeanVtx *o = &lv[nv + i];
-                o->p[0] = (float)v->pos[0]; o->p[1] = (float)v->pos[1]; o->p[2] = (float)v->pos[2]; o->p[3] = (float)v->pos[3];
-                o->c[0] = sCol8[(v->color[0] >> 3) & 63]; o->c[1] = sCol8[(v->color[1] >> 3) & 63];
-                o->c[2] = sCol8[(v->color[2] >> 3) & 63]; o->c[3] = a8;
-                o->t[0] = v->tex[0]; o->t[1] = v->tex[1];
-            }
-            for (int i = 1; i + 1 < p->nv; i++) { li[ni++] = (u16)base; li[ni++] = (u16)(base + i); li[ni++] = (u16)(base + i + 1); }
-            cur->ni += (u32)(p->nv - 2) * 3;
-            nv += (u32)p->nv;
-        }
-        glDisable(GL_ALPHA_TEST);   // (the shader does it)
-        glDisableClientState(GL_VERTEX_ARRAY);
-        glDisableClientState(GL_COLOR_ARRAY);
-        glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-        if (nb) {
-            glUseProgram(sLeanProg);
-            glUniform1f(sLeanAref, aref);
-            glBindBuffer(GL_ARRAY_BUFFER, sLeanVbo);
-            glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(nv * sizeof(LeanVtx)), lv, GL_STREAM_DRAW);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sLeanIbo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(ni * sizeof(u16)), li, GL_STREAM_DRAW);
-            glEnableVertexAttribArray((GLuint)sLeanPos);
-            glEnableVertexAttribArray((GLuint)sLeanCol);
-            glEnableVertexAttribArray((GLuint)sLeanUv);
-            glActiveTexture(GL_TEXTURE0);
-            int curBlendL = -1;
-            GLuint curTexL = (GLuint)-1;
-            for (int b = 0; b < nb; b++) {
-                const LeanBatch *bt = &lb[b];
-                if (!bt->ni) continue;
-                if (bt->tex != curTexL) {
-                    if (bt->tex) glBindTexture(GL_TEXTURE_2D, bt->tex);
-                    glUniform1f(sLeanTexOn, bt->tex ? 1.0f : 0.0f);
-                    curTexL = bt->tex;
-                }
-                if (bt->blend != curBlendL) {
-                    if (bt->blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
-                    else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
-                    curBlendL = bt->blend;
-                }
-                glUniform2f(sLeanUvScale, bt->su, bt->sv);
-                const uintptr_t vo = (uintptr_t)bt->v0 * sizeof(LeanVtx);
-                glVertexAttribPointer((GLuint)sLeanPos, 4, GL_FLOAT, GL_FALSE, sizeof(LeanVtx), (const void *)(vo + offsetof(LeanVtx, p)));
-                glVertexAttribPointer((GLuint)sLeanCol, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(LeanVtx), (const void *)(vo + offsetof(LeanVtx, c)));
-                glVertexAttribPointer((GLuint)sLeanUv, 2, GL_SHORT, GL_FALSE, sizeof(LeanVtx), (const void *)(vo + offsetof(LeanVtx, t)));
-                glDrawElements(GL_TRIANGLES, (GLsizei)bt->ni, GL_UNSIGNED_SHORT, (const void *)((uintptr_t)bt->i0 * sizeof(u16)));
-            }
-            glDisableVertexAttribArray((GLuint)sLeanPos);
-            glDisableVertexAttribArray((GLuint)sLeanCol);
-            glDisableVertexAttribArray((GLuint)sLeanUv);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-            glUseProgram(0);
-        }
-        glDisable(GL_BLEND);
-        glDepthMask(GL_TRUE);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        sPrevDraw = draw;
-        sStDraws += (unsigned long long)nb;
-        sStSubmitNs += host_plat_time_ns() - tRead;
-        return;
-    }
+    sStResolveNs += host_plat_time_ns() - tRes;
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
         const G3Polygon *p = r->poly[k];
