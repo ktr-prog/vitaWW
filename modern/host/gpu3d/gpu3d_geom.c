@@ -263,6 +263,19 @@ static void mtx_identity(Mtx *a) {
 }
 static void mtx_mult(Mtx *cur, const Mtx *a) {
     Mtx r;
+    if (a->m[3] == 0 && a->m[7] == 0 && a->m[11] == 0 && a->m[15] == 0x1000) {
+        // a is affine (MTX_MULT_4x3/3x3, a 4x3 position matrix): the same sums without the zero terms, and the
+        // 0x1000 * cur[3][j] term of the last row exactly as a shift.
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++) {
+                s64 s = (s64)a->m[i * 4] * cur->m[j] + (s64)a->m[i * 4 + 1] * cur->m[4 + j] +
+                        (s64)a->m[i * 4 + 2] * cur->m[8 + j];
+                if (i == 3) s += (s64)cur->m[12 + j] * 0x1000;
+                r.m[i * 4 + j] = (s32)(s >> 12);
+            }
+        *cur = r;
+        return;
+    }
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             s64 s = 0;
@@ -1430,12 +1443,15 @@ static void *mt_worker(void *arg) {
                 for (u32 i = 0; i < n; i++) tmp[i] = sMtQ[(r + 1 + i) & MTQ_M];
                 p = tmp;
             }
-            if (c == 0xf5) {   // a packed group of pass-through commands: the FIFO header word, then the parameters
-                const u32 *pp = p + 1;
-                for (u32 hdr = p[0]; hdr; hdr >>= 8) {
-                    u32 sc = hdr & 0xff;
-                    w_cmd(sc, pp);
-                    pp += kParams[sc];
+            if (c == 0xf5) {   // packed groups of pass-through commands: each FIFO header word, then its parameters
+                const u32 *pp = p, *end = p + n;
+                while (pp < end) {
+                    u32 hdr = *pp++;
+                    for (; hdr; hdr >>= 8) {
+                        u32 sc = hdr & 0xff;
+                        w_cmd(sc, pp);
+                        pp += kParams[sc];
+                    }
                 }
                 r += 1 + n;
                 park = sFlushPending;
@@ -1943,6 +1959,24 @@ static void mt_snapshots(void) {
     if (sMtTexDirty) { mt_push(0xf2, (const u32 *)sTex.m, 16); sMtTexDirty = 0; }
 }
 static inline int fast_pass(u8 c) { return (c >= 0x20 && c <= 0x2b) || (c >= 0x30 && c <= 0x34) || c == 0x40 || c == 0x60; }
+// A packed header word whose commands are all pass-through (END_VTXS included): the number of parameter words that
+// follow it, else -1. Headers repeat (a model's vertex groups), so answers are kept in a small table. Game thread only.
+static inline int group_pass_tot(u32 h) {
+    static struct { u32 h; int t; } memo[256];   // direct-mapped; h = 0 never asked (a zero header is a NOP word)
+    u32 slot = (h * 2654435761u) >> 24;
+    if (memo[slot].h == h) return memo[slot].t;
+    int tot = 0;
+    for (u32 x = h; x; x >>= 8) {
+        u8 c = x & 0xff;
+        u32 k = kParams[c];
+        if (!(k ? fast_pass(c) : c == 0x41)) { tot = -1; break; }
+        tot += (int)k;
+    }
+    memo[slot].h = h;
+    memo[slot].t = tot;
+    return tot;
+}
+enum { MT_REC_MAX = 192 };   // longest 0xf5 record (the worker's wrap-around buffer)
 static void fifo_block_mt(const u32 *src, u32 n) {
     u32 i = 0;
     while (i < n) {
@@ -1960,29 +1994,34 @@ static void fifo_block_mt(const u32 *src, u32 n) {
                 // and the ring has room: the same records as one command at a time, without the per-word steps.
                 // END_VTXS (no parameters) is a pass-through record too. Matrix snapshots that are due go first.
                 if (!sMtSkip && strMode == 0 && execCmd < 0) {
-                    u32 tot = 0, h = v;
-                    int ok = 1;
-                    for (; h; h >>= 8) {
-                        u8 c = h & 0xff;
-                        u32 k = kParams[c];
-                        if (!(k ? fast_pass(c) : c == 0x41)) { ok = 0; break; }
-                        tot += k;
-                    }
-                    if (ok && i + 1 + tot <= n && blocked) {
+                    int t = group_pass_tot(v);
+                    int ok = t >= 0 && i + 1 + (u32)t <= n;
+                    if (ok && blocked) {
                         sMtWLocal = w;
                         mt_snapshots();
                         w = sMtWLocal;
                         blocked = sMtCvDirty | sMtTexDirty | sMtSkip;
                         if (blocked) ok = 0;
                     }
-                    if (ok && i + 1 + tot <= n && w - rseen + tot + 2 <= MTQ_N) {
-                        // One record for the group: 0xf5, the header word and the parameters as they are.
-                        sMtQ[w++ & MTQ_M] = 0xf5 | (tot + 1) << 8;
+                    if (ok && w - rseen + (u32)t + 2 <= MTQ_N) {
+                        // One record for this group and the pass-through groups right after it in the block: 0xf5,
+                        // then the header words and parameters as they are (one copy; the worker walks the groups).
+                        u32 j = i + 1 + (u32)t;
+                        while (j < n) {
+                            u32 h2 = src[j];
+                            if (!h2) break;
+                            int t2 = group_pass_tot(h2);
+                            if (t2 < 0 || j + 1 + (u32)t2 > n || j - i + 1 + (u32)t2 > MT_REC_MAX ||
+                                w - rseen + (j - i) + 2 + (u32)t2 > MTQ_N) break;
+                            j += 1 + (u32)t2;
+                        }
+                        u32 len = j - i;
+                        sMtQ[w++ & MTQ_M] = 0xf5 | len << 8;
                         u32 wi = w & MTQ_M;
-                        if (wi + tot + 1 <= MTQ_N) memcpy(&sMtQ[wi], src + i, (tot + 1) * sizeof(u32));
-                        else for (u32 j = 0; j <= tot; j++) sMtQ[(w + j) & MTQ_M] = src[i + j];
-                        w += tot + 1;
-                        i += tot;
+                        if (wi + len <= MTQ_N) memcpy(&sMtQ[wi], src + i, len * sizeof(u32));
+                        else for (u32 k = 0; k < len; k++) sMtQ[(w + k) & MTQ_M] = src[i + k];
+                        w += len;
+                        i = j - 1;
                         left = 0;
                         sMtWDone = w;
                         if (w - sMtW >= MTQ_BATCH) mt_publish_w(w);

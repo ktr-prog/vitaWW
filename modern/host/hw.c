@@ -589,7 +589,7 @@ static void gx_send_op_body(unsigned int op, const unsigned int *args, unsigned 
     u32 buf[64];
     if (num < 64) {
         buf[0] = op;
-        for (unsigned i = 0; i < num; i++) buf[1 + i] = args[i];
+        memcpy(buf + 1, args, num * sizeof(u32));
         gpu3d_write_block(0x04000400, buf, num + 1);
     } else {
         gpu3d_write_block(0x04000400, &op, 1);
