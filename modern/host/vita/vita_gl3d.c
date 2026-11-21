@@ -32,15 +32,15 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 
 // Timing split of g3w_render, reported on the "render thread split" line.
 extern uint64_t host_plat_time_ns(void);
-static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws, sStGlNs, sStResolveNs;
+static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws, sStGlNs, sStResolveNs, sStSyncNs;
 unsigned long long vita_gl3d_stats(char *buf, int n) {
     unsigned long long c = sStCalls ? sStCalls : 1;
     extern unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;
     unsigned long long pc = gVitaPresents ? gVitaPresents : 1;
-    snprintf(buf, (size_t)n, "; 3d: draw submit %llu us (of which textures %llu us [decode %llu us, %llu uploads/frame], glDrawElements %llu us, %llu draws/frame); "
+    snprintf(buf, (size_t)n, "; 3d: texture sync %llu us, draw submit %llu us (of which textures %llu us [decode %llu us, %llu uploads/frame], glDrawElements %llu us, %llu draws/frame); "
              "present: compose %llu us, swap %llu us",
-             sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStGlNs / c / 1000, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
-    sStDraws = sStGlNs = sStResolveNs = 0;
+             sStSyncNs / c / 1000, sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStGlNs / c / 1000, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
+    sStDraws = sStGlNs = sStResolveNs = sStSyncNs = 0;
     gVitaComposeNs = gVitaSwapNs = gVitaPresents = 0;
     sStReadNs = sStSubmitNs = sStTexNs = sStTexUploads = sStCalls = 0;
     return c;
@@ -226,31 +226,44 @@ unsigned vita_gl3d_frame_tex(void) { return sReady && sPrevDraw >= 0 ? sColorTex
 
 #define BATCH_V 0xC000  // vertices per draw: vitaGL's glDrawArrays index limit (MAX_IDX_NUMBER)
 
-static const G3RenderState *sSortR;
-static int cmp_tex(const void *a, const void *b) {
-    const G3Polygon *pa = sSortR->poly[*(const int *)a], *pb = sSortR->poly[*(const int *)b];
-    uint64_t ka = (uint64_t)pa->texparam << 32 | pa->texpal;
-    uint64_t kb = (uint64_t)pb->texparam << 32 | pb->texpal;
-    if (ka != kb) return ka < kb ? -1 : 1;
-    return 0;
-}
-
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
-    {   // lazy texture setup: sync the VRAM ranges of every texture drawn this frame (sets the change flags)
-        uint32_t lastTp = 0, lastPal = 0;
-        int have = 0;
-        for (int k = 0; k < r->npoly; k++) {
-            const G3Polygon *p = r->poly[k];
-            if (p->nv < 3 || !(p->texparam >> 26 & 7)) continue;
-            if (have && p->texparam == lastTp && p->texpal == lastPal) continue;
-            gpu3d_tex_sync_for(p->texparam, p->texpal);
-            lastTp = p->texparam; lastPal = p->texpal; have = 1;
+    uint64_t tSync = host_plat_time_ns();
+    // Group the polygons by texture once (a hash of texparam/texpal, O(n)): each distinct texture is synced,
+    // resolved and bound once per frame, and the opaque polygons are drawn group by group (in the order each
+    // texture first appears) - no qsort with a pointer-chasing comparator, no per-polygon cache lookup.
+    enum { GH = 16384 };   // > MAX_POLYGONS: the table never fills
+    static uint64_t gKey[GH];
+    static uint32_t gStamp[GH], sGStamp;
+    static int gId[GH];
+    static uint64_t grpKey[MAX_POLYGONS];
+    static int grpCount[MAX_POLYGONS], grpPos[MAX_POLYGONS];
+    static GLuint grpTex[MAX_POLYGONS];
+    static int sPolyGrp[MAX_POLYGONS];
+    int ngrp = 0;
+    sGStamp++;
+    if (!sGStamp) { memset(gStamp, 0, sizeof gStamp); sGStamp = 1; }
+    for (int k = 0; k < r->npoly; k++) {
+        const G3Polygon *p = r->poly[k];
+        if (p->nv < 3) { sPolyGrp[k] = -1; continue; }
+        uint64_t key = (p->texparam >> 26 & 7) ? ((uint64_t)p->texparam << 32 | p->texpal) : 0;
+        uint32_t h = (uint32_t)(key ^ key >> 29 ^ key >> 47) * 0x9e3779b1u >> 18;
+        while (gStamp[h] == sGStamp && gKey[h] != key) h = (h + 1) & (GH - 1);
+        if (gStamp[h] != sGStamp) {
+            gStamp[h] = sGStamp; gKey[h] = key; gId[h] = ngrp;
+            grpKey[ngrp] = key; grpCount[ngrp] = 0; ngrp++;
         }
+        int g = gId[h];
+        sPolyGrp[k] = g;
+        if (!p->translucent) grpCount[g]++;
     }
+    // lazy texture setup: sync the VRAM ranges of every texture drawn this frame (sets the change flags)
+    for (int g = 0; g < ngrp; g++)
+        if (grpKey[g]) gpu3d_tex_sync_for((uint32_t)(grpKey[g] >> 32), (uint32_t)grpKey[g]);
     tex_frame_begin(img, pal);   // re-decode only textures whose VRAM changed since last frame
     uint64_t tStart = host_plat_time_ns();
+    sStSyncNs += tStart - tSync;
     sStCalls++;
 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
@@ -351,37 +364,23 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // Render opaque polygons sorted by texture (same texture batches into one draw, cutting GXM texture-bind
     // flushes - the dominant 3D render cost when the scene interleaves many textures). Depth test resolves the
     // opaque image regardless of draw order. Translucent polygons follow in submission order (order matters).
-    static int sOrder[8192];
+    static int sOrder[MAX_POLYGONS];
     int nOrd = 0;
-    for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && !r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
-    sSortR = r;
-    if (nOrd > 1) {
-        int sorted = 1;
-        uint64_t prev = ((uint64_t)r->poly[sOrder[0]]->texparam << 32) | r->poly[sOrder[0]]->texpal;
-        for (int i = 1; i < nOrd; i++) {
-            const G3Polygon *p = r->poly[sOrder[i]];
-            uint64_t key = ((uint64_t)p->texparam << 32) | p->texpal;
-            if (key < prev) { sorted = 0; break; }
-            prev = key;
-        }
-        if (!sorted) qsort(sOrder, nOrd, sizeof sOrder[0], cmp_tex);
-    }
-    for (int k = 0; k < r->npoly; k++) if (r->poly[k]->nv >= 3 && r->poly[k]->translucent && nOrd < 8192) sOrder[nOrd++] = k;
-    // Resolve every polygon's texture before drawing anything. A cache miss or refresh uploads a texture, which
-    // rebinds GL_TEXTURE_2D; doing that inside the draw loop made the batch still pending for the previous
-    // texture draw with the newly uploaded one (wrong textures for a frame whenever a texture was uploaded).
-    static GLuint sPolyTex[8192];
+    for (int g = 0; g < ngrp; g++) { grpPos[g] = nOrd; nOrd += grpCount[g]; }
+    for (int k = 0; k < r->npoly; k++)
+        if (sPolyGrp[k] >= 0 && !r->poly[k]->translucent) sOrder[grpPos[sPolyGrp[k]]++] = k;
+    for (int k = 0; k < r->npoly; k++)
+        if (sPolyGrp[k] >= 0 && r->poly[k]->translucent) sOrder[nOrd++] = k;
+    // Resolve every texture before drawing anything. A cache miss or refresh uploads a texture, which rebinds
+    // GL_TEXTURE_2D; doing that inside the draw loop made the batch still pending for the previous texture draw
+    // with the newly uploaded one (wrong textures for a frame whenever a texture was uploaded).
     uint64_t tRes = host_plat_time_ns();
-    for (int oi = 0; oi < nOrd; oi++) {
-        const G3Polygon *p = r->poly[sOrder[oi]];
-        sPolyTex[oi] = tex_for(p->texparam, p->texpal);
-    }
+    for (int g = 0; g < ngrp; g++) grpTex[g] = tex_for((uint32_t)(grpKey[g] >> 32), (uint32_t)grpKey[g]);
     sStResolveNs += host_plat_time_ns() - tRes;
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
         const G3Polygon *p = r->poly[k];
-        if (p->nv < 3) continue;
-        GLuint tex = sPolyTex[oi];
+        GLuint tex = grpTex[sPolyGrp[k]];
         int blend = p->translucent ? 1 : 0;
         int full = bn + p->nv > BATCH_V || bi + (p->nv - 2) * 3 > BATCH_V * 3;
         if (!haveState || tex != curTex || blend != curBlend || full) {

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/reent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -66,12 +67,80 @@ static int find_rom(char *out, size_t cap) {
     return 1;
 }
 
+// The log must never stall a frame: writing to ux0 takes milliseconds, and the game and render threads print
+// a report every 60 frames. stderr stays a newlib FILE opened on the log file (freopen keeps the one shared
+// FILE object every thread prints to), but its low-level write hook is replaced: lines are copied into a
+// memory ring, and a low-priority thread writes the ring to the file a few times a second. If the ring is
+// full (only possible if the card stalls for seconds), lines are dropped and the count is logged.
+#define LOG_RING (1 << 17)
+static char sLogRing[LOG_RING];
+static unsigned sLogHead, sLogTail, sLogDropped;   // head: write position, tail: drained up to (both wrap)
+static SDL_SpinLock sLogLock, sLogDrainLock;   // drain lock: the writer thread vs the exit flush
+static int sLogFd = -1;
+
+static _READ_WRITE_RETURN_TYPE log_ring_write(struct _reent *r, void *cookie, const char *buf,
+                                              _READ_WRITE_BUFSIZE_TYPE n) {
+    (void)r; (void)cookie;
+    SDL_AtomicLock(&sLogLock);
+    unsigned room = LOG_RING - (sLogHead - sLogTail);
+    if ((unsigned)n > room) sLogDropped++;
+    else {
+        unsigned at = sLogHead & (LOG_RING - 1), first = (unsigned)n < LOG_RING - at ? (unsigned)n : LOG_RING - at;
+        memcpy(sLogRing + at, buf, first);
+        memcpy(sLogRing, buf + first, (unsigned)n - first);
+        sLogHead += (unsigned)n;
+    }
+    SDL_AtomicUnlock(&sLogLock);
+    return n;
+}
+
+// The writer reads [tail, head) straight out of the ring; producers never touch that range (they only fill the
+// room before tail), so the lock is held just to read head and to advance tail - a writer preempted mid-write
+// never blocks a game thread for longer than one line copy.
+static void log_drain(void) {
+    SDL_AtomicLock(&sLogDrainLock);
+    SDL_AtomicLock(&sLogLock);
+    unsigned h = sLogHead, t = sLogTail, dropped = sLogDropped;
+    sLogDropped = 0;
+    SDL_AtomicUnlock(&sLogLock);
+    unsigned n = h - t, at = t & (LOG_RING - 1), first = n < LOG_RING - at ? n : LOG_RING - at;
+    if (first) write(sLogFd, sLogRing + at, first);
+    if (n > first) write(sLogFd, sLogRing, n - first);
+    SDL_AtomicLock(&sLogLock);
+    sLogTail = h;
+    SDL_AtomicUnlock(&sLogLock);
+    if (dropped) {
+        char msg[64];
+        int m = snprintf(msg, sizeof msg, "vita: log ring full, %u lines dropped\n", dropped);
+        write(sLogFd, msg, (size_t)m);
+    }
+    SDL_AtomicUnlock(&sLogDrainLock);
+}
+static void log_final(void) { fflush(stderr); log_drain(); }
+
+static int log_writer(void *unused) {
+    (void)unused;
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    for (;;) {
+        SDL_Delay(200);
+        log_drain();
+    }
+    return 0;
+}
+
 static void open_log(void) {
     rename(DATA_DIR "/acww-log.txt", DATA_DIR "/acww-log-previous.txt");
     // (newlib on the Vita has no dup2: the game logs to stderr, so only stderr is redirected to the file)
     if (!freopen(DATA_DIR "/acww-log.txt", "w", stderr)) return;
-    setvbuf(stderr, NULL, _IONBF, 0);
     fprintf(stderr, "vita: vitaWW starting (build %s)\n", VITA_BUILD);
+    fflush(stderr);
+    sLogFd = stderr->_file;
+    static char lineBuf[1024];
+    setvbuf(stderr, lineBuf, _IOLBF, sizeof lineBuf);
+    stderr->_write = log_ring_write;
+    atexit(log_final);
+    SDL_Thread *t = SDL_CreateThread(log_writer, "log writer", NULL);
+    if (t) SDL_DetachThread(t);
 }
 
 static void ensure_readme(void) {
