@@ -1365,11 +1365,26 @@ static inline void mt_publish(void) {
     if (sMtW != sMtWDone) __atomic_store_n(&sMtW, sMtWDone, __ATOMIC_RELEASE);
 }
 extern volatile unsigned char gHostPhase;   // phase sampler (host.h): 6 = PH_WAIT
-static void mt_sync(void) {
+// Game-thread waits for the GX worker, by reason (0 box test, 1 RAM-count read, 2 vblank commit, 3 other), for
+// the "gx waits" log line.
+static unsigned long long sMtWaitNs[4], sMtWaitN[4], sBoxTests;
+static void mt_sync_r(int why) {
     unsigned char ph = gHostPhase;
     gHostPhase = 6;
+    uint64_t t0 = host_plat_time_ns();
     mt_sync_body();
+    sMtWaitNs[why] += host_plat_time_ns() - t0;
+    sMtWaitN[why]++;
     gHostPhase = ph;
+}
+static void mt_sync(void) { mt_sync_r(3); }
+void gpu3d_wait_stats(char *buf, int n, int frames) {
+    if (frames < 1) frames = 1;
+    snprintf(buf, (size_t)n, "gx waits (avg/frame): box tests %llu (waited %llu x, %llu us), ram-count reads %llu x %llu us, "
+             "commit %llu us, other %llu x %llu us", sBoxTests / frames, sMtWaitN[0] / frames, sMtWaitNs[0] / frames / 1000,
+             sMtWaitN[1] / frames, sMtWaitNs[1] / frames / 1000, sMtWaitNs[2] / frames / 1000, sMtWaitN[3] / frames,
+             sMtWaitNs[3] / frames / 1000);
+    memset(sMtWaitNs, 0, sizeof sMtWaitNs); memset(sMtWaitN, 0, sizeof sMtWaitN); sBoxTests = 0;
 }
 static void mt_sync_body(void) {
     int s = 0;
@@ -1413,7 +1428,7 @@ static void mt_dispatch(u8 c, const u32 *p, int n) {
     // BOX_TEST depends only on the clip matrix, which the game thread keeps current in command order: answer it
     // here without waiting for the worker to drain (the game issues one per model for culling; each wait used to
     // serialise the game thread behind all queued geometry).
-    if (c == 0x70) { static int syncBox = -1; if (syncBox < 0) syncBox = getenv("ACWW_BOXSYNC") && atoi(getenv("ACWW_BOXSYNC")); if (syncBox) mt_sync(); box_test(p); return; }
+    if (c == 0x70) { static int syncBox = -1; if (syncBox < 0) syncBox = getenv("ACWW_BOXSYNC") && atoi(getenv("ACWW_BOXSYNC")); sBoxTests++; if (syncBox) mt_sync_r(0); box_test(p); return; }
     if (c == 0x72) { vec_test(p[0]); return; }
     if (!is_command(c)) return;
     if (sMtSkip && c >= 0x23 && c <= 0x28) return;
@@ -1737,7 +1752,7 @@ void gpu3d_write_block(uint32_t addr, const uint32_t *src, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) gpu3d_write32(addr, src[i]);
 }
 uint32_t gpu3d_read32(uint32_t addr) {
-    if (sMT) { if (addr == 0x04000604) mt_sync(); }
+    if (sMT) { if (addr == 0x04000604) mt_sync_r(1); }
     else drain();
     if (addr == 0x04000600) return gxstat();
     if (addr == 0x04000604) { g3_feature(F_READ_RAMCOUNT); return (u32)sNumPolys | (u32)sNumVerts << 16; }
@@ -1783,7 +1798,7 @@ void gpu3d_commit(const uint8_t *const bank[9]) {
         // if the worker has a finished frame parked, otherwise keep showing the previous one (frameskip above
         // keeps the backlog bounded).
         mt_publish();
-        if (!sMtAsync) mt_sync();
+        if (!sMtAsync) mt_sync_r(2);
         if (__atomic_load_n(&sMtParked, __ATOMIC_ACQUIRE)) {
             do_swap();
             sMtSwapsDone++;

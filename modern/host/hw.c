@@ -309,6 +309,12 @@ static void run_events_body(void) {
                         " | %llu gx writes, %llu mmio accesses\n",
                         (unsigned long long)(sCpuNs / 60000), (unsigned long long)(sRenderNs / 60000),
                         (unsigned long long)(sPresentNs / 60000), gpu3d_mt_busy_ns() / 60000, gx, io);
+                {
+                    extern void gpu3d_wait_stats(char *buf, int n, int frames);
+                    char wb[256];
+                    gpu3d_wait_stats(wb, sizeof wb, 60);
+                    fprintf(stderr, "%s\n", wb);
+                }
                 sCpuNs = sRenderNs = sPresentNs = 0; sBreakN = 0;
             }
         }
