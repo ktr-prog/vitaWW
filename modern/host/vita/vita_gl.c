@@ -93,6 +93,7 @@ static void ensure_tex(int w, int h, const void *pixels) {
 
 // Blit the canvas texture (sTex, via sFbo) to the whole screen, and flip.
 static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh);
+static void present_swap(void);
 
 // ---- GPU compose -------------------------------------------------------------------------------------------------
 // The 2D bands hand over the frame's layers (gpu2d.h Gpu2dGc) and the GPU composes them with the 3D colour buffer
@@ -106,6 +107,8 @@ static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
 enum { GC_W = 341, GC_TEX_W = 352 };
 static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1;
+static GLuint sBlitProg;   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
+static GLint sBlitPos = -1, sBlitTex = -1;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -122,19 +125,16 @@ static GLuint gc_shader(GLenum type, const char *src) {
     }
     return sh;
 }
-int vita_gl_gc_init(void) {
-    if (sGcState) return sGcState > 0;
-    sGcState = -1;
-    if (!sReady) return 0;
-    // Cg sources compiled as is (GL_CG_*: not through vitaGL's GLSL translator). Compiling takes seconds on the
-    // Vita, so the linked program is kept in ux0:data/vitaWW (keyed by a hash of the sources) and loaded from there
-    // on later starts. Each step is logged, so a failure on a device shows where it happened.
+// A Cg program, compiled once: the linked binary is kept in ux0:data/vitaWW (keyed by a hash of the sources) and
+// loaded from there on later starts (compiling takes seconds on the Vita). 0 on failure.
+static GLuint cached_program(const char *vsrc, const char *fsrc, const char *name) {
+    GLuint prog;
     unsigned long long h = 1469598103934665603ull;
-    for (const char *q = kGcVertexShaderCg; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
-    for (const char *q = kGcFragmentShaderCg; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
-    char cachePath[96];
-    snprintf(cachePath, sizeof cachePath, "ux0:data/vitaWW/compose-%016llx.bin", h);
-    sGcProg = glCreateProgram();
+    for (const char *q = vsrc; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
+    for (const char *q = fsrc; *q; q++) { h ^= (unsigned char)*q; h *= 1099511628211ull; }
+    char cachePath[128];
+    snprintf(cachePath, sizeof cachePath, "ux0:data/vitaWW/%s-%016llx.bin", name, h);
+    prog = glCreateProgram();
     int fromCache = 0;
     FILE *cf = fopen(cachePath, "rb");
     if (cf) {
@@ -143,40 +143,51 @@ int vita_gl_gc_init(void) {
         fseek(cf, 0, SEEK_SET);
         void *bin = len > 0 ? malloc((size_t)len) : NULL;
         if (bin && fread(bin, 1, (size_t)len, cf) == (size_t)len) {
-            glProgramBinary(sGcProg, 0, bin, (GLsizei)len);
+            glProgramBinary(prog, 0, bin, (GLsizei)len);
             GLint ok = 0;
-            glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
+            glGetProgramiv(prog, GL_LINK_STATUS, &ok);
             fromCache = ok != 0;
         }
         free(bin);
         fclose(cf);
-        fprintf(stderr, "vita_gl: GPU compose: shaders %s the cache\n", fromCache ? "loaded from" : "could not be loaded from");
-        if (!fromCache) { glDeleteProgram(sGcProg); sGcProg = glCreateProgram(); }
+        fprintf(stderr, "vita_gl: %s shaders %s the cache\n", name, fromCache ? "loaded from" : "could not be loaded from");
+        if (!fromCache) { glDeleteProgram(prog); prog = glCreateProgram(); }
     }
     if (!fromCache) {
-        fprintf(stderr, "vita_gl: GPU compose: compiling shaders (first start only)\n");
-        GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, kGcVertexShaderCg);
-        GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, kGcFragmentShaderCg) : 0;
+        fprintf(stderr, "vita_gl: %s shaders: compiling (first start only)\n", name);
+        GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, vsrc);
+        GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, fsrc) : 0;
         if (!vs || !fs) return 0;
-        fprintf(stderr, "vita_gl: GPU compose: linking\n");
-        glAttachShader(sGcProg, vs);
-        glAttachShader(sGcProg, fs);
-        glLinkProgram(sGcProg);
+        fprintf(stderr, "vita_gl: %s shaders: linking\n", name);
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glLinkProgram(prog);
         GLint ok = 0;
-        glGetProgramiv(sGcProg, GL_LINK_STATUS, &ok);
-        if (!ok) { fprintf(stderr, "vita_gl: compose program failed to link\n"); return 0; }
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) { fprintf(stderr, "vita_gl: %s program failed to link\n", name); return 0; }
         GLint len = 0;
-        glGetProgramiv(sGcProg, GL_PROGRAM_BINARY_LENGTH, &len);
+        glGetProgramiv(prog, GL_PROGRAM_BINARY_LENGTH, &len);
         void *bin = len > 0 ? malloc((size_t)len) : NULL;
         if (bin) {
             GLsizei got = 0;
             GLenum fmt = 0;
-            glGetProgramBinary(sGcProg, len, &got, &fmt, bin);
+            glGetProgramBinary(prog, len, &got, &fmt, bin);
             FILE *wf = got > 0 ? fopen(cachePath, "wb") : NULL;
             if (wf) { fwrite(bin, 1, (size_t)got, wf); fclose(wf); }
             free(bin);
         }
     }
+    return prog;
+}
+int vita_gl_gc_init(void) {
+    if (sGcState) return sGcState > 0;
+    sGcState = -1;
+    if (!sReady) return 0;
+    // Cg sources compiled as is (GL_CG_*: not through vitaGL's GLSL translator). Compiling takes seconds on the
+    // Vita, so the linked program is kept in ux0:data/vitaWW (keyed by a hash of the sources) and loaded from there
+    // on later starts. Each step is logged, so a failure on a device shows where it happened.
+    sGcProg = cached_program(kGcVertexShaderCg, kGcFragmentShaderCg, "compose");
+    if (!sGcProg) return 0;
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
     fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
     if (sGcAttr < 0) return 0;
@@ -184,6 +195,8 @@ int vita_gl_gc_init(void) {
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     glUseProgram(sGcProg);
     glUniform1f(glGetUniformLocation(sGcProg, "uW"), (float)GC_W);
+    glUniform1f(glGetUniformLocation(sGcProg, "u3dCols"), (float)GC_W);   // the 3D is drawn GC_W wide (vita_gl3d.c)
+    glUniform1f(glGetUniformLocation(sGcProg, "u3dTexW"), 352.0f);
     static const char *const kNames[10] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d", "uLogo"};
     for (int i = 0; i < 10; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
     sGcLogoOn = glGetUniformLocation(sGcProg, "uLogoOn");
@@ -307,7 +320,40 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glUseProgram(0);
     glDepthMask(GL_TRUE);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
-    blit_canvas(sGcFbo, 0, 0, GC_W, 192);
+    if (!sBlitProg) {
+        sBlitProg = cached_program(kBlitVertexShaderCg, kBlitFragmentShaderCg, "blit");
+        if (sBlitProg) {
+            sBlitPos = glGetAttribLocation(sBlitProg, "aPos");
+            sBlitTex = glGetAttribLocation(sBlitProg, "aTex");
+            glUseProgram(sBlitProg);
+            glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
+            glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
+                        (float)SCREEN_H / 192.0f);
+            glUseProgram(0);
+            if (sBlitPos < 0 || sBlitTex < 0) sBlitProg = 0;
+            fprintf(stderr, "vita_gl: sharp-bilinear present %s\n", sBlitProg ? "on" : "unavailable (linear blit)");
+        }
+        if (!sBlitProg) sBlitProg = (GLuint)-1;
+    }
+    if (sBlitProg != (GLuint)-1) {
+        // The canvas (GC_W of its GC_TEX_W columns; row 0 = DS line 0 at the top) across the whole screen.
+        static const float kPos[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+        static const float kTex[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glUseProgram(sBlitProg);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, sGcCanvas);
+        glEnableVertexAttribArray((GLuint)sBlitPos);
+        glEnableVertexAttribArray((GLuint)sBlitTex);
+        glVertexAttribPointer((GLuint)sBlitPos, 2, GL_FLOAT, GL_FALSE, 0, kPos);
+        glVertexAttribPointer((GLuint)sBlitTex, 2, GL_FLOAT, GL_FALSE, 0, kTex);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray((GLuint)sBlitPos);
+        glDisableVertexAttribArray((GLuint)sBlitTex);
+        glUseProgram(0);
+        present_swap();
+    } else
+        blit_canvas(sGcFbo, 0, 0, GC_W, 192);
     if (first) { first = 0; fprintf(stderr, "vita_gl: GPU compose: first frame presented\n"); }
 }
 
@@ -334,10 +380,13 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
                       dx, dy, dx + dw, dy + dh,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
+    present_swap();
+}
+static void present_swap(void) {
     uint64_t ts = host_plat_time_ns();
     vglSwapBuffers(GL_FALSE);
     gVitaSwapNs += host_plat_time_ns() - ts;
-    { extern unsigned long long gVitaFrameSwapNs; gVitaFrameSwapNs = host_plat_time_ns() - ts; }
+    gVitaFrameSwapNs = host_plat_time_ns() - ts;
     gVitaPresents++;
 }
 

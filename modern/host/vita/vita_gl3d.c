@@ -24,6 +24,10 @@
 
 #define VW 256
 #define VH 192
+// The colour buffers are 352 wide: with the GPU compose (16:9) the 3D is drawn 341 columns wide (vita_gl.c GC_W) -
+// one 3D pixel per screen column of the canvas, not 256 stretched; the readback path (no GPU compose) uses 256.
+#define FBO_W 352
+#define WIDE_W 341
 
 static int sEnabled;     // g3w_init called (gpu3d_use_wgpu succeeded)
 static int sReady;       // GL objects created (lazy, after the vitaGL context is up)
@@ -203,11 +207,11 @@ static void lazy_init(void) {
     glGenRenderbuffers(2, sDepthRb);
     for (int i = 0; i < 2; i++) {
         glBindTexture(GL_TEXTURE_2D, sColorTex[i]);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, VW, VH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FBO_W, VH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glBindRenderbuffer(GL_RENDERBUFFER, sDepthRb[i]);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, VW, VH);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, FBO_W, VH);
         glBindFramebuffer(GL_FRAMEBUFFER, sFbo[i]);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sColorTex[i], 0);
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sDepthRb[i]);
@@ -329,7 +333,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     sStReadNs += tRead - tStart;
     int draw = (sPrevDraw + 1) & 1;   // submit this frame to the other FBO
     glBindFramebuffer(GL_FRAMEBUFFER, sFbo[draw]);
-    glViewport(0, 0, VW, VH);
+    { extern int gVitaGc; glViewport(0, 0, gVitaGc ? WIDE_W : VW, VH); }
     glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
     glDisable(GL_CULL_FACE);   // polys arrive pre-culled and pre-clipped from the CPU geometry pipeline

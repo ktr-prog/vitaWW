@@ -5,6 +5,7 @@
 //   uBg0..uBg3 BG lines, uObj sprite colours, uAux window mask + sprite attributes; uPar the per-line parameters
 //   (GPU2D_GC_PAR RGBA texels per line, 8x192); u3d the 3D colour buffer (RGBA8; 6-bit colour = byte >> 2,
 //   alpha = byte >> 3), DS line y in row 191 - y as the GL renderer leaves it; uOvl the FPS overlay rows.
+// u3d holds u3dCols columns of 3D (in a texture u3dTexW wide) spread across the uW canvas columns.
 // It is drawn over a uW x 192 target (uW = 256, or wider for a 16:9 screen): gl_FragCoord gives the pixel, row =
 // DS line. Wider than 256: the 3D layer (rendered with a 16:9 camera) is stretched across the whole width, the 2D
 // layers stay 1:1 in the middle 256 columns. Beside them: the 3D view, the window mask of the nearest edge column,
@@ -34,6 +35,8 @@ static const char kGcVertexShader[] =
     "uniform float uHave3d;\n" \
     "uniform float uOvlOn;\n" \
     "uniform float uW;\n" \
+    "uniform float u3dCols;\n" \
+    "uniform float u3dTexW;\n" \
     "uniform sampler2D uLogo;\n" \
     "uniform float uLogoOn;\n" \
     "uniform float uMirror;\n" \
@@ -53,7 +56,7 @@ static const char kGcVertexShader[] =
     "  float cx = floor(fc.x), y = floor(fc.y);\n" \
     "  float x = cx - floor((uW - 256.0) / 2.0);\n" \
     "  float in2d = x >= 0.0 && x < 256.0 ? 1.0 : 0.0;\n" \
-    "  float x3 = floor((cx + 0.5) * 256.0 / uW);\n" \
+    "  float x3 = floor((cx + 0.5) * u3dCols / uW);\n" \
     "  vec2 uv = vec2((x + 0.5) / 256.0, (y + 0.5) / 192.0);\n" \
     "  if (uMirror > 0.5) return in2d > 0.5 ? vec4(texture2D(uLogo, uv).rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
     "  float py = (y + 0.5) / 192.0;\n" \
@@ -100,9 +103,9 @@ static const char kGcVertexShader[] =
     "  if (pr0 < 3.5 && bitOf(m, 1.0) > 0.5) {\n" \
     "    float on = 0.0, al = 0.0;\n" \
     "    if (on3d > 0.5) {\n" \
-    "      float sx = x3 + hofs;\n" \
-    "      if (uHave3d > 0.5 && sx >= 0.0 && sx < 256.0) {\n" \
-    "        vec4 q = texture2D(u3d, vec2((sx + 0.5) / 256.0, (191.0 - y + 0.5) / 192.0));\n" \
+    "      float sx = x3 + floor(hofs * u3dCols / 256.0);\n" \
+    "      if (uHave3d > 0.5 && sx >= 0.0 && sx < u3dCols) {\n" \
+    "        vec4 q = texture2D(u3d, vec2((sx + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
     "        al = floor(by(q.a) / 8.0);\n" \
     "        c = floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0);\n" \
     "        on = al > 0.5 ? 1.0 : 0.0;\n" \
@@ -177,5 +180,20 @@ static const char kGcFragmentShaderCg[] =
     "float4 main(float4 fc : WPOS) : COLOR { return compose(fc.xy); }\n";
 static const char kGcVertexShaderCg[] =
     "void main(float2 aPos, out float4 oPos : POSITION) { oPos = float4(aPos, 0.0, 1.0); }\n";
+
+// The canvas to the screen, "sharp bilinear": each canvas pixel a crisp block, only the block edges blended (the
+// 192 lines go to 544, a non-integer 2.83x, which plain linear filtering blurs and nearest makes uneven).
+static const char kBlitVertexShaderCg[] =
+    "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
+static const char kBlitFragmentShaderCg[] =
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz) : COLOR {\n"
+    "  float2 tx = vTex * uSz.xy;\n"
+    "  float2 fl = floor(tx);\n"
+    "  float2 d = tx - fl - 0.5;\n"
+    "  float2 r = 0.5 - 0.5 / uSz.zw;\n"
+    "  float2 f = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
+    "  return float4(tex2D(uTex, (fl + f) / uSz.xy).rgb, 1.0);\n"
+    "}\n";
 
 #endif
