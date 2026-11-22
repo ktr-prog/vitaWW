@@ -36,6 +36,8 @@ static const char kGcVertexShader[] =
     "uniform float uW;\n" \
     "uniform sampler2D uLogo;\n" \
     "uniform float uLogoOn;\n" \
+    "uniform vec2 uLogoOfs;\n" \
+    "uniform float uBg3Shift;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
     "float bitOf(float v, float p) { return gmod(floor(v / p), 2.0); }\n"   \
     "vec3 col15(float lo, float hi) {\n" \
@@ -78,6 +80,12 @@ static const char kGcVertexShader[] =
     "  vec2 luv = in2d > 0.5 ? uv : euv;\n" \
     "  float use0 = in2d > 0.5 ? 1.0 : bitOf(uni, 1.0), use1 = in2d > 0.5 ? 1.0 : bitOf(uni, 2.0);\n" \
     "  float use2 = in2d > 0.5 ? 1.0 : bitOf(uni, 4.0), use3 = in2d > 0.5 ? 1.0 : bitOf(uni, 8.0);\n" \
+    "  vec2 uv3 = luv;\n" \
+    "  if (uBg3Shift > 0.5) {\n" \
+    "    float x3b = x - uBg3Shift;\n" \
+    "    use3 = x3b >= 0.0 && x3b < 256.0 ? 1.0 : 0.0;\n" \
+    "    uv3 = vec2((x3b + 0.5) / 256.0, uv.y);\n" \
+    "  }\n" \
     "  float m = in2d > 0.5 ? by(ax.r) : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
@@ -123,7 +131,7 @@ static const char kGcVertexShader[] =
     "    }\n" \
     "  }\n" \
     "  if (pr3 < 3.5 && bitOf(m, 8.0) > 0.5 && use3 > 0.5) {\n" \
-    "    tv = texture2D(uBg3, luv);\n" \
+    "    tv = texture2D(uBg3, uv3);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr3 * 8.0 + 4.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 3.0; a1 = 0.0; }\n" \
@@ -142,9 +150,10 @@ static const char kGcVertexShader[] =
     "    else if (effect > 1.5 && effect < 2.5) o = brighten(c1, evy, 8.0);\n" \
     "    else if (effect > 2.5) o = darken(c1, evy, 7.0);\n" \
     "  }\n" \
-    "  if (uLogoOn > 0.5 && in2d > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
-    "    vec4 lg = texture2D(uLogo, uv);\n" \
-    "    if (lg.a > 0.5) o = floor(lg.rgb * 63.0 + 0.5);\n" \
+    "  if (uLogoOn > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
+    "    vec2 lu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
+    "    vec4 lg = texture2D(uLogo, lu);\n" \
+    "    if (lg.a > 0.5 && lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) o = floor(lg.rgb * 63.0 + 0.5);\n" \
     "  }\n" \
     "  if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) o = brighten(o, mbf, 0.0);\n" \
     "  else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) o = darken(o, mbf, 15.0);\n" \

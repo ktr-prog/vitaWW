@@ -47,7 +47,13 @@ void TitleBlinkText::update() {
     (this->*tbl[state])();
 }
 
+#if HOST_VITA
+extern "C" int gHostTitlePrompt;   // the prompt (BG3) is up: the Vita's compose moves it into the screen's corner
+#endif
 void TitleBlinkText::requestVariant(s32 v) {
+#if HOST_VITA
+    if (v == 0) v = 1;   // the Vita: always the small bottom-right "touch to start" (variant 1), never the middle one
+#endif
     requestedVariant = v;
 }
 
@@ -176,17 +182,16 @@ extern "C" void TitleBlinkText_SetupBg3() {
     IO_W(r, (IO_R(r) & ~3) | 1);
     IO_W(r, (IO_R(r) & 0x43) | 0x700);
     IO_W(r, IO_R(r) & ~0x40);
-#if HOST_VITA
-    Gfx2d_SetMainBg3Offset(-60, -84);   // the Vita: "touch to start" in the bottom-right corner, under the title logo
-#else
     Gfx2d_SetMainBg3Offset(0, 0);
-#endif
 }
 
 extern "C" void TitleBlinkText_ShowBg3() { Gfx2d_ShowMainPlanes(8); }
 
 extern "C" void TitleBlinkText_HideBg3() {
     volatile u32 *r = (volatile u32 *)0x4000000;
+#if HOST_VITA
+    gHostTitlePrompt = 0;
+#endif
     Gfx2d_HideMainPlanes(8);
     u32 v = Gfx2d_GetMainPlanes();
     IO_W(r, (IO_R(r) & 0xffffe0ff) | (v << 8));
@@ -244,6 +249,9 @@ void TitleBlinkText::show() {
     TitleBlinkText_SetupBg3();
     TitleBlinkText_LoadGraphics(variant);
     TitleBlinkText_ShowBg3();
+#if HOST_VITA
+    gHostTitlePrompt = 1;
+#endif
     applyBlendAlpha();
 }
 

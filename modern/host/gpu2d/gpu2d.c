@@ -803,12 +803,17 @@ static int sIrisSnap = -1;
 // The Vita's title screen: the top screen's logo - the sub engine's BG2, just that layer, rendered on the game
 // thread in the prepass - drawn 1:1 at the same place on the main screen by the GPU compose. RGBA8 (R,G,B,A
 // bytes), transparent where BG2 is. Not while BG2 is a full-screen picture (the black wipe before the logo).
-static int sLogoOn, sLogoReady, sLogoFull;
+static int sLogoOn, sLogoReady, sLogoFull, sLogoDx, sLogoDy, sPromptSnap;
 static uint32_t sLogo[SCREEN_W * SCREEN_H];
-int gpu2d_gc_logo(const uint32_t **px) {
-    if (!sLogoReady) return 0;
-    *px = sLogo;
-    return 1;
+int gHostTitlePrompt;   // TitleBlinkText (Vita): the "touch to start" BG3 is shown
+// The logo (NULL when none) and how far to move it to centre it on the screen (dx, dy); prompt: BG3 is the title's
+// "touch to start", to be drawn in the screen's bottom-right corner.
+int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt) {
+    *prompt = sLogoOn && sPromptSnap;
+    *dx = sLogoDx;
+    *dy = sLogoDy;
+    *px = sLogoReady ? sLogo : NULL;
+    return sLogoReady;
 }   // gHostIrisRadius as the frame's prepass saw it (the GPU compose's wide-screen iris)
 const uint32_t *gpu2d_canvas(int *rows) {
     *rows = sCanvasRows;
@@ -1315,6 +1320,23 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
     }
     sLogoReady = sLogoOn && !sLogoFull;
+    sPromptSnap = gHostTitlePrompt;
+    if (sLogoReady) {   // centre the logo's bounding box (the sign with the copyright line) on the screen
+        int x0 = SCREEN_W, x1 = -1, y0 = SCREEN_H, y1 = -1;
+        for (int y = 0; y < SCREEN_H; y++)
+            for (int x = 0; x < SCREEN_W; x++)
+                if (sLogo[y * SCREEN_W + x]) {
+                    if (x < x0) x0 = x;
+                    if (x > x1) x1 = x;
+                    if (y < y0) y0 = y;
+                    if (y > y1) y1 = y;
+                }
+        if (x1 < 0) sLogoReady = 0;
+        else {
+            sLogoDx = SCREEN_W / 2 - (x0 + x1 + 1) / 2;
+            sLogoDy = SCREEN_H / 2 - (y0 + y1 + 1) / 2;
+        }
+    }
     for (int b = 0; b < s2dNB; b++) {
         sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
         memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays
