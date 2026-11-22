@@ -9,8 +9,8 @@
 // DS line. Wider than 256: the 3D layer (rendered with a 16:9 camera) is stretched across the whole width, the 2D
 // layers stay 1:1 in the middle 256 columns. Beside them: the 3D view, the window mask of the nearest edge column,
 // and only BG layers that are one opaque colour across the line (uPar texel 5 alpha: a curtain or solid background
-// carries on; a HUD does not); uLogo: the title screen's logo (RGBA, transparent black around it, box uLogoBox
-// x,y,w,h in its 256x192 picture) drawn scaled by uLogoDst.z with its corner at uLogoDst.xy; during the iris wipe (texel 5: radius, on) the circle continues there (outside: black). (Identifiers avoid s, t, st,
+// carries on; a HUD does not); uLogo: the title screen's logo (the top screen's BG2, RGBA 256x192), drawn 1:1
+// in the 2D area over the 3D / backdrop, under the main screen's own 2D layers and before its brightness; during the iris wipe (texel 5: radius, on) the circle continues there (outside: black). (Identifiers avoid s, t, st,
 // ts, ss, tt: vitaGL's GLSL-to-Cg header defines them as macros.)
 #ifndef GPU2D_COMPOSE_H
 #define GPU2D_COMPOSE_H
@@ -36,8 +36,6 @@ static const char kGcVertexShader[] =
     "uniform float uW;\n" \
     "uniform sampler2D uLogo;\n" \
     "uniform float uLogoOn;\n" \
-    "uniform vec4 uLogoBox;\n" \
-    "uniform vec3 uLogoDst;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
     "float bitOf(float v, float p) { return gmod(floor(v / p), 2.0); }\n"   \
     "vec3 col15(float lo, float hi) {\n" \
@@ -144,16 +142,13 @@ static const char kGcVertexShader[] =
     "    else if (effect > 1.5 && effect < 2.5) o = brighten(c1, evy, 8.0);\n" \
     "    else if (effect > 2.5) o = darken(c1, evy, 7.0);\n" \
     "  }\n" \
+    "  if (uLogoOn > 0.5 && in2d > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
+    "    vec4 lg = texture2D(uLogo, uv);\n" \
+    "    if (lg.a > 0.5) o = floor(lg.rgb * 63.0 + 0.5);\n" \
+    "  }\n" \
     "  if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) o = brighten(o, mbf, 0.0);\n" \
     "  else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) o = darken(o, mbf, 15.0);\n" \
     "  vec3 o8 = (o * 4.0 + floor(o / 16.0)) / 255.0;\n" \
-    "  if (uLogoOn > 0.5) {\n" \
-    "    vec2 lp = (vec2(cx, y) + 0.5 - uLogoDst.xy) / uLogoDst.z;\n" \
-    "    if (lp.x >= 0.0 && lp.y >= 0.0 && lp.x < uLogoBox.z && lp.y < uLogoBox.w) {\n" \
-    "      vec4 lg = texture2D(uLogo, (uLogoBox.xy + lp) / vec2(256.0, 192.0));\n" \
-    "      o8 = o8 * (1.0 - lg.a) + lg.rgb;\n" \
-    "    }\n" \
-    "  }\n" \
     "  if (uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) {\n" \
     "    vec4 ov = texture2D(uOvl, vec2(uv.x, (y + 0.5) / 16.0));\n" \
     "    if (ov.a > 0.5) o8 = ov.rgb;\n" \

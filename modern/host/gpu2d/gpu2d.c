@@ -800,15 +800,14 @@ static u32 sCanvas[SCREEN_W * CANVAS_MAX];
 static int sCanvasRows;
 int gHostIrisRadius = -1;
 static int sIrisSnap = -1;
-// The Vita's title screen: the top screen's logo (sub engine, rendered on the game thread in the prepass) drawn onto
-// the main screen by the GPU compose. RGBA8 (R,G,B,A bytes) with transparent black where the sub screen shows only
-// its backdrop (the sky), and the bounding box of the rest.
-static int sLogoOn, sLogoReady, sLogoBox[4];
+// The Vita's title screen: the top screen's logo - the sub engine's BG2, just that layer, rendered on the game
+// thread in the prepass - drawn 1:1 at the same place on the main screen by the GPU compose. RGBA8 (R,G,B,A
+// bytes), transparent where BG2 is. Not while BG2 is a full-screen picture (the black wipe before the logo).
+static int sLogoOn, sLogoReady, sLogoFull;
 static uint32_t sLogo[SCREEN_W * SCREEN_H];
-int gpu2d_gc_logo(const uint32_t **px, int box[4]) {
+int gpu2d_gc_logo(const uint32_t **px) {
     if (!sLogoReady) return 0;
     *px = sLogo;
-    for (int i = 0; i < 4; i++) box[i] = sLogoBox[i];
     return 1;
 }   // gHostIrisRadius as the frame's prepass saw it (the GPU compose's wide-screen iris)
 const uint32_t *gpu2d_canvas(int *rows) {
@@ -1276,6 +1275,7 @@ static int sMtPending;   // a prepass ran in deferred mode and is waiting for it
 
 static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
+    sLogoFull = 0;
     sIrisSnap = gHostIrisRadius;
     for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
     int bi = 0;
@@ -1294,36 +1294,27 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
-        if (sLogoOn) {   // the sub screen's line as the sequential loop renders it (before this line's hblank)
+        if (sLogoOn) {   // the sub screen's BG2 line (before this line's hblank, as the sequential loop)
             Engine *e1 = &sEngine[1];
-            window_vertical(e1, line);
-            if (line == 0 && e1->haveNextLine0) e1->obj = e1->objNextLine0;
-            else if (line == 0) memset(&e1->obj, 0, sizeof e1->obj);
-            else gpu2d_render_obj_line(e1, line, &e1->obj);
-            render_line(e1, in, line);
+            u32 *lp = sLogo + line * SCREEN_W;
+            if (reg32(e1, REG_DISPCNT) & 0x400) {
+                gpu2d_render_bg_line(e1, 2, line);
+                int opaque = 0;
+                for (int x = 0; x < SCREEN_W; x++) {
+                    u16 v = e1->bg[2][x];
+                    if (!(v & PIX_OPAQUE)) { lp[x] = 0; continue; }
+                    opaque++;
+                    u32 r = v & 31, g = v >> 5 & 31, b = v >> 10 & 31;
+                    lp[x] = (r << 3 | r >> 2) | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2) << 16 | 0xff000000u;
+                }
+                if (opaque == SCREEN_W) sLogoFull = 1;
+            } else
+                memset(lp, 0, SCREEN_W * sizeof *lp);
         }
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
     }
-    sLogoReady = 0;
-    if (sLogoOn) {
-        int x0 = SCREEN_W, y0 = SCREEN_H, x1 = -1, y1 = -1;
-        const u32 *o = sEngine[1].out;
-        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
-            if (sBBack[i]) { sLogo[i] = 0; continue; }
-            u32 c = argb(o[i]);
-            sLogo[i] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | 0xff000000u;
-            int x = i % SCREEN_W, y = i / SCREEN_W;
-            if (x < x0) x0 = x;
-            if (x > x1) x1 = x;
-            if (y < y0) y0 = y;
-            if (y > y1) y1 = y;
-        }
-        if (x1 >= x0) {
-            sLogoBox[0] = x0; sLogoBox[1] = y0; sLogoBox[2] = x1 + 1 - x0; sLogoBox[3] = y1 + 1 - y0;
-            sLogoReady = 1;
-        }
-    }
+    sLogoReady = sLogoOn && !sLogoFull;
     for (int b = 0; b < s2dNB; b++) {
         sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
         memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays
@@ -1539,7 +1530,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     }
     sExtRows = 0;
     if (sSingle && !sSingleBlank && !sGpu && !sDefer3d) render_ext_sky(in);
-    for (int n = 0; n < (mainOnly && !sLogoOn ? 1 : 2); n++) {
+    for (int n = 0; n < (mainOnly ? 1 : 2); n++) {
         Engine *e = &sEngine[n];
         for (int line = SCREEN_H + 1; line < FRAME_LINES; line++) window_vertical(e, line);
         gpu2d_render_obj_line(e, 0, &e->objNextLine0);
