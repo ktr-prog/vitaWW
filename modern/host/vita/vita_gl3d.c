@@ -32,16 +32,18 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 
 // Timing split of g3w_render, reported on the "render thread split" line.
 extern uint64_t host_plat_time_ns(void);
-unsigned long long gG3FrameTexNs, gG3FrameUploads, gG3FrameSyncNs;   // the last frame's (render.c: longest frame)
+unsigned long long gG3FrameTexNs, gG3FrameUploads, gG3FrameSyncNs;
+enum { TEX_REFRESH_BUDGET_NS = 2500000 };
+static unsigned long long sStRefreshes, sStDeferred;   // the last frame's (render.c: longest frame)
 static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws, sStGlNs, sStResolveNs, sStSyncNs;
 unsigned long long vita_gl3d_stats(char *buf, int n) {
     unsigned long long c = sStCalls ? sStCalls : 1;
     extern unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;
     unsigned long long pc = gVitaPresents ? gVitaPresents : 1;
-    snprintf(buf, (size_t)n, "; 3d: texture sync %llu us, draw submit %llu us (of which textures %llu us [decode %llu us, %llu uploads/frame], glDrawElements %llu us, %llu draws/frame); "
+    snprintf(buf, (size_t)n, "; 3d: texture sync %llu us, draw submit %llu us (of which textures %llu us [decode+upload %llu us, %llu uploads/frame, %llu of them refreshes, %llu refreshes deferred in 60 frames], glDrawElements %llu us, %llu draws/frame); "
              "present: compose %llu us, swap %llu us",
-             sStSyncNs / c / 1000, sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStGlNs / c / 1000, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
-    sStDraws = sStGlNs = sStResolveNs = sStSyncNs = 0;
+             sStSyncNs / c / 1000, sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStRefreshes / c, sStDeferred, sStGlNs / c / 1000, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
+    sStDraws = sStGlNs = sStResolveNs = sStSyncNs = sStRefreshes = sStDeferred = 0;
     gVitaComposeNs = gVitaSwapNs = gVitaPresents = 0;
     sStReadNs = sStSubmitNs = sStTexNs = sStTexUploads = sStCalls = 0;
     return c;
@@ -155,7 +157,11 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     int s = tex_slot(texparam, texpal);
     TexEnt *e = &sTex[s];
     if (e->used) {
-        if (e->stale) { tex_upload(e); e->stale = 0; }
+        // A texture whose VRAM changed is decoded again - unless this frame already spent its upload budget: then
+        // it is drawn as it was and refreshed on a following frame (a burst of changed textures no longer stalls
+        // one frame; textures never seen before are always uploaded).
+        if (e->stale && (gG3FrameTexNs < TEX_REFRESH_BUDGET_NS || !e->tex)) { tex_upload(e); e->stale = 0; sStRefreshes++; }
+        else if (e->stale) sStDeferred++;
         e->lastUsed = sTexFrame;
         sLastTexSlot = s;
         return e->tex;

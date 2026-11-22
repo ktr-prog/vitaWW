@@ -53,6 +53,7 @@ u64 host_cycles(void) { return sCycles; }
 u64 pxi7_next_due(void);
 void pxi7_run_due(void);
 
+int gHostCamStickX, gHostCamStickY;   // the right stick's direction, -1/0/1 per axis (frontend_sdl.c; Camera::onExecute)
 static u32 sIF;
 void host_irq_raise(u32 m) { sIF |= m; }
 void host_irq_ack(u32 m) { sIF &= ~m; }

@@ -337,6 +337,17 @@ static uint32_t keyboard_keys(void) {
 static uint32_t pad_keys(void) {
     enum { DEAD = 16000 };
     uint32_t k = 0;
+    extern int gHostCamStickX, gHostCamStickY;
+    int cx = 0, cy = 0;
+    for (int p = 0; p < 4; p++) {   // right stick: the camera presets (Camera::onExecute)
+        SDL_GameController *c = sPads[p];
+        if (!c || cx || cy) continue;
+        int rx = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX), ry = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY);
+        cx = rx > DEAD ? 1 : rx < -DEAD ? -1 : 0;
+        cy = ry > DEAD ? 1 : ry < -DEAD ? -1 : 0;
+    }
+    gHostCamStickX = cx;
+    gHostCamStickY = cy;
     for (int p = 0; p < 4; p++) {
         SDL_GameController *c = sPads[p];
         if (!c) continue;

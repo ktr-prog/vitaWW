@@ -7,8 +7,9 @@
 //   alpha = byte >> 3), DS line y in row 191 - y as the GL renderer leaves it; uOvl the FPS overlay rows.
 // It is drawn over a uW x 192 target (uW = 256, or wider for a 16:9 screen): gl_FragCoord gives the pixel, row =
 // DS line. Wider than 256: the 3D layer (rendered with a 16:9 camera) is stretched across the whole width, the 2D
-// layers stay 1:1 in the middle 256 columns; to their sides there is no 2D (window mask: BG0 + effects only), and
-// during the iris wipe (uPar texel 5: radius, on) the circle continues there (outside it: black, as the wipe). (Identifiers avoid s, t, st,
+// layers stay 1:1 in the middle 256 columns. Beside them: the 3D view, the window mask of the nearest edge column,
+// and only BG layers that are one opaque colour across the line (uPar texel 5 alpha: a curtain or solid background
+// carries on; a HUD does not); during the iris wipe (texel 5: radius, on) the circle continues there (outside: black). (Identifiers avoid s, t, st,
 // ts, ss, tt: vitaGL's GLSL-to-Cg header defines them as macros.)
 #ifndef GPU2D_COMPOSE_H
 #define GPU2D_COMPOSE_H
@@ -61,13 +62,19 @@ static const char kGcVertexShader[] =
     "  vec3 bd = vec3(by(p3.r), by(p3.g), by(p3.b));\n" \
     "  float hofs = by(p4.r) + by(p4.g) * 256.0 - 256.0;\n" \
     "  vec4 ax = texture2D(uAux, uv);\n" \
-    "  float sideM = 33.0;\n" \
+    "  vec2 euv = vec2(x < 0.0 ? 0.5 / 256.0 : 255.5 / 256.0, uv.y);\n" \
     "  vec4 p5 = texture2D(uPar, vec2(5.5 / 8.0, py));\n" \
+    "  float uni = by(p5.a);\n" \
+    "  float sideM = by(texture2D(uAux, euv).r);\n" \
     "  if (in2d < 0.5 && by(p5.b) > 0.5) {\n" \
     "    float ir = by(p5.r) + by(p5.g) * 256.0, dd = floor(abs(2.0 * y + 1.0 - 192.0) / 2.0);\n" \
     "    float hr = dd <= ir ? floor(sqrt(ir * ir - dd * dd)) : -1.0;\n" \
     "    if (!(hr >= 0.0 && x >= 128.0 - hr && x < 128.0 + hr)) return vec4(0.0, 0.0, 0.0, 1.0);\n" \
+    "    sideM = 33.0;\n" \
     "  }\n" \
+    "  vec2 luv = in2d > 0.5 ? uv : euv;\n" \
+    "  float use0 = in2d > 0.5 ? 1.0 : bitOf(uni, 1.0), use1 = in2d > 0.5 ? 1.0 : bitOf(uni, 2.0);\n" \
+    "  float use2 = in2d > 0.5 ? 1.0 : bitOf(uni, 4.0), use3 = in2d > 0.5 ? 1.0 : bitOf(uni, 8.0);\n" \
     "  float m = in2d > 0.5 ? by(ax.r) : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
@@ -88,7 +95,7 @@ static const char kGcVertexShader[] =
     "        on = al > 0.5 ? 1.0 : 0.0;\n" \
     "      }\n" \
     "    } else {\n" \
-    "      tv = texture2D(uBg0, uv); on = in2d > 0.5 && by(tv.a) >= 128.0 ? 1.0 : 0.0; c = col15(by(tv.r), by(tv.a));\n" \
+    "      tv = texture2D(uBg0, luv); on = use0 > 0.5 && by(tv.a) >= 128.0 ? 1.0 : 0.0; c = col15(by(tv.r), by(tv.a));\n" \
     "    }\n" \
     "    if (on > 0.5) {\n" \
     "      k = pr0 * 8.0 + 1.0;\n" \
@@ -96,24 +103,24 @@ static const char kGcVertexShader[] =
     "      else if (k < k2) { k2 = k; c2 = c; l2 = 0.0; }\n" \
     "    }\n" \
     "  }\n" \
-    "  if (pr1 < 3.5 && bitOf(m, 2.0) > 0.5) {\n" \
-    "    tv = texture2D(uBg1, uv);\n" \
+    "  if (pr1 < 3.5 && bitOf(m, 2.0) > 0.5 && use1 > 0.5) {\n" \
+    "    tv = texture2D(uBg1, luv);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr1 * 8.0 + 2.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 1.0; a1 = 0.0; }\n" \
     "      else if (k < k2) { k2 = k; c2 = c; l2 = 1.0; }\n" \
     "    }\n" \
     "  }\n" \
-    "  if (pr2 < 3.5 && bitOf(m, 4.0) > 0.5) {\n" \
-    "    tv = texture2D(uBg2, uv);\n" \
+    "  if (pr2 < 3.5 && bitOf(m, 4.0) > 0.5 && use2 > 0.5) {\n" \
+    "    tv = texture2D(uBg2, luv);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr2 * 8.0 + 3.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 2.0; a1 = 0.0; }\n" \
     "      else if (k < k2) { k2 = k; c2 = c; l2 = 2.0; }\n" \
     "    }\n" \
     "  }\n" \
-    "  if (pr3 < 3.5 && bitOf(m, 8.0) > 0.5) {\n" \
-    "    tv = texture2D(uBg3, uv);\n" \
+    "  if (pr3 < 3.5 && bitOf(m, 8.0) > 0.5 && use3 > 0.5) {\n" \
+    "    tv = texture2D(uBg3, luv);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr3 * 8.0 + 4.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 3.0; a1 = 0.0; }\n" \

@@ -1132,12 +1132,20 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     obj_mosaic_x(e, obj);
     const int has3d = (dispcnt & 8) && (dispcnt & 0x100) && in->lines3d;
     u8 p[GPU2D_GC_PAR * 4] = {0};
+    u8 uni = 0;
     for (int n = 0; n < 4; n++) {
         int on = (dispcnt & 0x100u << n) && (n == 0 && (dispcnt & 8) ? has3d : e->bgAny[n]);
         p[n] = on ? (u8)(reg16(e, REG_BGCNT + 2 * n) & 3) : 4;
         if (on && !(n == 0 && (dispcnt & 8))) {
             memcpy(sGc.bg[n] + line * SCREEN_W, e->bg[n], sizeof e->bg[n]);
             __atomic_fetch_or(&sGc.used, 1u << n, __ATOMIC_RELAXED);
+            // a layer that is one opaque colour across the whole line (a black curtain, a solid background):
+            // a wider canvas continues it beside the 2D area (p[23] bit n)
+            if (kWideCanvas && (e->bg[n][0] & PIX_OPAQUE)) {
+                int x = 1;
+                while (x < SCREEN_W && e->bg[n][x] == e->bg[n][0]) x++;
+                if (x == SCREEN_W) uni |= (u8)(1u << n);
+            }
         }
     }
     u16 bldcnt = reg16(e, REG_BLDCNT), bldalpha = reg16(e, REG_BLDALPHA), mb = reg16(e, REG_MASTER_BRIGHT);
@@ -1158,6 +1166,7 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     // The iris wipe's circle (radius in pixels from the screen centre) while window 0 is on: a wider canvas than
     // the DS's 256 columns continues the circle beside the 2D layers.
     if (sIrisSnap >= 0 && (dispcnt & 0x2000)) { p[20] = (u8)(sIrisSnap & 0xff); p[21] = (u8)(sIrisSnap >> 8); p[22] = 1; }
+    p[23] = uni;
     // (built here and copied out whole: the destination may be uncached GPU memory)
     u16 oc[SCREEN_W], ax[SCREEN_W];
     int anyObj = 0;

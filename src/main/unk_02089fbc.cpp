@@ -1469,6 +1469,9 @@ BOOL HudCameraButton::canShow() {
 #ifdef HOST
     if (MenuCtrl_IsMenuOpen()) a = TRUE;
 #endif
+#if HOST_VITA
+    return FALSE;   // no camera button on the Vita: the right stick moves the camera (Camera::onExecute)
+#endif
     if (enabled != 0 && !a && !b && !c) {
         r = TRUE;
     } else {

@@ -337,8 +337,24 @@ BOOL Camera::onCreate() {
     return TRUE;
 }
 
+#ifdef HOST
+extern "C" int gHostCamStickX, gHostCamStickY;   // the controller's right stick, -1/0/1 per axis (frontend)
+extern "C" BOOL Camera_SetPresetCell(s32 a, s32 b);
+#endif
 BOOL Camera::onExecute() {
     s32 v[4];
+#ifdef HOST
+    {   // The right stick picks the camera preset - the 3x3 grid of the camera button (up/down: row, left/right:
+        // column) - wherever the camera follows the player; back to the middle when the stick is let go. Only a
+        // change of the stick moves the camera, so the touch grid keeps working.
+        static int lastX, lastY;
+        if (this == gCamera && (gHostCamStickX != lastX || gHostCamStickY != lastY)) {
+            lastX = gHostCamStickX;
+            lastY = gHostCamStickY;
+            Camera_SetPresetCell(lastY + 1, lastX + 1);
+        }
+    }
+#endif
     updateMode();
     Camera_GetLookAtPoint((VecFx32 *)v, this);
     WorldCurve_Update(&gWorldCurve, (VecFx32 *)v);
