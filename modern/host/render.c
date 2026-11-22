@@ -851,6 +851,13 @@ static void render_frame_mt(void) {
         }
         extern void host_vram_snapshot_banks(const u8 *out[9], int slot, int keepLcdc);
         extern int gpu2d_main_vram_display(void);
+#if HOST_VITA
+        {   // the title screen: the sub screen's logo is drawn onto the main screen (gpu2d), so keep its banks too
+            extern unsigned Scene_GetCurrent(void);
+            extern int gHostSnapSub;
+            gHostSnapSub = Scene_GetCurrent() == 0x2c;
+        }
+#endif
         if (mainOnly) host_vram_snapshot_banks(sSnapBank, slot, gpu2d_main_vram_display());
         else {
             if (!snapMem[slot]) snapMem[slot] = malloc(host_vram_total());

@@ -105,6 +105,8 @@ static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 // The composed canvas is 16:9 at the DS's 192 lines: GC_W columns (the 3D view across all of them, the 2D layers
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
 enum { GC_W = 341, GC_TEX_W = 352 };
+static GLint sGcLogoOn = -1, sGcLogoBox = -1, sGcLogoDst = -1;
+static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
     GLuint sh = glCreateShader(type);
@@ -182,8 +184,12 @@ int vita_gl_gc_init(void) {
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     glUseProgram(sGcProg);
     glUniform1f(glGetUniformLocation(sGcProg, "uW"), (float)GC_W);
-    static const char *const kNames[9] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d"};
-    for (int i = 0; i < 9; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
+    static const char *const kNames[10] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d", "uLogo"};
+    for (int i = 0; i < 10; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
+    sGcLogoOn = glGetUniformLocation(sGcProg, "uLogoOn");
+    sGcLogoBox = glGetUniformLocation(sGcProg, "uLogoBox");
+    sGcLogoDst = glGetUniformLocation(sGcProg, "uLogoDst");
+    glUniform1f(sGcLogoOn, 0.0f);
     glUseProgram(0);
     for (int set = 0; set < 2; set++) {
         glGenTextures(8, sGcTex[set]);
@@ -251,6 +257,36 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     }
     glActiveTexture(GL_TEXTURE0 + 8);
     glBindTexture(GL_TEXTURE_2D, tex3d);
+    {   // the title screen's logo (gpu2d: the sub screen's picture), scaled into the top of the 16:9 canvas
+        extern int gpu2d_gc_logo(const uint32_t **px, int box[4]);
+        const uint32_t *lp;
+        int box[4];
+        int on = gpu2d_gc_logo(&lp, box);
+        if (on) {
+            glActiveTexture(GL_TEXTURE0 + 9);
+            if (!sGcLogoTex) {
+                glGenTextures(1, &sGcLogoTex);
+                glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            } else {
+                glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
+            }
+            // at most 120 lines tall (the town and "touch to start" stay visible below), centred at the top
+            float s = 120.0f / (float)box[3];
+            if (s > 1.0f) s = 1.0f;
+            if ((float)box[2] * s > 330.0f) s = 330.0f / (float)box[2];
+            glUseProgram(sGcProg);
+            glUniform4f(sGcLogoBox, (float)box[0], (float)box[1], (float)box[2], (float)box[3]);
+            glUniform3f(sGcLogoDst, (GC_W - (float)box[2] * s) * 0.5f, 4.0f, s);
+        }
+        glUseProgram(sGcProg);
+        glUniform1f(sGcLogoOn, on ? 1.0f : 0.0f);
+    }
     glActiveTexture(GL_TEXTURE0);
 
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);   // the RGBA canvas texture is its colour attachment

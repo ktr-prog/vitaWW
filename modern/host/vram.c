@@ -140,15 +140,16 @@ const u32 *host_vram_bank_gens(void) { return sBankGen; }
 // VRAM directly (keepLcdc). Banks mapped to the sub engine (never rendered there), to the ARM7, to LCDC, or
 // disabled are not copied; their snapshot bytes are simply stale and nothing reads them this frame. Unknown
 // mappings are copied.
+int gHostSnapSub;   // render.c: the sub engine's banks are wanted this frame too (the Vita's title logo)
 static int bank_needed(int i, u8 c, int keepLcdc) {
     if (!(c & 0x80)) return 0;
     u32 mst = c & 7;
     switch (i) {
     case 0: case 1: return (mst & 3) != 0 || keepLcdc;
-    case 2: case 3: return mst == 0 ? keepLcdc : mst != 2 && mst != 4;
+    case 2: case 3: return mst == 0 ? keepLcdc : mst == 4 ? gHostSnapSub : mst != 2;
     case 4: return mst != 0;
     case 5: case 6: return mst != 0;
-    case 7: case 8: return 0;   // sub engine BG/OBJ/extended palettes, or LCDC
+    case 7: case 8: return gHostSnapSub && (mst & 3) != 0;   // sub engine BG/OBJ/extended palettes, or LCDC
     }
     return 1;
 }

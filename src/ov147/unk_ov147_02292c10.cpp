@@ -176,7 +176,11 @@ extern "C" void TitleBlinkText_SetupBg3() {
     IO_W(r, (IO_R(r) & ~3) | 1);
     IO_W(r, (IO_R(r) & 0x43) | 0x700);
     IO_W(r, IO_R(r) & ~0x40);
+#if HOST_VITA
+    Gfx2d_SetMainBg3Offset(-60, -84);   // the Vita: "touch to start" in the bottom-right corner, under the title logo
+#else
     Gfx2d_SetMainBg3Offset(0, 0);
+#endif
 }
 
 extern "C" void TitleBlinkText_ShowBg3() { Gfx2d_ShowMainPlanes(8); }
