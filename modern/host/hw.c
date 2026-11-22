@@ -145,30 +145,25 @@ static void host_pace_frame(void) {
     if (sFast == 1 || host_frame() < (u64)sFast) return;
 #endif
 #if HOST_VITA
-    // The Vita: one frame per display refresh, paced on the display's vblanks rather than a 60.000 Hz timer. The
-    // render thread's swap waits for a vblank anyway; with a separate timer the two drifted against each other and
-    // every ~10 s a run of frames each waited a whole extra refresh in the swap (logs: swap 15-20 ms, in bursts).
-    // A late frame starts the next one at once instead of waiting for another vblank (no catching up later).
+    // The Vita: the display paces the frames. The render thread's swap blocks while the display queue (triple
+    // buffered: two finished frames may wait) is full, and the hand-off waits for the render thread, so the game
+    // runs at the display's rate with the queue absorbing the GPU's frame-to-frame variation. A second pacer here
+    // (a 60 Hz timer, then the vblank count) fought the queue: each time the GPU finished a frame a bit late the
+    // queue filled, the swap blocked a whole refresh and the game lost a frame (logs: 1-5 a second, swap ~20 ms).
+    // This only keeps a floor of 16 ms for when no frames are being shown (no back-pressure then).
     {
-        extern unsigned host_vita_vcount(void);
-        extern void host_vita_wait_vblank(void);
-        static unsigned target;
         u64 now = host_plat_time_ns();
-        unsigned vc = host_vita_vcount();
-        if (sNextFrame == 0) sNextFrame = 1, target = vc;
-        target++;
-        if (sPaceLast && now - sPaceLast > sWorstFrameNs) {
-            sWorstFrameNs = now - sPaceLast;
-            sWorstWaitNs = gHoFrameWaitNs;
-            sWorstHoNs = gHoFrameNs;
+        if (sNextFrame == 0) sNextFrame = 1;
+        if (sPaceLast) {
+            u64 dt = now - sPaceLast;
+            if (dt > sWorstFrameNs) {
+                sWorstFrameNs = dt;
+                sWorstWaitNs = gHoFrameWaitNs;
+                sWorstHoNs = gHoFrameNs;
+            }
+            if (dt > 25000000ull) sLateFrames++;   // over 1.5 refreshes: a refresh went by without a new frame
+            if (dt < 16000000ull) HOST_PHASE(PH_PACE, host_plat_sleep_until_ns(sPaceLast + 16000000ull));
         }
-        // The render thread's swap waits for the vblank, so after the hand-off the game thread usually arrives here
-        // just after the vblank that starts its next frame - on time. Late is when a further vblank went by.
-        if ((int)(vc - target) >= 0) {
-            if ((int)(vc - target) > 0) sLateFrames++;
-            target = vc;
-        } else
-            HOST_PHASE(PH_PACE, while ((int)(host_vita_vcount() - target) < 0) host_vita_wait_vblank());
         sPaceLast = host_plat_time_ns();
         return;
     }
