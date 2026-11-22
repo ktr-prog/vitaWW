@@ -296,7 +296,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         }
         glUseProgram(sGcProg);
         glUniform1f(sGcLogoOn, on && !mirror ? 1.0f : 0.0f);
-        glUniform1f(sGcMirror, mirror ? 1.0f : 0.0f);   // the boot screens: the top screen's picture instead
+        glUniform1f(sGcMirror, (float)mirror);   // 1 the boot screens' top-screen picture instead; 2 a menu over it   // the boot screens: the top screen's picture instead
         glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
         glUniform1f(sGcBg3Shift, prompt ? (float)(GC_W - 256) / 2.0f : 0.0f);
         // the HUD clock's sprites moved right by the side bar's width, to the screen's right edge (gpu2d)

@@ -60,7 +60,7 @@ static const char kGcVertexShader[] =
     "  float in2d = x >= 0.0 && x < 256.0 ? 1.0 : 0.0;\n" \
     "  float x3 = floor((cx + 0.5) * u3dCols / uW);\n" \
     "  vec2 uv = vec2((x + 0.5) / 256.0, (y + 0.5) / 192.0);\n" \
-    "  if (uMirror > 0.5) return in2d > 0.5 ? vec4(texture2D(uLogo, uv).rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
+    "  if (uMirror > 0.5 && uMirror < 1.5) return in2d > 0.5 ? vec4(texture2D(uLogo, uv).rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
     "  float py = (y + 0.5) / 192.0;\n" \
     "  vec4 p0 = texture2D(uPar, vec2(0.5 / 8.0, py));\n" \
     "  vec4 p1 = texture2D(uPar, vec2(1.5 / 8.0, py));\n" \
@@ -173,6 +173,10 @@ static const char kGcVertexShader[] =
     "  if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) o = brighten(o, mbf, 0.0);\n" \
     "  else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) o = darken(o, mbf, 15.0);\n" \
     "  vec3 o8 = (o * 4.0 + floor(o / 16.0)) / 255.0;\n" \
+    "  if (uMirror > 1.5 && in2d > 0.5) {\n" \
+    "    vec4 mn = texture2D(uLogo, uv); float ma = by(mn.a);\n" \
+    "    if (ma > 191.0 || (ma > 63.0 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5)))) o8 = mn.rgb;\n" \
+    "  }\n" \
     "  if (uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) {\n" \
     "    vec4 ov = texture2D(uOvl, vec2(uv.x, (y + 0.5) / 16.0));\n" \
     "    if (ov.a > 0.5) o8 = ov.rgb;\n" \
