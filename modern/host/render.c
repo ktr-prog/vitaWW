@@ -933,6 +933,13 @@ static void render_frame_mt(void) {
                 }
         }
     } else sDraw3d = 1;
+#if HOST_VITA
+    {   // engine B is the picture shown (a menu, the boot screens): the 3D is not seen, skip drawing it - the render
+        // thread's cores are then free for engine B's bands
+        extern int gpu2d_mirror_shown(void);
+        if (gpu2d_mirror_shown()) sDraw3d = 0;
+    }
+#endif
     sHoCommitNs += host_plat_time_ns() - c0;
     {   // this frame's hand-off, for the pacing report's longest frame (hw.c)
         extern unsigned long long gHoFrameWaitNs, gHoFrameNs;

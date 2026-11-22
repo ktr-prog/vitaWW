@@ -823,6 +823,7 @@ int gpu2d_gc_objmove(int rect[4]) {
     rect[0] = sClockXSnap + CLOCK_BOX_DX, rect[1] = sClockYSnap + CLOCK_BOX_DY, rect[2] = 256, rect[3] = 192;
     return sClockSnap;
 }
+int gpu2d_mirror_shown(void) { return sMirrorOn; }   // (Vita) the picture shown is engine B's (render.c)
 int gpu2d_sub_shown(void) { return (sPowCnt & 0x8000) != 0; }   // (Vita) engine B is the screen shown
 int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror) {
     *mirror = sMirrorReady;
@@ -1114,7 +1115,7 @@ static u8 s2dRegSnap[SCREEN_H][REG_SIZE];   // per-line register state (hblank c
 static u8 s2dPalSnap[SCREEN_H][0x400];       // per-line palette (hblank can write palette per scanline: sky/water)
 static const u8 *s2dPalLine[SCREEN_H];       // each line's palette: its own snapshot, or the previous line's if equal
 typedef struct { s32 refX[2], refY[2]; int refLine; u8 refWritten[2], winActive[2]; int objMosaicLine, objMosaicCount; } Snap2d;
-typedef struct { const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; u32 *canvas; } Band2d;
+typedef struct { const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; u32 *canvas; int mirror; } Band2d;
 
 static void ref_advance(Engine *e, int line) {
     for (int i = 0; i < 2; i++) {
@@ -1270,6 +1271,18 @@ static void band2d_run(Band2d *w) {
         if (line == 0 && e->haveNextLine0) e->obj = e->objNextLine0;
         else if (line == 0) memset(&e->obj, 0, sizeof e->obj);
         else gpu2d_render_obj_line(e, line, &e->obj);
+        if (w->mirror) {   // (Vita) engine B's whole picture, for the mirror (the menus, the boot screens)
+            render_line(e, w->in, line);
+            ref_advance(e, line);
+            if (line + 1 == w->hi) e->objCandOn = 0;
+            const u32 *o = e->out + line * SCREEN_W;
+            u32 *d = sLogo + line * SCREEN_W;
+            for (int x = 0; x < SCREEN_W; x++) {
+                u32 c = argb(o[x]);
+                d[x] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | 0xff000000u;
+            }
+            continue;
+        }
         if (sGcFrame) {
             gc_line(e, w->in, line);    // layers for the GPU compose instead of the CPU compose
             ref_advance(e, line);
@@ -1399,34 +1412,37 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     } else
         sSubDirty = 1;
     if (subDraw) sLogoFull = 0;
+    // A changed mirror picture (a menu, a boot screen) is drawn by the bands from engine B's per-line snapshots, off
+    // the game thread (on it, one engine-B frame cost ~42 ms on the Vita: the menus ran at 20-30 fps). Engine A is
+    // not shown then, so the bands are free for it.
+    const int mirrorBand = sMirrorOn && subDraw;
+    Engine *se = mirrorBand ? &sEngine[1] : e;   // the engine the bands draw
     sIrisSnap = gHostIrisRadius;
     for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
     int bi = 0;
     for (int line = 0; line < SCREEN_H; line++) {
         while (bi < s2dNB && line == sMtBnd[bi]) {
             Snap2d *s = &sMtW[bi].snap;
-            s->refX[0] = e->refX[0]; s->refX[1] = e->refX[1]; s->refY[0] = e->refY[0]; s->refY[1] = e->refY[1];
-            s->refLine = e->refLine; s->refWritten[0] = e->refWritten[0]; s->refWritten[1] = e->refWritten[1];
-            s->winActive[0] = e->winActive[0]; s->winActive[1] = e->winActive[1];
-            s->objMosaicLine = e->objMosaicLine; s->objMosaicCount = e->objMosaicCount;
+            s->refX[0] = se->refX[0]; s->refX[1] = se->refX[1]; s->refY[0] = se->refY[0]; s->refY[1] = se->refY[1];
+            s->refLine = se->refLine; s->refWritten[0] = se->refWritten[0]; s->refWritten[1] = se->refWritten[1];
+            s->winActive[0] = se->winActive[0]; s->winActive[1] = se->winActive[1];
+            s->objMosaicLine = se->objMosaicLine; s->objMosaicCount = se->objMosaicCount;
             bi++;
         }
-        memcpy(s2dRegSnap[line], e->regs, REG_SIZE);   // capture registers for this line before hblank mutates them
-        memcpy(s2dPalSnap[line], e->palette, 0x400);   // capture palette for this line (hblank sky/water gradients)
+        memcpy(s2dRegSnap[line], se->regs, REG_SIZE);   // capture registers for this line before hblank mutates them
+        memcpy(s2dPalSnap[line], se->palette, 0x400);   // capture palette for this line (hblank sky/water gradients)
         s2dPalLine[line] = s2dPalSnap[line];   // (comparing with the line above first measured slower on the Vita)
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
-        if (sMirrorOn || sLogoOn) {   // what the hblank IRQs leave in engine B's registers, line by line
-            subLines = sub_regs_hash(&sEngine[1], sMirrorOn, mix32(subLines, (u32)line));
-        }
-        if (sMirrorOn && subDraw) {   // the boot screens, the menus: the sub screen's whole line (before this line's hblank)
+        if (mirrorBand) {   // engine B's own per-line state, for the band snapshots above
             Engine *e1 = &sEngine[1];
             window_vertical(e1, line);
-            if (line == 0 && e1->haveNextLine0) e1->obj = e1->objNextLine0;
-            else if (line == 0) memset(&e1->obj, 0, sizeof e1->obj);
-            else gpu2d_render_obj_line(e1, line, &e1->obj);
-            render_line(e1, in, line);
+            if (line == 0) { e1->objMosaicLine = 0; e1->objMosaicCount = 0; }
+            obj_mosaic_y(e1, line);
+        }
+        if (sMirrorOn || sLogoOn) {   // what the hblank IRQs leave in engine B's registers, line by line
+            subLines = sub_regs_hash(&sEngine[1], sMirrorOn, mix32(subLines, (u32)line));
         }
         if (sLogoOn && subDraw) {   // the sub screen's BG2 line (before this line's hblank, as the sequential loop)
             Engine *e1 = &sEngine[1];
@@ -1453,14 +1469,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         sSubLines = subLines;
     }
     if (!sMirrorOn) sMirrorReady = 0;
-    if (sMirrorOn && subDraw) {
-        const u32 *o = sEngine[1].out;
-        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
-            u32 c = argb(o[i]);
-            sLogo[i] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | 0xff000000u;
-        }
-        sMirrorReady = 1;
-    }
+    if (mirrorBand) sMirrorReady = 1;   // (the bands fill sLogo before this frame's present, on the render thread)
     sLogoReady = sLogoOn && !sLogoFull;
     sPromptSnap = gHostTitlePrompt;
     sClockSnap = gHostClockDrawn;
@@ -1475,8 +1484,9 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     sLogoDx = 0;
     sLogoDy = -6;
     for (int b = 0; b < s2dNB; b++) {
-        sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
-        memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays
+        sMtW[b].in = in; sMtW[b].src = se; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
+        sMtW[b].mirror = mirrorBand;
+        memcpy(&s2dBandEng[b], se, offsetof(Engine, out));   // inputs only, not the big output arrays
     }
 }
 
