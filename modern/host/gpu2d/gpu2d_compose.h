@@ -42,6 +42,8 @@ static const char kGcVertexShader[] =
     "uniform float uMirror;\n" \
     "uniform vec2 uLogoOfs;\n" \
     "uniform float uBg3Shift;\n" \
+    "uniform vec4 uObjMove;\n" \
+    "uniform float uObjShift;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
     "float bitOf(float v, float p) { return gmod(floor(v / p), 2.0); }\n"   \
     "vec3 col15(float lo, float hi) {\n" \
@@ -95,8 +97,16 @@ static const char kGcVertexShader[] =
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
     "  float k; vec3 c;\n" \
-    "  vec4 tv = texture2D(uObj, uv);\n" \
-    "  if (in2d > 0.5 && objOn > 0.5 && by(tv.a) >= 128.0 && bitOf(m, 16.0) > 0.5) {\n" \
+    "  vec2 ouv = uv; float oin = in2d, om = m;\n" \
+    "  if (uObjShift > 0.5 && y >= uObjMove.y && y < uObjMove.w) {\n" \
+    "    float xs = x - uObjShift;\n" \
+    "    if (xs >= uObjMove.x && xs < uObjMove.z) {\n" \
+    "      ouv = vec2((xs + 0.5) / 256.0, uv.y); oin = 1.0;\n" \
+    "      vec4 axs = texture2D(uAux, ouv); om = by(axs.r); oa = by(axs.a);\n" \
+    "    } else if (x >= uObjMove.x && x < uObjMove.z) oin = 0.0;\n" \
+    "  }\n" \
+    "  vec4 tv = texture2D(uObj, ouv);\n" \
+    "  if (oin > 0.5 && objOn > 0.5 && by(tv.a) >= 128.0 && bitOf(om, 16.0) > 0.5) {\n" \
     "    k = gmod(oa, 4.0) * 8.0; c = col15(by(tv.r), by(tv.a));\n" \
     "    k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 4.0; a1 = 0.0;\n" \
     "  }\n" \

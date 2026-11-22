@@ -106,7 +106,7 @@ static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 // The composed canvas is 16:9 at the DS's 192 lines: GC_W columns (the 3D view across all of them, the 2D layers
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
 enum { GC_W = 341, GC_TEX_W = 352 };
-static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1;
+static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1, sGcObjMove = -1, sGcObjShift = -1;
 static GLuint sBlitProg;   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
 static GLint sBlitPos = -1, sBlitTex = -1;
 static GLuint sGcLogoTex;
@@ -203,6 +203,8 @@ int vita_gl_gc_init(void) {
     sGcLogoOfs = glGetUniformLocation(sGcProg, "uLogoOfs");
     sGcBg3Shift = glGetUniformLocation(sGcProg, "uBg3Shift");
     sGcMirror = glGetUniformLocation(sGcProg, "uMirror");
+    sGcObjMove = glGetUniformLocation(sGcProg, "uObjMove");
+    sGcObjShift = glGetUniformLocation(sGcProg, "uObjShift");
     glUniform1f(sGcMirror, 0.0f);
     glUniform1f(sGcLogoOn, 0.0f);
     glUseProgram(0);
@@ -296,6 +298,12 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glUniform1f(sGcMirror, mirror ? 1.0f : 0.0f);   // the boot screens: the top screen's picture instead
         glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
         glUniform1f(sGcBg3Shift, prompt ? (float)(GC_W - 256) / 2.0f : 0.0f);
+        // the HUD clock's sprites moved right by the side bar's width, to the screen's right edge (gpu2d)
+        extern int gpu2d_gc_objmove(int rect[4]);
+        int r[4];
+        int mv = gpu2d_gc_objmove(r);
+        glUniform4f(sGcObjMove, (float)r[0], (float)r[1], (float)r[2], (float)r[3]);
+        glUniform1f(sGcObjShift, mv ? (float)(GC_W - 256) / 2.0f : 0.0f);
     }
     glActiveTexture(GL_TEXTURE0);
 

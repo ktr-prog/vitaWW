@@ -270,7 +270,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         }
         int g = gId[h];
         sPolyGrp[k] = g;
-        if (!p->translucent) grpCount[g]++;
+        if (!p->translucent && !(p->attr & 0x4000)) grpCount[g]++;   // (depth-equal decals go after: below)
     }
     // lazy texture setup: sync the VRAM ranges of every texture drawn this frame (sets the change flags)
     for (int g = 0; g < ngrp; g++)
@@ -382,8 +382,19 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     static int sOrder[MAX_POLYGONS];
     int nOrd = 0;
     for (int g = 0; g < ngrp; g++) { grpPos[g] = nOrd; nOrd += grpCount[g]; }
+    // Polygons with the DS "depth equal" test (attr bit 14: decals - ground patterns, shadows) are drawn on top of
+    // the surface under them: after every other opaque polygon, in submission order, and pulled towards the camera
+    // a little (the DS passes them within +-0x200 of the stored depth; below). Sorted in with the rest and with a plain
+    // LEQUAL test, whether a decal won against the coplanar ground changed from frame to frame (flicker).
+    int nPlain = 0;
     for (int k = 0; k < r->npoly; k++)
-        if (sPolyGrp[k] >= 0 && !r->poly[k]->translucent) sOrder[grpPos[sPolyGrp[k]]++] = k;
+        if (sPolyGrp[k] >= 0 && !r->poly[k]->translucent && !(r->poly[k]->attr & 0x4000)) {
+            sOrder[grpPos[sPolyGrp[k]]++] = k;
+            nPlain++;
+        }
+    nOrd = nPlain;
+    for (int k = 0; k < r->npoly; k++)
+        if (sPolyGrp[k] >= 0 && !r->poly[k]->translucent && (r->poly[k]->attr & 0x4000)) sOrder[nOrd++] = k;
     for (int k = 0; k < r->npoly; k++)
         if (sPolyGrp[k] >= 0 && r->poly[k]->translucent) sOrder[nOrd++] = k;
     // Resolve every texture before drawing anything. A cache miss or refresh uploads a texture, which rebinds
@@ -411,6 +422,9 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         // two, so multiplying is bit-identical to dividing by 16 and then by tw/th; alpha is per polygon.
         const float su = 1.0f / (16.0f * tw), sv = 1.0f / (16.0f * th);
         const u8 a8 = p->translucent ? (u8)(((p->attr >> 16 & 31) * 255 + 15) / 31) : 255;
+        // depth-equal: pulled forward by 2e-5 in NDC depth - far above the float error of two coplanar polygons'
+        // interpolated depths, and (W-buffered, as the town is) a few hundredths of a unit at the usual distances
+        const float zEq = (p->attr & 0x4000) ? 2e-5f : 0.0f;
         for (int i = 0; i < p->nv; i++) {
             const G3VHot *v = p->hv[0] ? p->hv[i] : (const G3VHot *)0;
             G3VHot tmp;
@@ -423,7 +437,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             // DS clip-space position (pos[]=NDC*w); GL does the divide/viewport/depth and clips the frustum.
             // v->color is the 9-bit interpolation value, so >>3 to the displayed 6-bit channel.
             const int o = bn + i;
-            bPos[o][0] = (float)v->pos[0]; bPos[o][1] = (float)v->pos[1]; bPos[o][2] = (float)v->pos[2];
+            bPos[o][0] = (float)v->pos[0]; bPos[o][1] = (float)v->pos[1]; bPos[o][2] = (float)v->pos[2] - zEq * (float)v->pos[3];
             bPos[o][3] = (float)v->pos[3];
             bCol8[o][0] = sCol8[(v->color[0] >> 3) & 63]; bCol8[o][1] = sCol8[(v->color[1] >> 3) & 63];
             bCol8[o][2] = sCol8[(v->color[2] >> 3) & 63]; bCol8[o][3] = a8;

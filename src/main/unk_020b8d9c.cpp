@@ -6614,6 +6614,12 @@ extern "C" void Sky_ResetObjGfx(void) {
 extern "C" BOOL Sky_SetEngine(s32 arg) {
     BOOL result = FALSE;
     MinuteHour t;
+#if HOST_VITA
+    if (arg == 1) {   // the sky on the main screen (behind the town while a menu is up): no sky at all on the Vita
+        Sky_Disable();
+        return TRUE;
+    }
+#endif
     if (arg == 0) {
         Gfx2d_SetSubBgModeState(1);
         Clock_GetMinuteHour(&t.minute);

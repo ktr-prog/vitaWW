@@ -781,6 +781,21 @@ BOOL Camera::initModeDefault() {
     return TRUE;
 }
 
+#ifdef HOST
+// The camera grid's side columns turn the camera (yaw h0 = -+0xe02) but keep the look-at offset (0, y, z) fixed in
+// the world, so the point looked at - and with it the player - slides off the middle of the picture. The offset
+// turns with the camera here, so the player stays where the middle column has him.
+static void host_turn_offset(CameraPose *t) {
+    if (t->h0 == 0) return;
+    V3 v;
+    v.x = t->x;
+    v.y = 0;
+    v.z = t->z;
+    Vec_RotateY(&v, t->h0);
+    t->x = v.x;
+    t->z = v.z;
+}
+#endif
 void Camera::updateModeDefault() {
     volatile VecFx32 cur;
     cur.x = targetFocus.x;
@@ -799,6 +814,9 @@ void Camera::updateModeDefault() {
     if (gCurSceneInfo->isOutdoor == 0) {
         if (Scene_InHouseRoom() || Scene_InVillagerHouse() || (Scene_InMuseumRoom() && Scene_GetCurrent() != 0x20 && Scene_GetCurrent() != 0x22)) {
             loadPose(sCameraPoseGrid[presetRow].v[presetCol], 0);
+#ifdef HOST
+            host_turn_offset(&target);
+#endif
             targetFocus.x = d.x;
             targetFocus.y = d.y;
             targetFocus.z = d.z;
@@ -808,6 +826,7 @@ void Camera::updateModeDefault() {
         } else {
 #ifdef HOST
             loadPose(sCameraPoseGrid[presetRow].v[presetCol], 0);
+            host_turn_offset(&target);
 #endif
             targetFocus.x = d.x;
             targetFocus.y = d.y;
@@ -826,6 +845,7 @@ void Camera::updateModeDefault() {
             target.w0 = sCameraPoseTable[0].w0 + sCameraPoseTable[g].w0 - sCameraPoseTable[m].w0;
             target.h1 = (s16)(sCameraPoseTable[0].h1 + sCameraPoseTable[g].h1 - sCameraPoseTable[m].h1);
             target.h0 = (s16)(sCameraPoseTable[0].h0 + sCameraPoseTable[g].h0 - sCameraPoseTable[m].h0);
+            host_turn_offset(&target);
         } else if (sHostOutdoorPreset) {
             sHostOutdoorPreset = FALSE;
             loadPose(0, 0);

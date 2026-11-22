@@ -176,6 +176,9 @@ HudClock::~HudClock() {
     release();
 }
 
+#ifdef HOST
+extern "C" int gHostClockDrawn, gHostClockX, gHostClockY;
+#endif
 void HudClock::draw() {
     if (state != 0) {
         GXOamAttr *a = anim.getCell();
@@ -188,6 +191,12 @@ void HudClock::draw() {
             s32 by = g + t;
             s32 f = weekday == 0 ? 0xf : 9;
             Oam_DrawCell(0, a, bx + x, by + y, f, -1, 0x1000, 0x1000, 0, -1, 0, 0);
+#ifdef HOST
+            // the Vita's compose moves the clock's box to the 16:9 screen's right edge (gpu2d_gc_objmove)
+            gHostClockDrawn = altLayout == 0;   // (the box is measured for this layout)
+            gHostClockX = bx + x;
+            gHostClockY = by + y;
+#endif
         }
     }
 }

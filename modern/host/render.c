@@ -856,7 +856,9 @@ static void render_frame_mt(void) {
             extern unsigned Scene_GetCurrent(void);
             extern int gHostSnapSub;
             unsigned sc = Scene_GetCurrent();
-            gHostSnapSub = sc == 0x2c || sc == 0x3f;   // the title's logo; the boot screens' Nintendo logo
+            extern int gpu2d_sub_shown(void);
+            gHostSnapSub = sc == 0x2c || sc == 0x3f || gpu2d_sub_shown();   // the title's logo; the boot screens'
+                                                                            // Nintendo logo; the menus (engine B)
         }
 #endif
         if (mainOnly) host_vram_snapshot_banks(sSnapBank, slot, gpu2d_main_vram_display());

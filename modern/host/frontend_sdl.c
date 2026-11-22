@@ -463,12 +463,18 @@ static int raw_touch(int *x, int *y, unsigned *presses) {
     // the DS screen 1:1 in its middle (finger_to_logical).
     extern unsigned Scene_GetCurrent(void);
     extern int gHostTitlePrompt;
+    // In the field a touch reaches the game only while no menu, screen swap or conversation is up; the game then
+    // takes it only on a villager (PlayerActor input: TouchPick kind 2) - tapping villagers to greet them.
+    extern int gpu2d_sub_shown(void);
+    extern int MenuCtrl_IsMenuOpen(void), TalkRequest_IsActive(void);
     static int held, ok;
-    if (sFinger.held && !held) ok = Scene_GetCurrent() == 0x2c && gHostTitlePrompt;
+    if (sFinger.held && !held)
+        ok = Scene_GetCurrent() == 0x2c ? gHostTitlePrompt
+                                        : !gpu2d_sub_shown() && !MenuCtrl_IsMenuOpen() && !TalkRequest_IsActive();
     held = sFinger.held;
     *presses = sRawPresses;
     *x = sFinger.x, *y = sFinger.y - 192;
-    if (!ok || !sFinger.held || Scene_GetCurrent() != 0x2c) return 0;
+    if (!ok || !sFinger.held) return 0;
     return *x >= 0 && *x < 256 && *y >= 0 && *y < 192;
 #elif HOST_IOS
     *presses = tc_stylus_presses(&sTouch);

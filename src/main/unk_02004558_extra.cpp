@@ -719,7 +719,11 @@ void PlayerActor::readInput() {
     } else {
     if (gGfxMainOnTop == 0) {
         vc = TouchPick_GetGroundPos(Scene_GetTouchPicker(), &p50);
-        if (TouchPickResult_GetTarget(Scene_GetTouchPicker(), &p68, &sp34, &sp30)) {
+        BOOL tgt = TouchPickResult_GetTarget(Scene_GetTouchPicker(), &p68, &sp34, &sp30);
+#if HOST_VITA
+        if (!tgt || sp34 != 2) vc = 0, tgt = FALSE;   // the Vita: touch only taps villagers (kind 2: NPCs) - walk up, greet
+#endif
+        if (tgt) {
             got = TRUE;
             {
                 switch (sp34) {

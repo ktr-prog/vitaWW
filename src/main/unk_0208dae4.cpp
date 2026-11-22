@@ -51,6 +51,9 @@ void HudUnkIcon::updateHiding() {
 }
 
 extern "C" BOOL HudUnkIcon_CanShow() {
+#if HOST_VITA
+    return FALSE;   // no "open the menu" arrow on the Vita: the pockets open with the buttons
+#endif
     BOOL a, b, c;
     long d, e;
     s32 v;

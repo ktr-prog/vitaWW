@@ -811,6 +811,18 @@ static uint32_t sLogo[SCREEN_W * SCREEN_H];
 int gHostTitlePrompt;   // TitleBlinkText (Vita): the "touch to start" BG3 is shown
 // The logo (NULL when none) and how far to move it to centre it on the screen (dx, dy); prompt: BG3 is the title's
 // "touch to start", to be drawn in the screen's bottom-right corner.
+// (Vita) The HUD clock (HudClock::draw sets gHostClockDrawn each frame it draws, gHostClockX/Y where its panel
+// cell goes): the GPU compose moves the sprites of the clock's box - from the panel's outline to the screen's right
+// and bottom edges - right by the side bar's width, so the clock sits at the 16:9 screen's right edge.
+#define CLOCK_BOX_DX 36   // the box measured on the field HUD: panel point (128, 96) -> box x 164..255, y 148..191
+#define CLOCK_BOX_DY 52
+int gHostClockDrawn, gHostClockX, gHostClockY;
+static int sClockSnap, sClockXSnap, sClockYSnap;
+int gpu2d_gc_objmove(int rect[4]) {
+    rect[0] = sClockXSnap + CLOCK_BOX_DX, rect[1] = sClockYSnap + CLOCK_BOX_DY, rect[2] = 256, rect[3] = 192;
+    return sClockSnap;
+}
+int gpu2d_sub_shown(void) { return (sPowCnt & 0x8000) != 0; }   // (Vita) engine B is the screen shown
 int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror) {
     *mirror = sMirrorReady;
     if (sMirrorReady) { *px = sLogo; *dx = *dy = *prompt = 0; return 1; }
@@ -1343,6 +1355,10 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     }
     sLogoReady = sLogoOn && !sLogoFull;
     sPromptSnap = gHostTitlePrompt;
+    sClockSnap = gHostClockDrawn;
+    sClockXSnap = gHostClockX;
+    sClockYSnap = gHostClockY;
+    gHostClockDrawn = 0;
     // The logo with its copyright line, centred: its finished picture spans x 35..224 (the sign 35..215 plus the
     // (R) mark; the year 72..184, centred on the DS screen's middle) and y 10..188. Fixed offsets, not the box of
     // what is drawn so far - the logo is uncovered tile by tile, and a box that grows would move it every frame.
@@ -1519,7 +1535,10 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         extern unsigned Scene_GetCurrent(void);
         unsigned sc = Scene_GetCurrent();
         sLogoOn = sc == 0x2c;
-        sMirrorOn = sc == 0x3f;
+        // The boot screens (their Nintendo logo is on the top screen), and whenever the game puts engine A on the
+        // top screen (POWCNT1 bit 15: the menus - the pockets and the rest - are then on the bottom screen, drawn by
+        // engine B): the Vita shows engine B's whole picture.
+        sMirrorOn = sc == 0x3f || (sPowCnt & 0x8000);
     }
 #else
     static int forceMain = -1;
