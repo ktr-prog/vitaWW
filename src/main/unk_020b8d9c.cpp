@@ -5363,6 +5363,9 @@ extern "C" void SkySprites_Draw(SkySprites *obj) {
         py = b + ((pos->y + 0x800) >> 12);
         y = py - yoff;
         if (gWeatherManager.engine == 1) {
+#if HOST_VITA
+            continue;   // no sky on the Vita (Sky_SetEngine)
+#endif
             u8 k = e->cullRadius;
             BOOL hidden = FALSE;
             if (k != 0) {
@@ -6614,12 +6617,6 @@ extern "C" void Sky_ResetObjGfx(void) {
 extern "C" BOOL Sky_SetEngine(s32 arg) {
     BOOL result = FALSE;
     MinuteHour t;
-#if HOST_VITA
-    if (arg == 1) {   // the sky on the main screen (behind the town while a menu is up): no sky at all on the Vita
-        Sky_Disable();
-        return TRUE;
-    }
-#endif
     if (arg == 0) {
         Gfx2d_SetSubBgModeState(1);
         Clock_GetMinuteHour(&t.minute);
@@ -6670,6 +6667,11 @@ extern "C" BOOL Sky_SetEngine(s32 arg) {
             gWeatherManager.prevPlayerZ = pos->z;
         }
     }
+#if HOST_VITA
+    // The sky moved to the main screen (a menu opened outdoors; engine B is the menu's now) as the original does,
+    // but no sky is shown on the Vita: its layers hidden, no line effects (its sprites: Sky objects' draw).
+    if (arg == 1) Sky_Disable();
+#endif
     return result;
 }
 
