@@ -12,6 +12,8 @@ jobs:
   vita:
     name: Vita homebrew (.vpk)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # the draft release "ci-latest" below
     env:
       # a workspace-local install so the VitaSDK scripts need no sudo; configure_host.py reads $VITASDK
       VITASDK: ${{ github.workspace }}/vitasdk
@@ -201,3 +203,23 @@ jobs:
           name: vitaWW
           path: build/vita/vitaWW.vpk
           if-no-files-found: error
+
+      # The newest main build as an asset of a draft (unpublished, collaborators only) release "ci-latest", so the
+      # .vpk can be fetched where the Actions artifact storage is unreachable (testing in the Vita3K emulator).
+      - name: Draft release ci-latest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          id=$(gh api "repos/${{ github.repository }}/releases" --jq '.[] | select(.name == "ci-latest") | .id' | head -1)
+          if [ -z "$id" ]; then
+            id=$(gh api -X POST "repos/${{ github.repository }}/releases" -f tag_name=ci-latest -f name=ci-latest \
+                 -F draft=true -f body="Newest main build" --jq .id)
+          fi
+          for a in $(gh api "repos/${{ github.repository }}/releases/$id/assets" --jq '.[].id'); do
+            gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$a"
+          done
+          curl -sSf -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/octet-stream" \
+            --data-binary @build/vita/vitaWW.vpk \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$id/assets?name=vitaWW.vpk" >/dev/null
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$id" -f body="Newest main build (${{ github.sha }})" >/dev/null
