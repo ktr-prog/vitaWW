@@ -340,18 +340,33 @@ BOOL Camera::onCreate() {
 #ifdef HOST
 extern "C" int gHostCamStickX, gHostCamStickY;   // the controller's right stick, -1/0/1 per axis (frontend)
 extern "C" BOOL Camera_SetPresetCell(s32 a, s32 b);
+extern "C" BOOL TalkRequest_IsActive(void);
+extern "C" BOOL MenuCtrl_IsMenuOpen(void);
 #endif
 BOOL Camera::onExecute() {
     s32 v[4];
 #ifdef HOST
-    {   // The right stick picks the camera preset - the 3x3 grid of the camera button (up/down: row, left/right:
-        // column) - wherever the camera follows the player; back to the middle when the stick is let go. Only a
-        // change of the stick moves the camera, so the touch grid keeps working.
+    {   // The right stick works the camera button's 3x3 grid without the HUD, wherever the camera follows the player:
+        // each push moves the selection one cell, as the D-pad does in the open grid (HudCameraGrid::moveByDpad:
+        // right, left, up, down in that order; clamped), the choice stays where it is (no spring back), and a
+        // change plays the grid's sounds (HudCameraGrid::applySelection: up 0x4d, down 0x4c, sideways 0x4e).
         static int lastX, lastY;
-        if (this == gCamera && (gHostCamStickX != lastX || gHostCamStickY != lastY)) {
-            lastX = gHostCamStickX;
-            lastY = gHostCamStickY;
-            Camera_SetPresetCell(lastY + 1, lastX + 1);
+        int sx = gHostCamStickX, sy = gHostCamStickY;
+        int pushed = (sx || sy) && !lastX && !lastY;
+        lastX = sx;
+        lastY = sy;
+        if (pushed && this == gCamera && !TalkRequest_IsActive() && !MenuCtrl_IsMenuOpen()) {
+            s32 cx = presetCol - 1, cy = presetRow - 1, ox = cx, oy = cy;
+            if (sx > 0) cx++;
+            else if (sx < 0) cx--;
+            else if (sy < 0) cy--;
+            else cy++;
+            cx = cx < -1 ? -1 : cx > 1 ? 1 : cx;
+            cy = cy < -1 ? -1 : cy > 1 ? 1 : cy;
+            if (cx != ox || cy != oy) {
+                Camera_SetPresetCell(cy + 1, cx + 1);
+                Snd_PlaySe(cy < oy ? 0x4d : cy > oy ? 0x4c : 0x4e);
+            }
         }
     }
 #endif

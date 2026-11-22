@@ -1069,6 +1069,12 @@ static void frame_body(void) {
 #else
     sShm->keys = keyboard_keys() | pad_keys();
     sShm->stick = stick_word();
+    {   // the left stick pushed all the way runs (as the iOS stick does; B / L / R still run at any tilt)
+        extern int gHostStickRun;
+        uint32_t w = sShm->stick;
+        int sx = (int8_t)(w & 0xff), sy = (int8_t)(w >> 8 & 0xff);
+        gHostStickRun = (w >> 16 & 1) && sx * sx + sy * sy >= 97 * 97;
+    }
 #endif
     update_touch();
     show();
