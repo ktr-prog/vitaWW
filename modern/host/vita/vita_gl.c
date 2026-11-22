@@ -108,7 +108,19 @@ static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
 enum { GC_W = 341, GC_TEX_W = 352 };
 static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1, sGcObjMove = -1, sGcObjShift = -1;
-static GLuint sBlitProg;   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
+static GLuint sBlitProg;
+// The menu over the scene (gpu2d: engine B's picture, alpha 0 where it has nothing): a small pass of its own over
+// the composed canvas, in the 256 DS columns. (Kept out of the big compose shader, which is near the limits of the
+// Vita's shader compiler.)
+static GLuint sOvlProg;
+static GLint sOvlPos = -1, sOvlTex = -1;
+static int sOvlNow;
+static const char kMenuVertexShaderCg[] =
+    "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
+static const char kMenuFragmentShaderCg[] =
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
+    "  float4 c = tex2D(uTex, vTex);\n  if (c.a < 0.25) discard;\n  return float4(c.rgb, 1.0);\n}\n";   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
 static GLint sBlitPos = -1, sBlitTex = -1;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
@@ -296,7 +308,8 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         }
         glUseProgram(sGcProg);
         glUniform1f(sGcLogoOn, on && !mirror ? 1.0f : 0.0f);
-        glUniform1f(sGcMirror, (float)mirror);   // 1 the boot screens' top-screen picture instead; 2 a menu over it   // the boot screens: the top screen's picture instead
+        glUniform1f(sGcMirror, mirror == 1 ? 1.0f : 0.0f);   // the boot screens: the top screen's picture instead
+        sOvlNow = mirror == 2 && on;   // a menu: drawn over the composed picture below (its own small pass)
         glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
         glUniform1f(sGcBg3Shift, prompt ? (float)(GC_W - 256) / 2.0f : 0.0f);
         // the HUD clock's sprites moved right by the side bar's width, to the screen's right edge (gpu2d)
@@ -325,6 +338,34 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sGcAttr);
+    if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
+        if (!sOvlProg) {
+            sOvlProg = cached_program(kMenuVertexShaderCg, kMenuFragmentShaderCg, "menu");
+            if (sOvlProg) {
+                sOvlPos = glGetAttribLocation(sOvlProg, "aPos");
+                sOvlTex = glGetAttribLocation(sOvlProg, "aTex");
+                glUseProgram(sOvlProg);
+                glUniform1i(glGetUniformLocation(sOvlProg, "uTex"), 0);
+                if (sOvlPos < 0 || sOvlTex < 0) sOvlProg = 0;
+            }
+            fprintf(stderr, "vita_gl: menu layer %s\n", sOvlProg ? "ready" : "unavailable");
+            if (!sOvlProg) sOvlProg = (GLuint)-1;
+        }
+        if (sOvlProg != (GLuint)-1) {
+            static const float kTex[8] = {0, 0, 1, 0, 0, 1, 1, 1};
+            glViewport((GC_W - 256) / 2, 0, 256, 192);
+            glUseProgram(sOvlProg);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
+            glEnableVertexAttribArray((GLuint)sOvlPos);
+            glEnableVertexAttribArray((GLuint)sOvlTex);
+            glVertexAttribPointer((GLuint)sOvlPos, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
+            glVertexAttribPointer((GLuint)sOvlTex, 2, GL_FLOAT, GL_FALSE, 0, kTex);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            glDisableVertexAttribArray((GLuint)sOvlPos);
+            glDisableVertexAttribArray((GLuint)sOvlTex);
+        }
+    }
     gVitaComposeNs += host_plat_time_ns() - t0;
     glUseProgram(0);
     glDepthMask(GL_TRUE);
