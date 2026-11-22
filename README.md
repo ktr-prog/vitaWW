@@ -11,6 +11,7 @@ A native PlayStation Vita port of *Animal Crossing: Wild World*, built from the 
 - 16:9 Widescreen
 - Pixel-Perfect rendering
 - Camera Controls
+- Adapted to single screen
 
 ## Installing
 
