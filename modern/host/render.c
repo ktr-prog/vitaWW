@@ -948,6 +948,15 @@ static void render_frame_mt(void) {
                 (unsigned long long)(sRender2dNs / 60000), (unsigned long long)(sRender3dNs / 60000),
                 (unsigned long long)(__atomic_exchange_n(&sWorkerNs, 0, __ATOMIC_RELAXED) / 60000),
                 sRenderSkipped, gpu3d_mt_skipped());
+        {   // the Vita's CPU-drawn sub-screen picture (title logo, boot screens, menus): redrawn only on change
+            extern unsigned gSubFrames, gSubDraws;
+            extern unsigned long long gSubCheckNs;
+            if (gSubFrames)
+                fprintf(stderr, "render: sub-screen picture redrawn %u of %u frames (change check %llu us/frame)\n",
+                        gSubDraws, gSubFrames, gSubCheckNs / 1000 / gSubFrames);
+            gSubFrames = gSubDraws = 0;
+            gSubCheckNs = 0;
+        }
         {
             unsigned long long bands = __atomic_exchange_n(&sWBandsNs, 0, __ATOMIC_RELAXED) / 60000;
             unsigned long long pres = __atomic_exchange_n(&sWPresentNs, 0, __ATOMIC_RELAXED) / 60000;

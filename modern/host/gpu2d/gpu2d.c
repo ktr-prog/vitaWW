@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "gpu2d_internal.h"
+#include "../plat.h"
 
 static Engine sEngine[2];
 static int sSingle, sSingleBlank, sA3dNow, sA3dPrev, sOutdoors;
@@ -822,7 +823,6 @@ int gpu2d_gc_objmove(int rect[4]) {
     rect[0] = sClockXSnap + CLOCK_BOX_DX, rect[1] = sClockYSnap + CLOCK_BOX_DY, rect[2] = 256, rect[3] = 192;
     return sClockSnap;
 }
-int gpu2d_logo_shown(void) { return sLogoReady && !sMirrorReady; }   // (Vita) the title logo is drawn
 int gpu2d_sub_shown(void) { return (sPowCnt & 0x8000) != 0; }   // (Vita) engine B is the screen shown
 int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror) {
     *mirror = sMirrorReady;
@@ -1337,7 +1337,7 @@ static u32 sub_state_hash(const Engine *e1, int mirror) {
     for (int i = 0; i < 8; i++) {   // engine B: 128 KB of BG VRAM (and of OBJ VRAM), 16 KB granules, each once
         int seen = 0;
         for (int j = 0; j < i; j++) seen |= e1->bgGran[j] == e1->bgGran[i];
-        h = mix32(h, (u32)(uintptr_t)e1->bgGran[i]);
+        h = mix32(h, e1->bgGran[i] != NULL);   // (contents, not where the snapshot copy happens to be)
         if (e1->bgGran[i] && !seen) h = hash_words(h, g, e1->bgGran[i], 0x4000, &g);
     }
     for (int i = 0; i < 4; i++)
@@ -1347,7 +1347,7 @@ static u32 sub_state_hash(const Engine *e1, int mirror) {
         for (int i = 0; i < 8; i++) {
             int seen = 0;
             for (int j = 0; j < i; j++) seen |= e1->objGran[j] == e1->objGran[i];
-            h = mix32(h, (u32)(uintptr_t)e1->objGran[i]);
+            h = mix32(h, e1->objGran[i] != NULL);
             if (e1->objGran[i] && !seen) h = hash_words(h, g, e1->objGran[i], 0x4000, &g);
         }
         if (e1->objExtPal) h = hash_words(h, g, e1->objExtPal, 0x2000, &g);
@@ -1356,6 +1356,8 @@ static u32 sub_state_hash(const Engine *e1, int mirror) {
 }
 static u32 sSubSig, sSubLines;
 static int sSubDirty = 1;
+unsigned gSubFrames, gSubDraws;   // (render.c's log) frames with a sub-screen picture, and how many redrew it
+unsigned long long gSubCheckNs;   // the time the check above took
 
 static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
@@ -1363,9 +1365,13 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     int subDraw = 0;
     u32 subLines = 2166136261u;
     if (sMirrorOn || sLogoOn) {
+        uint64_t t0 = host_plat_time_ns();
         u32 sig = sub_state_hash(&sEngine[1], sMirrorOn);
+        gSubCheckNs += host_plat_time_ns() - t0;
         subDraw = sSubDirty || sig != sSubSig || (sMirrorOn && !sMirrorReady) || (sLogoOn && !sLogoReady && !sLogoFull);
         sSubSig = sig;
+        gSubFrames++;
+        gSubDraws += subDraw;
     } else
         sSubDirty = 1;
     if (subDraw) sLogoFull = 0;
@@ -1440,9 +1446,10 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     // The logo with its copyright line, centred: its finished picture spans x 35..224 (the sign 35..215 plus the
     // (R) mark; the year 72..184, centred on the DS screen's middle) and y 10..188. Fixed offsets, not the box of
     // what is drawn so far - the logo is uncovered tile by tile, and a box that grows would move it every frame.
-    // Horizontally it is already centred (the year's middle is the screen's), vertically it moves up 3 lines.
+    // Horizontally it is already centred (the year's middle is the screen's); vertically it goes up 6 lines (above
+    // the middle, as asked: 4 lines free above it, 9 below).
     sLogoDx = 0;
-    sLogoDy = -3;
+    sLogoDy = -6;
     for (int b = 0; b < s2dNB; b++) {
         sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
         memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays

@@ -183,7 +183,8 @@ extern "C" void TitleBlinkText_SetupBg3() {
     IO_W(r, (IO_R(r) & 0x43) | 0x700);
     IO_W(r, IO_R(r) & ~0x40);
 #if HOST_VITA
-    Gfx2d_SetMainBg3Offset(0, -6);   // the Vita: 6 lines lower, so "touch to start" ends level with the (C) line
+    Gfx2d_SetMainBg3Offset(0, -3);   // the Vita: 3 lines lower, so "touch to start" ends level with the (C) line
+                                     // (line 182: the logo is 6 lines up, gpu2d.c)
 #else
     Gfx2d_SetMainBg3Offset(0, 0);
 #endif
