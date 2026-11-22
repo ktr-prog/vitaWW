@@ -162,8 +162,10 @@ static void host_pace_frame(void) {
             sWorstWaitNs = gHoFrameWaitNs;
             sWorstHoNs = gHoFrameNs;
         }
-        if ((int)(vc - target) >= 0) {   // the vblank that starts the next frame has passed: late
-            sLateFrames++;
+        // The render thread's swap waits for the vblank, so after the hand-off the game thread usually arrives here
+        // just after the vblank that starts its next frame - on time. Late is when a further vblank went by.
+        if ((int)(vc - target) >= 0) {
+            if ((int)(vc - target) > 0) sLateFrames++;
             target = vc;
         } else
             HOST_PHASE(PH_PACE, while ((int)(host_vita_vcount() - target) < 0) host_vita_wait_vblank());

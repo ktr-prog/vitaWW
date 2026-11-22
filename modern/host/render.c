@@ -957,6 +957,13 @@ static void render_frame_mt(void) {
             gSubFrames = gSubDraws = 0;
             gSubCheckNs = 0;
         }
+#if HOST_VITA
+        {   // what is seen as stutter: refreshes of the screen that showed the same picture again
+            extern unsigned gVitaRepeats;
+            fprintf(stderr, "display: %u refreshes repeated the previous picture (last 60 frames)\n",
+                    __atomic_exchange_n(&gVitaRepeats, 0, __ATOMIC_RELAXED));
+        }
+#endif
         {
             unsigned long long bands = __atomic_exchange_n(&sWBandsNs, 0, __ATOMIC_RELAXED) / 60000;
             unsigned long long pres = __atomic_exchange_n(&sWPresentNs, 0, __ATOMIC_RELAXED) / 60000;
