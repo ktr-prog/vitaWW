@@ -918,7 +918,10 @@ void PlayerActor::readInput() {
             if (host_circle_pad(&sx, &sy)) {
                 s32 m = (s32)((u32)Math_Sqrt64((u64)((s64)sx * sx + (s64)sy * sy)) << 12) / 105;
                 if (m > 0x1000) m = 0x1000;
-                if (gHostStickRun) this->inputRun = 1, m = 0x1000;
+                // Running with the stick: B / L / R held runs at full speed whatever the tilt, as with the D-pad
+                // (the key path sets 0x1000); a partly tilted stick would otherwise "run" (the dust) no faster
+                // than walking (the target speed is magnitude * 0x6e2).
+                if (gHostStickRun || this->inputRun) this->inputRun = 1, m = 0x1000;
                 if (this->inputRun == 0) m = (s32)((u32)m * 0xc32) >> 12;
                 this->inputMagnitude = (u16)m;
                 this->inputAngle = (s16)Math_Atan2(sx, -sy);

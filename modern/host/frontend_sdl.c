@@ -427,6 +427,12 @@ static void window_to_logical(int wx, int wy, int *x, int *y) {
     *y = (int)SDL_floorf(((float)wy - r[1]) * 384.0f / r[3]);
 }
 static void finger_to_logical(float fx, float fy, int *x, int *y) {
+#if HOST_VITA
+    // the 341x192 canvas fills the panel; the DS screen is its columns 42..297 (vita_gl.c GC_W, gpu2d_compose.h)
+    *x = (int)SDL_floorf(fx * 341.0f) - 42;
+    *y = 192 + (int)SDL_floorf(fy * 192.0f);
+    return;
+#endif
     int w, h;
     SDL_GetWindowSize(sWin, &w, &h);
     if (sGpu) { window_to_logical((int)(fx * w), (int)(fy * h), x, y); return; }
@@ -451,10 +457,13 @@ void frontend_backend_touch_read(int held) {
 }
 static int raw_touch(int *x, int *y, unsigned *presses) {
 #if HOST_VITA
-    // Touch input is off on the Vita for now: the front panel does not reach the game.
-    *x = *y = 0;
+    // Touch reaches the game only on the title screen (scene 0x2c: "touch to start" and its menus) for now. The
+    // panel shows the 16:9 canvas with the DS screen 1:1 in its middle (finger_to_logical).
+    extern unsigned Scene_GetCurrent(void);
     *presses = sRawPresses;
-    return 0;
+    *x = sFinger.x, *y = sFinger.y - 192;
+    if (Scene_GetCurrent() != 0x2c || !sFinger.held) return 0;
+    return *x >= 0 && *x < 256 && *y >= 0 && *y < 192;
 #elif HOST_IOS
     *presses = tc_stylus_presses(&sTouch);
     return tc_stylus(&sTouch, x, y);
@@ -1069,12 +1078,6 @@ static void frame_body(void) {
 #else
     sShm->keys = keyboard_keys() | pad_keys();
     sShm->stick = stick_word();
-    {   // the left stick pushed all the way runs (as the iOS stick does; B / L / R still run at any tilt)
-        extern int gHostStickRun;
-        uint32_t w = sShm->stick;
-        int sx = (int8_t)(w & 0xff), sy = (int8_t)(w >> 8 & 0xff);
-        gHostStickRun = (w >> 16 & 1) && sx * sx + sy * sy >= 97 * 97;
-    }
 #endif
     update_touch();
     show();

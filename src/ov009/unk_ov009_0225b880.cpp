@@ -1580,7 +1580,9 @@ BOOL BuildingActor::isOffscreen() {
             dx = -dx;
         }
         s32 dz = position.z - g->z;
-#if defined(HOST) && !HOST_VITA   // (the Vita: the original draw distance)
+#if HOST_VITA   // the original ranges, the sideways one widened with the 16:9 view
+        if (dx > getViewRangeX() * 3 / 2 || dz > getViewRangeFront() || dz < -getViewRangeBack()) {
+#elif defined(HOST)
         if (dx > getViewRangeX() * 2 || dz > getViewRangeFront() * 2 || dz < -getViewRangeBack() * 2) {
 #else
         if (dx > getViewRangeX() || dz > getViewRangeFront() || dz < -getViewRangeBack()) {

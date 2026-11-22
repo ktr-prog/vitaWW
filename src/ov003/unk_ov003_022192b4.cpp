@@ -4036,7 +4036,13 @@ void FieldObj_DrawUnits(O *o, BlockMap *g) {
         l.A = gCameraLookAt;
         FieldPos_SnapToUnitCenter(&l.C, &l.A);
         FieldPos_ToUnit(&l.x, &l.z, &l.C);
-#if defined(HOST) && !HOST_VITA   // (the Vita: the original draw distance)
+#if HOST_VITA
+        // The Vita's 16:9 view is a third wider than the DS's: the original depth, 13 columns either side instead
+        // of 9 (the DS grid widened to the wider picture, so nothing pops in or out at its sides) and the object
+        // budget grown with the grid.
+        enum { HALF_W = 13, BACK = 14, MAX_OBJS = 0x168 };
+enum { FAR_BACK = 0x1c200, FAR_FRONT = 0x8200, NEAR_BACK = 0x14a00, NEAR_FRONT = 0x6400 };
+#elif defined(HOST)
         enum { HALF_W = 18, BACK = 28, MAX_OBJS = 0x3f0 };
 enum { FAR_BACK = 0x1c200 * 2, FAR_FRONT = 0x8200 * 2, NEAR_BACK = 0x14a00 * 2, NEAR_FRONT = 0x6400 * 2 };
 #else
