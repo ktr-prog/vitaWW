@@ -1343,22 +1343,12 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     }
     sLogoReady = sLogoOn && !sLogoFull;
     sPromptSnap = gHostTitlePrompt;
-    if (sLogoReady) {   // centre the logo's bounding box (the sign with the copyright line) on the screen
-        int x0 = SCREEN_W, x1 = -1, y0 = SCREEN_H, y1 = -1;
-        for (int y = 0; y < SCREEN_H; y++)
-            for (int x = 0; x < SCREEN_W; x++)
-                if (sLogo[y * SCREEN_W + x]) {
-                    if (x < x0) x0 = x;
-                    if (x > x1) x1 = x;
-                    if (y < y0) y0 = y;
-                    if (y > y1) y1 = y;
-                }
-        if (x1 < 0) sLogoReady = 0;
-        else {
-            sLogoDx = SCREEN_W / 2 - (x0 + x1 + 1) / 2;
-            sLogoDy = SCREEN_H / 2 - (y0 + y1 + 1) / 2;
-        }
-    }
+    // The logo with its copyright line, centred: its finished picture spans x 35..224 (the sign 35..215 plus the
+    // (R) mark; the year 72..184, centred on the DS screen's middle) and y 10..188. Fixed offsets, not the box of
+    // what is drawn so far - the logo is uncovered tile by tile, and a box that grows would move it every frame.
+    // Horizontally it is already centred (the year's middle is the screen's), vertically it moves up 3 lines.
+    sLogoDx = 0;
+    sLogoDy = -3;
     for (int b = 0; b < s2dNB; b++) {
         sMtW[b].in = in; sMtW[b].src = e; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
         memcpy(&s2dBandEng[b], e, offsetof(Engine, out));   // inputs only, not the big output arrays

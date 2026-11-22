@@ -383,6 +383,8 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
     present_swap();
 }
 static void present_swap(void) {
+    static int shown;
+    if (!shown) { shown = 1; fprintf(stderr, "vita_gl: first picture on screen\n"); }
     uint64_t ts = host_plat_time_ns();
     vglSwapBuffers(GL_FALSE);
     gVitaSwapNs += host_plat_time_ns() - ts;

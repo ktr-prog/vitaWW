@@ -458,12 +458,17 @@ void frontend_backend_touch_read(int held) {
 }
 static int raw_touch(int *x, int *y, unsigned *presses) {
 #if HOST_VITA
-    // Touch reaches the game only on the title screen (scene 0x2c: "touch to start" and its menus) for now. The
-    // panel shows the 16:9 canvas with the DS screen 1:1 in its middle (finger_to_logical).
+    // Touch reaches the game only for the title screen's "touch to start" (scene 0x2c while the prompt is up), not
+    // its menus: a touch counts only when it began while the prompt was shown. The panel shows the 16:9 canvas with
+    // the DS screen 1:1 in its middle (finger_to_logical).
     extern unsigned Scene_GetCurrent(void);
+    extern int gHostTitlePrompt;
+    static int held, ok;
+    if (sFinger.held && !held) ok = Scene_GetCurrent() == 0x2c && gHostTitlePrompt;
+    held = sFinger.held;
     *presses = sRawPresses;
     *x = sFinger.x, *y = sFinger.y - 192;
-    if (Scene_GetCurrent() != 0x2c || !sFinger.held) return 0;
+    if (!ok || !sFinger.held || Scene_GetCurrent() != 0x2c) return 0;
     return *x >= 0 && *x < 256 && *y >= 0 && *y < 192;
 #elif HOST_IOS
     *presses = tc_stylus_presses(&sTouch);

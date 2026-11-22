@@ -29,6 +29,7 @@ void card_init(const char *path) {
         free((void *)sRom);
         sRom = fixed;
     }
+    fprintf(stderr, "card: the game read (%u KB)\n", sRomSize >> 10);
 }
 
 const u8 *host_rom(u32 *size) { *size = sRomSize; return sRom; }

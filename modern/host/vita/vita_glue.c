@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 
 #include "vita.h"
@@ -78,17 +79,36 @@ static unsigned sLogHead, sLogTail, sLogDropped;   // head: write position, tail
 static SDL_SpinLock sLogLock, sLogDrainLock;   // drain lock: the writer thread vs the exit flush
 static int sLogFd = -1;
 
+static void ring_put(const char *buf, unsigned n) {   // (sLogLock held)
+    unsigned at = sLogHead & (LOG_RING - 1), first = n < LOG_RING - at ? n : LOG_RING - at;
+    memcpy(sLogRing + at, buf, first);
+    memcpy(sLogRing, buf + first, n - first);
+    sLogHead += n;
+}
+static int sLogMidLine;   // the last write did not end its line
+// Every line starts with the time since the process started ("[  12.345] "), so the log shows where time goes
+// (the boot included).
 static _READ_WRITE_RETURN_TYPE log_ring_write(struct _reent *r, void *cookie, const char *buf,
                                               _READ_WRITE_BUFSIZE_TYPE n) {
     (void)r; (void)cookie;
+    char stamp[24];
+    unsigned long long us = sceKernelGetProcessTimeWide();
+    int sl = snprintf(stamp, sizeof stamp, "[%4u.%03u] ", (unsigned)(us / 1000000), (unsigned)(us / 1000 % 1000));
     SDL_AtomicLock(&sLogLock);
-    unsigned room = LOG_RING - (sLogHead - sLogTail);
-    if ((unsigned)n > room) sLogDropped++;
+    unsigned lines = 0;
+    for (_READ_WRITE_BUFSIZE_TYPE i = 0; i < n; i++) lines += buf[i] == '\n';
+    unsigned need = (unsigned)n + (lines + 1) * (unsigned)sl;
+    if (need > LOG_RING - (sLogHead - sLogTail)) sLogDropped++;
     else {
-        unsigned at = sLogHead & (LOG_RING - 1), first = (unsigned)n < LOG_RING - at ? (unsigned)n : LOG_RING - at;
-        memcpy(sLogRing + at, buf, first);
-        memcpy(sLogRing, buf + first, (unsigned)n - first);
-        sLogHead += (unsigned)n;
+        const char *p = buf, *end = buf + n;
+        while (p < end) {
+            if (!sLogMidLine) ring_put(stamp, (unsigned)sl);
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            const char *e = nl ? nl + 1 : end;
+            ring_put(p, (unsigned)(e - p));
+            sLogMidLine = !nl;
+            p = e;
+        }
     }
     SDL_AtomicUnlock(&sLogLock);
     return n;
