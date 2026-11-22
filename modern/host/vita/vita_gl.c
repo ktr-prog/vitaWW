@@ -432,7 +432,22 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
 
     present_swap();
 }
+// On the render thread the swap is done after the thread has told the game it is finished with the frame's data
+// (render.c render_worker_main): a swap that waits for the display (the queue full) then no longer holds up the
+// game's next frame - the game thread was losing a frame each time (~once a second, swap ~20 ms).
+int gVitaDeferSwap;
+static int sSwapPending;
+static void do_swap(void);
+void vita_gl_swap_pending(void) {
+    if (!sSwapPending) return;
+    sSwapPending = 0;
+    do_swap();
+}
 static void present_swap(void) {
+    if (gVitaDeferSwap) { sSwapPending = 1; return; }
+    do_swap();
+}
+static void do_swap(void) {
     static int shown;
     if (!shown) { shown = 1; fprintf(stderr, "vita_gl: first picture on screen\n"); }
     uint64_t ts = host_plat_time_ns();

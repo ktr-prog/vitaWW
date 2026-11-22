@@ -737,6 +737,10 @@ static void render_worker_phase(void) {
 static void *render_worker_main(void *a) {
     (void)a;
 #if HOST_VITA
+    {
+        extern int gVitaDeferSwap;
+        gVitaDeferSwap = 1;   // this thread now does all GL: its swaps come after the hand-off (below)
+    }
     extern int sceKernelChangeThreadCpuAffinityMask(int, int);
     sceKernelChangeThreadCpuAffinityMask(0, 0x60000);   // cores 1+2: core 0 belongs to the game thread
 #endif
@@ -750,6 +754,12 @@ static void *render_worker_main(void *a) {
         sWDone = 1;
         pthread_cond_signal(&sWCvDone);
         pthread_mutex_unlock(&sWMx);
+#if HOST_VITA
+        {   // the frame's data is read and its drawing submitted: the game goes on while the swap waits for the display
+            extern void vita_gl_swap_pending(void);
+            vita_gl_swap_pending();
+        }
+#endif
     }
     return 0;
 }
