@@ -668,8 +668,12 @@ static void job2d_wait(void) {
     while (!s2dJobDone) pthread_cond_wait(&s2dJobDoneCv, &s2dJobMx);
     pthread_mutex_unlock(&s2dJobMx);
 }
+// The longest render-thread frame since the last report and its parts (us), for the "render thread split" line.
+static unsigned long long sWWorst, sWWorst3d, sWWorstWait2d, sWWorstPresent, sWWorstTex, sWWorstUploads, sWWorstSync,
+    sWWorstSwap, sWWorstBands;
 static void render_worker_phase(void) {
     uint64_t tw = host_plat_time_ns();
+    uint64_t f3d = 0, fwait = 0, fpres = 0, fbands = 0;
     int par = job2d_start();
     if (!par) {
         gpu2d_render_finish();             // 2D bands + canvas from the per-line/VRAM snapshots
@@ -679,10 +683,14 @@ static void render_worker_phase(void) {
     if (sGpu3d && sDraw3d) {
         uint64_t t3d = host_plat_time_ns();
         gpu3d_render_committed();
-        sRender3dNs += host_plat_time_ns() - t3d;
+        f3d = host_plat_time_ns() - t3d;
+        sRender3dNs += f3d;
     }
     if (par) {
+        uint64_t tj = host_plat_time_ns();
         job2d_wait();
+        fwait = host_plat_time_ns() - tj;
+        fbands = s2dJobNs;
         __atomic_fetch_add(&sWBandsNs, s2dJobNs, __ATOMIC_RELAXED);
     }
     // Present the canvas this worker just produced. Only the GL present happens here: the frontend body (input
@@ -709,10 +717,21 @@ static void render_worker_phase(void) {
             if (c && rows >= 192 && rows <= 640) overlay_fps((uint32_t *)c);   // the canvas is rebuilt every frame
             if (c && rows >= 192 && rows <= 640) vita_gl_present_canvas(c, 256, rows, 0, 0, 256, rows);
         }
-        __atomic_fetch_add(&sWPresentNs, host_plat_time_ns() - tp, __ATOMIC_RELAXED);
+        fpres = host_plat_time_ns() - tp;
+        __atomic_fetch_add(&sWPresentNs, fpres, __ATOMIC_RELAXED);
     }
 #endif
-    __atomic_fetch_add(&sWorkerNs, host_plat_time_ns() - tw, __ATOMIC_RELAXED);
+    uint64_t ftot = host_plat_time_ns() - tw;
+    if (ftot / 1000 > sWWorst) {
+#if HOST_VITA
+        extern unsigned long long gG3FrameTexNs, gG3FrameUploads, gG3FrameSyncNs, gVitaFrameSwapNs;
+        sWWorstTex = gG3FrameTexNs / 1000; sWWorstUploads = gG3FrameUploads; sWWorstSync = gG3FrameSyncNs / 1000;
+        sWWorstSwap = gVitaFrameSwapNs / 1000;
+#endif
+        sWWorst = ftot / 1000; sWWorst3d = f3d / 1000; sWWorstWait2d = fwait / 1000; sWWorstPresent = fpres / 1000;
+        sWWorstBands = fbands / 1000;
+    }
+    __atomic_fetch_add(&sWorkerNs, ftot, __ATOMIC_RELAXED);
 }
 
 static void *render_worker_main(void *a) {
@@ -930,6 +949,11 @@ static void render_frame_mt(void) {
             const char *g3 = "";
 #endif
             fprintf(stderr, "render thread split (avg/drawn frame): 2d bands %llu us, present %llu us%s\n", bands, pres, g3);
+            fprintf(stderr, "render thread longest frame %llu us: 3d %llu us (texture sync %llu us, texture decode+upload %llu us "
+                    "for %llu textures), 2d bands %llu us (waited %llu us after the 3d), present %llu us (swap %llu us)\n",
+                    sWWorst, sWWorst3d, sWWorstSync, sWWorstTex, sWWorstUploads, sWWorstBands, sWWorstWait2d,
+                    sWWorstPresent, sWWorstSwap);
+            sWWorst = 0;
             fprintf(stderr, "game thread hand-off split (avg/frame): wait for render thread %llu us, VRAM snapshot %llu us,"
                     " 2d prepass %llu us (of which hblank IRQs %llu us), geometry commit (incl. wait for GX worker) %llu us\n",
                     (unsigned long long)(sHoWaitRtNs / 60000), (unsigned long long)(sHoSnapNs / 60000),

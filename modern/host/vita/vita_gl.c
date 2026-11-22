@@ -98,7 +98,7 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh);
 // The 2D bands hand over the frame's layers (gpu2d.h Gpu2dGc) and the GPU composes them with the 3D colour buffer
 // straight into the canvas texture (gpu2d_compose.h): no 3D readback, no CPU compose, no canvas upload.
 extern uint64_t host_plat_time_ns(void);
-unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;   // present split (reported with the 3D stats)
+unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
@@ -304,6 +304,7 @@ static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
     uint64_t ts = host_plat_time_ns();
     vglSwapBuffers(GL_FALSE);
     gVitaSwapNs += host_plat_time_ns() - ts;
+    { extern unsigned long long gVitaFrameSwapNs; gVitaFrameSwapNs = host_plat_time_ns() - ts; }
     gVitaPresents++;
 }
 

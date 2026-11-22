@@ -196,6 +196,11 @@ static void window_vertical(Engine *e, int line) {
         else if ((line & 0xff) == v >> 8) e->winActive[w] |= 1;
     }
 }
+#if HOST_VITA
+enum { kWideCanvas = 1 };   // the Vita composes a 16:9 canvas (vita_gl.c)
+#else
+enum { kWideCanvas = 0 };
+#endif
 static void window_line(Engine *e, const ObjLine *obj, u8 *mask) {
     u32 dispcnt = reg32(e, REG_DISPCNT);
     if (!(dispcnt & 0xe000)) { memset(mask, 0x3f, SCREEN_W); return; }
@@ -213,7 +218,9 @@ static void window_line(Engine *e, const ObjLine *obj, u8 *mask) {
         int x1 = h >> 8, x2 = h & 0xff;
         u8 in = (u8)(winin >> (8 * w) & 0x3f);
         for (int x = 0; x < SCREEN_W; x++) {
-            if (x == x2 && !(sSingle && x1 == 0 && x2 == 0xff)) e->winActive[w] &= ~2;
+            // (x1 0, x2 255 - "the whole line" to the game, e.g. the open iris - leaves the last column out on the DS;
+            // the tall single screen and the Vita's 16:9 canvas, where the picture continues past it, keep it in)
+            if (x == x2 && !((sSingle || kWideCanvas) && x1 == 0 && x2 == 0xff)) e->winActive[w] &= ~2;
             else if (x == x1) e->winActive[w] |= 2;
             if (e->winActive[w] == 3) mask[x] = in;
         }

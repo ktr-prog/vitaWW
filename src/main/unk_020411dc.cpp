@@ -36,6 +36,9 @@ HBlankTask sIrisWipeHBlankTask;
 enum { IRIS_ROWS = 0x180, IRIS_REACH = 231 };
 extern "C" int gHostCanvasRows;
 extern "C" int gHostIrisRadius;
+// the radius each table was built for: the screen shows the active table (swapped in at vblank), so the host's
+// circle (gHostIrisRadius, drawn beside the 2D on a wide screen) follows the table on screen, not the newest one
+static s32 sIrisTableRadius[2] = {-1, -1};
 #else
 enum { IRIS_ROWS = 0x60, IRIS_REACH = 160 };
 #endif
@@ -153,6 +156,9 @@ extern "C" void IrisWipe_Begin() {
     MIi_CpuClear16(z, sIrisWipeTableA, sizeof sIrisWipeTableA);
     MIi_CpuClear16(z, sIrisWipeTableB, sizeof sIrisWipeTableB);
     sIrisWipeActiveTable = sIrisWipeTableA;
+#ifdef HOST
+    sIrisTableRadius[0] = sIrisTableRadius[1] = 0;   // (the cleared tables: an empty window)
+#endif
     IrisWipe_SetupLayers();
     if (HBlank_Add(&sIrisWipeHBlankTask, IrisWipe_HBlank, IrisWipe_VBlankRegs, NULL) != 0) {
         sIrisWipeFlags |= 1;
@@ -183,13 +189,13 @@ extern "C" void IrisWipe_Update() {
     s32 v = s->progress;
     if (v == 0) {
 #ifdef HOST
-        gHostIrisRadius = -1;
+        sIrisTableRadius[p == sIrisWipeTableA ? 0 : 1] = -1;
 #endif
         volatile u16 c = 0xff;
         MIi_CpuClear16(c, p, sizeof sIrisWipeTableA);
     } else if (v == 0x1000) {
 #ifdef HOST
-        gHostIrisRadius = 0;
+        sIrisTableRadius[0] = sIrisTableRadius[1] = 0;
 #endif
         volatile u16 c = 0x8080;
     MIi_CpuClear16(c, sIrisWipeTableA, sizeof sIrisWipeTableA);
@@ -205,7 +211,7 @@ extern "C" void IrisWipe_Update() {
 #endif
         while (rr * rr < reach) rr++;
         s32 h = ((0x1000 - v) * rr) >> 12;
-        gHostIrisRadius = h;
+        sIrisTableRadius[p == sIrisWipeTableA ? 0 : 1] = h;
         s32 h2 = (h * h) << 12;
         for (s32 i = 0; i < IRIS_ROWS; p++, i++) {
             s32 y = i < 0xc0 ? i + rows - 0x180 : rows - 0xc0 + (i - 0xc0);
@@ -243,6 +249,9 @@ extern "C" void IrisWipe_SwapTables() {
         v |= 2;
         sIrisWipeFlags = v;
     }
+#ifdef HOST
+    gHostIrisRadius = sIrisTableRadius[sIrisWipeActiveTable == sIrisWipeTableA ? 0 : 1];
+#endif
 }
 
 extern "C" void CutTransition_Begin() {

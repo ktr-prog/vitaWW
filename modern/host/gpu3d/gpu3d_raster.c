@@ -642,15 +642,91 @@ void gpu3d_texture_size(uint32_t texparam, int *w, int *h) {
     *w = 8 << (texparam >> 20 & 7);
     *h = 8 << (texparam >> 23 & 7);
 }
-void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out) {
+// A whole texture to RGBA8 (GL byte order R,G,B,A; 5-bit channels widened as c * 255 / 31) - the GL renderers'
+// texture upload. Every texel lies inside the texture, so the wrap modes do not apply; the paletted formats go
+// through a per-texture table of finished RGBA values (the same as g3_texel + the widening, texel by texel: the
+// Vita's A9 has no divide instruction, and that per-texel path took milliseconds per texture).
+static u32 sC8[32];
+static inline u32 texel_rgba(u32 px) {   // low15 = BGR555, bits16-20 = 5-bit alpha
+    return sC8[px & 31] | sC8[px >> 5 & 31] << 8 | sC8[px >> 10 & 31] << 16 | sC8[px >> 16 & 31] << 24;
+}
+static void decode_texture_slow(uint32_t texparam, uint32_t texpal, uint32_t *out) {
     int w = 8 << (texparam >> 20 & 7), h = 8 << (texparam >> 23 & 7);
     for (int t = 0; t < h; t++)
-        for (int s = 0; s < w; s++) {
-            u32 px = g3_texel(texparam, texpal, s, t);       // low15 = BGR555, bits16-20 = 5-bit alpha
-            u32 r = (px & 31) * 255 / 31, g = (px >> 5 & 31) * 255 / 31, b = (px >> 10 & 31) * 255 / 31;
-            u32 a = (px >> 16 & 31) * 255 / 31;
-            out[t * w + s] = r | g << 8 | b << 16 | a << 24; // RGBA8 (GL byte order R,G,B,A)
+        for (int s = 0; s < w; s++) out[t * w + s] = texel_rgba(g3_texel(texparam, texpal, s, t));
+}
+void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out) {
+    if (!sC8[31]) for (u32 c = 0; c < 32; c++) sC8[c] = c * 255 / 31;
+    const int fmt = texparam >> 26 & 7;
+    const u32 w = 8u << (texparam >> 20 & 7), h = 8u << (texparam >> 23 & 7), n = w * h;
+    const u32 base = (texparam & 0xffff) << 3, palbase = (texpal & 0x1fff) << 4;
+    const int zero = texparam >> 29 & 1;
+    u32 tab[256];
+    switch (fmt) {
+    case 1:   // A3I5
+        for (u32 v = 0; v < 256; v++) {
+            u32 a = v >> 5;
+            tab[v] = texel_rgba((pal16(palbase + (v & 31) * 2) & 0x7fffu) | ((a << 2) + (a >> 1)) << 16);
         }
+        for (u32 i = 0; i < n; i++) out[i] = tab[img8(base + i)];
+        return;
+    case 2:   // 4 colours (palette base in 8-byte units)
+        for (u32 c = 0; c < 4; c++)
+            tab[c] = zero && !c ? 0 : texel_rgba((pal16(((texpal & 0x1fff) << 3) + c * 2) & 0x7fffu) | 31u << 16);
+        for (u32 i = 0; i < n; i++) out[i] = tab[img8(base + (i >> 2)) >> ((i & 3) * 2) & 3];
+        return;
+    case 3:   // 16 colours
+        for (u32 c = 0; c < 16; c++) tab[c] = zero && !c ? 0 : texel_rgba((pal16(palbase + c * 2) & 0x7fffu) | 31u << 16);
+        for (u32 i = 0; i < n; i++) out[i] = tab[img8(base + (i >> 1)) >> ((i & 1) * 4) & 15];
+        return;
+    case 4:   // 256 colours
+        for (u32 c = 0; c < 256; c++) tab[c] = zero && !c ? 0 : texel_rgba((pal16(palbase + c * 2) & 0x7fffu) | 31u << 16);
+        for (u32 i = 0; i < n; i++) out[i] = tab[img8(base + i)];
+        return;
+    case 6:   // A5I3
+        for (u32 v = 0; v < 256; v++) tab[v] = texel_rgba((pal16(palbase + (v & 7) * 2) & 0x7fffu) | (v >> 3) << 16);
+        for (u32 i = 0; i < n; i++) out[i] = tab[img8(base + i)];
+        return;
+    case 7:   // direct colour
+        for (u32 i = 0; i < n; i++) {
+            u16 v = img16(base + i * 2);
+            out[i] = (v & 0x8000) ? texel_rgba((v & 0x7fffu) | 31u << 16) : 0;
+        }
+        return;
+    case 5:   // 4x4-compressed: the four colours of each block once, then its 16 texels
+        for (u32 by = 0; by < h / 4; by++)
+            for (u32 bx = 0; bx < w / 4; bx++) {
+                u32 addr = base + (by * (w >> 2) + bx) * 4;
+                u32 bits = img32(addr);
+                u32 slot1 = 0x20000 + ((addr & 0x1ffff) >> 1) + ((addr >> 17) == 2 ? 0x10000 : 0);
+                u16 info = img16(slot1);
+                u32 pb = palbase + (u32)(info & 0x3fff) * 4;
+                int mode = info >> 14;
+                u16 c0 = pal16(pb), c1 = pal16(pb + 2);
+                u32 col[4];
+                for (u32 c = 0; c < 4; c++) {
+                    if (c == 3 && mode < 2) { col[c] = 0; continue; }
+                    if (c < 2 || mode == 2) { col[c] = texel_rgba((pal16(pb + c * 2) & 0x7fffu) | 31u << 16); continue; }
+                    u32 r0 = c0 & 31, g0 = c0 >> 5 & 31, b0 = c0 >> 10 & 31, r1 = c1 & 31, g1 = c1 >> 5 & 31, b1 = c1 >> 10 & 31;
+                    u32 r, g, b;
+                    if (mode == 1) {
+                        r = (r0 + r1) / 2, g = (g0 + g1) / 2, b = (b0 + b1) / 2;
+                    } else if (c == 2) {
+                        r = (r0 * 5 + r1 * 3) / 8, g = (g0 * 5 + g1 * 3) / 8, b = (b0 * 5 + b1 * 3) / 8;
+                    } else {
+                        r = (r0 * 3 + r1 * 5) / 8, g = (g0 * 3 + g1 * 5) / 8, b = (b0 * 3 + b1 * 5) / 8;
+                    }
+                    col[c] = texel_rgba(r | g << 5 | b << 10 | 31u << 16);
+                }
+                u32 *o = out + by * 4 * w + bx * 4;
+                for (u32 t = 0; t < 4; t++, o += w)
+                    for (u32 s4 = 0; s4 < 4; s4++) o[s4] = col[bits >> ((t * 4 + s4) * 2) & 3];
+            }
+        return;
+    default:  // format 0: texel by texel
+        decode_texture_slow(texparam, texpal, out);
+        return;
+    }
 }
 int gpu3d_pixel_polygon(int x, int y, Gpu3dPolyInfo *info) {
     int i = sPoly[(y + g3_shown_yofs()) * W + x];

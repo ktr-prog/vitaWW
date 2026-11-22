@@ -32,6 +32,7 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 
 // Timing split of g3w_render, reported on the "render thread split" line.
 extern uint64_t host_plat_time_ns(void);
+unsigned long long gG3FrameTexNs, gG3FrameUploads, gG3FrameSyncNs;   // the last frame's (render.c: longest frame)
 static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws, sStGlNs, sStResolveNs, sStSyncNs;
 unsigned long long vita_gl3d_stats(char *buf, int n) {
     unsigned long long c = sStCalls ? sStCalls : 1;
@@ -91,6 +92,7 @@ static int tex_touches_dirty(uint32_t tp, uint32_t pp) {
 static void tex_upload(TexEnt *e) {
     uint64_t t0 = host_plat_time_ns();
     sStTexUploads++;
+    gG3FrameUploads++;
     int w, h;
     gpu3d_texture_size(e->tp, &w, &h);
     if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return;
@@ -106,6 +108,7 @@ static void tex_upload(TexEnt *e) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     sStTexNs += host_plat_time_ns() - t0;
+    gG3FrameTexNs += host_plat_time_ns() - t0;
 }
 static int tex_slot(uint32_t tp, uint32_t pp) {
     int h = (int)((tp * 2654435761u ^ pp * 40503u) & (TC_SLOTS - 1));
@@ -230,6 +233,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     if (!sEnabled || !out) return;
     lazy_init();
     uint64_t tSync = host_plat_time_ns();
+    gG3FrameTexNs = gG3FrameUploads = 0;
     // Group the polygons by texture once (a hash of texparam/texpal, O(n)): each distinct texture is synced,
     // resolved and bound once per frame, and the opaque polygons are drawn group by group (in the order each
     // texture first appears) - no qsort with a pointer-chasing comparator, no per-polygon cache lookup.
@@ -264,6 +268,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     tex_frame_begin(img, pal);   // re-decode only textures whose VRAM changed since last frame
     uint64_t tStart = host_plat_time_ns();
     sStSyncNs += tStart - tSync;
+    gG3FrameSyncNs = tStart - tSync;
     sStCalls++;
 
     // Deferred readback: read back the PREVIOUS frame's FBO into `out` (DS 3D line format) before submitting this
