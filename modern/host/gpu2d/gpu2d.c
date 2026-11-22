@@ -1330,10 +1330,34 @@ static u32 sub_regs_hash(const Engine *e1, int mirror, u32 h) {
     h = hash_words(h, 0, v, sizeof v, &g);
     return mix32(h, g);
 }
+// The 16-colour palettes BG2 (a text BG in 16 colours) draws with: one bit per palette, from its map entries.
+// 0xffff when it is not that kind of BG (all 256 colours count). The title animates other colours a few times a
+// second, which alone redrew the logo each time.
+static u32 bg2_palette_mask(const Engine *e1) {
+    u16 cnt = reg16(e1, 0x0c);
+    u32 mode = reg32(e1, REG_DISPCNT) & 7;
+    if ((cnt & 0x80) || !(mode <= 1 || mode == 3)) return 0xffff;   // 256 colours, or BG2 not a text BG
+    static const u8 kBlocks[4] = {1, 2, 2, 4};
+    u32 base = (u32)(cnt >> 8 & 31) * 0x800, mask = 0;
+    for (u32 b = 0; b < kBlocks[cnt >> 14]; b++)
+        for (u32 i = 0; i < 0x800; i += 2) {
+            u32 a = (base + b * 0x800 + i) & e1->bgMask;
+            const u8 *gp = e1->bgGran[a >> 14];
+            if (gp) mask |= 1u << (gp[(a & 0x3fff) + 1] >> 4);
+        }
+    return mask;
+}
 static u32 sub_state_hash(const Engine *e1, int mirror) {
     u32 g = 0x9e3779b9u, h = mix32(2166136261u, (u32)mirror);
     h = sub_regs_hash(e1, mirror, h);
-    h = hash_words(h, g, e1->palette, mirror ? 0x400 : 0x200, &g);
+    if (mirror)
+        h = hash_words(h, g, e1->palette, 0x400, &g);
+    else {
+        u32 pm = bg2_palette_mask(e1);
+        h = mix32(h, pm);
+        for (int i = 0; i < 16; i++)
+            if (pm >> i & 1) h = hash_words(h, g, e1->palette + i * 32, 32, &g);
+    }
     for (int i = 0; i < 8; i++) {   // engine B: 128 KB of BG VRAM (and of OBJ VRAM), 16 KB granules, each once
         int seen = 0;
         for (int j = 0; j < i; j++) seen |= e1->bgGran[j] == e1->bgGran[i];
