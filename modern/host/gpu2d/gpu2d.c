@@ -1121,6 +1121,7 @@ typedef struct { s32 refX[2], refY[2]; int refLine; u8 refWritten[2], winActive[
 typedef struct {
     const Gpu2dFrameInput *in; Engine *src; Engine *be; int lo, hi; Snap2d snap; u32 *canvas;
     int mirror;                                                     // engine B into sLogo: 1 whole, 2 menu overlay
+    const u8 *dirty;                                                // (mirror) lines to draw; the others keep theirs
     const u8 (*regSnap)[REG_SIZE], (*palSnap)[0x400];               // other per-line snapshots (engine B's), or NULL
 } Band2d;
 static u8 s2dRegSnapB[SCREEN_H][REG_SIZE];   // (Vita) engine B's per-line registers and palettes, for the menu overlay
@@ -1283,6 +1284,12 @@ static void band2d_run(Band2d *w) {
         memcpy(e->regs, w->regSnap ? w->regSnap[line] : s2dRegSnap[line], REG_SIZE);   // per-line registers
         e->palette = w->palSnap ? w->palSnap[line] : s2dPalLine[line];                  // per-line palette
         window_vertical(e, line);
+        if (w->mirror && w->dirty && !w->dirty[line]) {   // this line of engine B's picture did not change
+            obj_mosaic_y(e, line);
+            ref_advance(e, line);
+            if (line + 1 == w->hi) e->objCandOn = 0;
+            continue;
+        }
         if (line == 0 && e->haveNextLine0) e->obj = e->objNextLine0;
         else if (line == 0) memset(&e->obj, 0, sizeof e->obj);
         else gpu2d_render_obj_line(e, line, &e->obj);
@@ -1408,6 +1415,57 @@ static u32 sub_state_hash(const Engine *e1, int mirror) {
     }
     return mix32(h, g);
 }
+// Engine B's whole picture (the menus, the boot screens) is redrawn line by line: only the lines whose registers or
+// palette changed, the lines a changed OAM entry covers (before or after), or all of them when its VRAM changed.
+// The menus animate a cursor and scroll their background every frame; drawing all of engine B each frame cost the
+// menus ~18 ms per band (30 fps).
+static u32 bline_sig(const u8 *regs, u32 palh) {   // a line's registers, without the scroll of BGs not shown
+    u8 t[REG_SIZE];
+    memcpy(t, regs, REG_SIZE);
+    u32 dc = (u32)(t[0] | t[1] << 8 | t[2] << 16 | (u32)t[3] << 24), g;
+    for (int n = 0; n < 4; n++)
+        if (!(dc >> (8 + n) & 1)) {
+            memset(t + 0x10 + 4 * n, 0, 4);
+            if (n >= 2) memset(t + 0x20 + 0x10 * (n - 2), 0, 0x10);
+        }
+    u32 h = hash_words(palh, 0, t, REG_SIZE, &g);
+    return mix32(h, g);
+}
+static u32 sub_vram_hash(const Engine *e1) {   // engine B's VRAM (BG and OBJ) and extended palettes
+    u32 g = 0x9e3779b9u, h = 0x85ebca6bu;
+    for (int i = 0; i < 8; i++) {
+        int seen = 0;
+        for (int j = 0; j < i; j++) seen |= e1->bgGran[j] == e1->bgGran[i];
+        h = mix32(h, e1->bgGran[i] != NULL);
+        if (e1->bgGran[i] && !seen) h = hash_words(h, g, e1->bgGran[i], 0x4000, &g);
+    }
+    for (int i = 0; i < 8; i++) {
+        int seen = 0;
+        for (int j = 0; j < i; j++) seen |= e1->objGran[j] == e1->objGran[i];
+        h = mix32(h, e1->objGran[i] != NULL);
+        if (e1->objGran[i] && !seen) h = hash_words(h, g, e1->objGran[i], 0x4000, &g);
+    }
+    for (int i = 0; i < 4; i++)
+        if (e1->bgExtPal[i]) h = hash_words(h, g, e1->bgExtPal[i], 0x2000, &g);
+    if (e1->objExtPal) h = hash_words(h, g, e1->objExtPal, 0x2000, &g);
+    return mix32(h, g);
+}
+static void oam_mark(u8 *dirty, const u8 *ent) {   // the lines an OAM entry (attr0/1) covers
+    u16 a0 = (u16)(ent[0] | ent[1] << 8), a1 = (u16)(ent[2] | ent[3] << 8);
+    if (!(a0 & 0x100) && (a0 & 0x200)) return;   // disabled
+    static const u8 kH[3][4] = {{8, 16, 32, 64}, {8, 8, 16, 32}, {16, 32, 32, 64}};
+    if ((a0 >> 14) == 3) return;
+    int h = kH[a0 >> 14][a1 >> 14];
+    if ((a0 & 0x300) == 0x300) h *= 2;
+    for (int i = 0; i < h; i++) {
+        int y = ((a0 & 0xff) + i) & 0xff;
+        if (y < SCREEN_H) dirty[y] = 1;
+    }
+}
+static u8 sBDirty[SCREEN_H];
+static u32 sBLineSig[SCREEN_H], sBVramSig;
+static u8 sBOam[0x400];
+static int sBValid, sBMode;
 static u32 sSubSig, sSubLines;
 static int sSubDirty = 1;
 unsigned gSubFrames, gSubDraws;   // (render.c's log) frames with a sub-screen picture, and how many redrew it
@@ -1419,23 +1477,48 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     int subDraw = 0;
     u32 subLines = 2166136261u;
     const int whole = sMirrorOn || sOverlayOn;   // engine B's whole picture is drawn (boot screens, menus)
-    if (whole || sLogoOn) {
+    int bAll = 0;   // (whole) every line of engine B is redrawn
+    if (whole) {
         uint64_t t0 = host_plat_time_ns();
-        u32 sig = sub_state_hash(&sEngine[1], whole + sOverlayOn);
+        const Engine *e1 = &sEngine[1];
+        int mode = sMirrorOn ? 1 : 2;
+        u32 vs = sub_vram_hash(e1);
+        bAll = !sBValid || mode != sBMode || vs != sBVramSig || (sMirrorOn && !sMirrorReady) ||
+               (sOverlayOn && !sOvlReady);
+        sBVramSig = vs;
+        sBMode = mode;
+        memset(sBDirty, 0, sizeof sBDirty);
+        if (!bAll) {   // OAM entries that changed: the lines they covered and cover now
+            int rot = 0;
+            for (int i = 0; i < 128; i++) {
+                const u8 *o = e1->oam + i * 8, *p = sBOam + i * 8;
+                if (memcmp(o, p, 6)) oam_mark(sBDirty, p), oam_mark(sBDirty, o);
+                rot |= o[6] != p[6] || o[7] != p[7];   // rotation/scaling parameters
+            }
+            if (rot) bAll = 1;
+        }
+        memcpy(sBOam, e1->oam, 0x400);
         gSubCheckNs += host_plat_time_ns() - t0;
-        subDraw = sSubDirty || sig != sSubSig || (sMirrorOn && !sMirrorReady) || (sOverlayOn && !sOvlReady) ||
-                  (sLogoOn && !sLogoReady && !sLogoFull);
-        sSubSig = sig;
         gSubFrames++;
-        gSubDraws += subDraw;
-    } else
-        sSubDirty = 1;
+    } else {
+        sBValid = 0;
+        if (sLogoOn) {
+            uint64_t t0 = host_plat_time_ns();
+            u32 sig = sub_state_hash(&sEngine[1], 0);
+            gSubCheckNs += host_plat_time_ns() - t0;
+            subDraw = sSubDirty || sig != sSubSig || (!sLogoReady && !sLogoFull);
+            sSubSig = sig;
+            gSubFrames++;
+            gSubDraws += subDraw;
+        } else
+            sSubDirty = 1;
+    }
     if (subDraw) sLogoFull = 0;
-    // A changed mirror picture (a menu, a boot screen) is drawn by the bands from engine B's per-line snapshots, off
-    // the game thread (on it, one engine-B frame cost ~42 ms on the Vita: the menus ran at 20-30 fps). Engine A is
-    // not shown then, so the bands are free for it.
-    const int mirrorBand = sMirrorOn && subDraw;
-    const int overlayBand = sOverlayOn && subDraw;   // the menu: engine B's bands after engine A's (sMtWB)
+    // Engine B's whole picture (a menu, a boot screen) is drawn by the bands from its per-line snapshots, off the
+    // game thread - only its changed lines (sBDirty). The boot screens: the bands draw only engine B (engine A is
+    // not seen). The menus: engine A as always, then engine B's changed lines (sMtWB) to go over it.
+    const int mirrorBand = sMirrorOn;
+    const int overlayBand = sOverlayOn;
     Engine *se = mirrorBand ? &sEngine[1] : e;   // the engine the bands draw
     sIrisSnap = gHostIrisRadius;
     for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
@@ -1467,14 +1550,27 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
             memcpy(s2dRegSnapB[line], sEngine[1].regs, REG_SIZE);
             memcpy(s2dPalSnapB[line], sEngine[1].palette, 0x400);
         }
+        if (whole) {   // this line's inputs against last frame's: redraw it when they differ
+            static u32 palh;
+            const u8 *pl = overlayBand ? s2dPalSnapB[line] : s2dPalSnap[line];
+            const u8 *pp = line ? (overlayBand ? s2dPalSnapB[line - 1] : s2dPalSnap[line - 1]) : NULL;
+            if (!pp || memcmp(pl, pp, 0x400)) {
+                u32 g;
+                palh = hash_words(0x27d4eb2du, 0, pl, 0x400, &g);
+                palh = mix32(palh, g);
+            }
+            u32 ls = bline_sig(sEngine[1].regs, palh);
+            if (bAll || ls != sBLineSig[line]) sBDirty[line] = 1;
+            sBLineSig[line] = ls;
+        }
         if (mirrorBand || overlayBand) {   // engine B's own per-line state, for the band snapshots above
             Engine *e1 = &sEngine[1];
             window_vertical(e1, line);
             if (line == 0) { e1->objMosaicLine = 0; e1->objMosaicCount = 0; }
             obj_mosaic_y(e1, line);
         }
-        if (whole || sLogoOn) {   // what the hblank IRQs leave in engine B's registers, line by line
-            subLines = sub_regs_hash(&sEngine[1], whole, mix32(subLines, (u32)line));
+        if (sLogoOn) {   // what the hblank IRQs leave in engine B's registers, line by line
+            subLines = sub_regs_hash(&sEngine[1], 0, mix32(subLines, (u32)line));
         }
         if (sLogoOn && subDraw) {   // the sub screen's BG2 line (before this line's hblank, as the sequential loop)
             Engine *e1 = &sEngine[1];
@@ -1496,11 +1592,17 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
     }
-    if (whole || sLogoOn) {   // hblank-set registers changed while the frame start did not: redraw next frame
+    if (sLogoOn) {   // hblank-set registers changed while the frame start did not: redraw next frame
         sSubDirty = subLines != sSubLines;
         sSubLines = subLines;
     }
     if (!sMirrorOn) sMirrorReady = 0;
+    int bLines = 0;
+    if (whole) {
+        for (int i = 0; i < SCREEN_H; i++) bLines += sBDirty[i];
+        sBValid = 1;
+        gSubDraws += bLines != 0;
+    }
     if (mirrorBand) sMirrorReady = 1;   // (the bands fill sLogo before this frame's present, on the render thread)
     if (!sOverlayOn) sOvlReady = 0;
     if (overlayBand) sOvlReady = 1;
@@ -1520,13 +1622,14 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     for (int b = 0; b < s2dNB; b++) {
         sMtW[b].in = in; sMtW[b].src = se; sMtW[b].be = &s2dBandEng[b]; sMtW[b].lo = sMtBnd[b]; sMtW[b].hi = sMtBnd[b + 1];
         sMtW[b].mirror = mirrorBand;
+        sMtW[b].dirty = sBDirty;
         sMtW[b].regSnap = NULL, sMtW[b].palSnap = NULL;
         memcpy(&s2dBandEng[b], se, offsetof(Engine, out));   // inputs only, not the big output arrays
         sMtWB[b].in = in; sMtWB[b].src = &sEngine[1]; sMtWB[b].be = &s2dBandEngB[b];
-        sMtWB[b].lo = sMtBnd[b]; sMtWB[b].hi = overlayBand ? sMtBnd[b + 1] : sMtBnd[b];
-        sMtWB[b].canvas = NULL; sMtWB[b].mirror = 2;
+        sMtWB[b].lo = sMtBnd[b]; sMtWB[b].hi = overlayBand && bLines ? sMtBnd[b + 1] : sMtBnd[b];
+        sMtWB[b].canvas = NULL; sMtWB[b].mirror = 2; sMtWB[b].dirty = sBDirty;
         sMtWB[b].regSnap = s2dRegSnapB, sMtWB[b].palSnap = s2dPalSnapB;
-        if (overlayBand) memcpy(&s2dBandEngB[b], &sEngine[1], offsetof(Engine, out));
+        if (overlayBand && bLines) memcpy(&s2dBandEngB[b], &sEngine[1], offsetof(Engine, out));
     }
 }
 

@@ -339,7 +339,9 @@ extern "C" BOOL MenuScreen_StepAct04() {
     if (MenuScreen_LoadBackground(5)) {
         Gfx2d_DisableMainWindows(2);
         Gfx2d_HideSubPlanes(0xf);
-        Gfx2d_ShowLayer(5);
+#if !HOST_VITA
+        Gfx2d_ShowLayer(5);   // (the Vita: the menus' background pattern stays hidden - the scene shows through)
+#endif
         gGfxMainOnTop = 1;
         MenuCtrl_ClearScreenChanging();
         MenuCtrl_SetMenuOnTop();
