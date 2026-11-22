@@ -105,7 +105,7 @@ static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 // The composed canvas is 16:9 at the DS's 192 lines: GC_W columns (the 3D view across all of them, the 2D layers
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
 enum { GC_W = 341, GC_TEX_W = 352 };
-static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1;
+static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -189,6 +189,8 @@ int vita_gl_gc_init(void) {
     sGcLogoOn = glGetUniformLocation(sGcProg, "uLogoOn");
     sGcLogoOfs = glGetUniformLocation(sGcProg, "uLogoOfs");
     sGcBg3Shift = glGetUniformLocation(sGcProg, "uBg3Shift");
+    sGcMirror = glGetUniformLocation(sGcProg, "uMirror");
+    glUniform1f(sGcMirror, 0.0f);
     glUniform1f(sGcLogoOn, 0.0f);
     glUseProgram(0);
     for (int set = 0; set < 2; set++) {
@@ -259,10 +261,10 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glBindTexture(GL_TEXTURE_2D, tex3d);
     {   // the title screen: the logo (gpu2d: the top screen's BG2), 1:1, centred on the screen; "touch to start"
         // (BG3) moved right by the side bar's width, into the screen's bottom-right corner
-        extern int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt);
+        extern int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror);
         const uint32_t *lp;
-        int dx, dy, prompt;
-        int on = gpu2d_gc_logo(&lp, &dx, &dy, &prompt);
+        int dx, dy, prompt, mirror;
+        int on = gpu2d_gc_logo(&lp, &dx, &dy, &prompt, &mirror);
         if (on) {
             glActiveTexture(GL_TEXTURE0 + 9);
             int first = !sGcLogoTex;
@@ -277,7 +279,8 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             }
         }
         glUseProgram(sGcProg);
-        glUniform1f(sGcLogoOn, on ? 1.0f : 0.0f);
+        glUniform1f(sGcLogoOn, on && !mirror ? 1.0f : 0.0f);
+        glUniform1f(sGcMirror, mirror ? 1.0f : 0.0f);   // the boot screens: the top screen's picture instead
         glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
         glUniform1f(sGcBg3Shift, prompt ? (float)(GC_W - 256) / 2.0f : 0.0f);
     }

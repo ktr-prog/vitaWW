@@ -36,6 +36,7 @@ static const char kGcVertexShader[] =
     "uniform float uW;\n" \
     "uniform sampler2D uLogo;\n" \
     "uniform float uLogoOn;\n" \
+    "uniform float uMirror;\n" \
     "uniform vec2 uLogoOfs;\n" \
     "uniform float uBg3Shift;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
@@ -54,6 +55,7 @@ static const char kGcVertexShader[] =
     "  float in2d = x >= 0.0 && x < 256.0 ? 1.0 : 0.0;\n" \
     "  float x3 = floor((cx + 0.5) * 256.0 / uW);\n" \
     "  vec2 uv = vec2((x + 0.5) / 256.0, (y + 0.5) / 192.0);\n" \
+    "  if (uMirror > 0.5) return in2d > 0.5 ? vec4(texture2D(uLogo, uv).rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
     "  float py = (y + 0.5) / 192.0;\n" \
     "  vec4 p0 = texture2D(uPar, vec2(0.5 / 8.0, py));\n" \
     "  vec4 p1 = texture2D(uPar, vec2(1.5 / 8.0, py));\n" \

@@ -804,11 +804,16 @@ static int sIrisSnap = -1;
 // thread in the prepass - drawn 1:1 at the same place on the main screen by the GPU compose. RGBA8 (R,G,B,A
 // bytes), transparent where BG2 is. Not while BG2 is a full-screen picture (the black wipe before the logo).
 static int sLogoOn, sLogoReady, sLogoFull, sLogoDx, sLogoDy, sPromptSnap;
+// The boot screens (scene 0x3f): the Vita shows the top screen (the Nintendo logo) instead of the bottom one (the
+// online-play notice) - the sub engine's whole picture, rendered on the game thread, in sLogo.
+static int sMirrorOn, sMirrorReady;
 static uint32_t sLogo[SCREEN_W * SCREEN_H];
 int gHostTitlePrompt;   // TitleBlinkText (Vita): the "touch to start" BG3 is shown
 // The logo (NULL when none) and how far to move it to centre it on the screen (dx, dy); prompt: BG3 is the title's
 // "touch to start", to be drawn in the screen's bottom-right corner.
-int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt) {
+int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror) {
+    *mirror = sMirrorReady;
+    if (sMirrorReady) { *px = sLogo; *dx = *dy = *prompt = 0; return 1; }
     *prompt = sLogoOn && sPromptSnap;
     *dx = sLogoDx;
     *dy = sLogoDy;
@@ -1299,6 +1304,14 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
+        if (sMirrorOn) {   // the boot screens: the sub screen's whole line (before this line's hblank)
+            Engine *e1 = &sEngine[1];
+            window_vertical(e1, line);
+            if (line == 0 && e1->haveNextLine0) e1->obj = e1->objNextLine0;
+            else if (line == 0) memset(&e1->obj, 0, sizeof e1->obj);
+            else gpu2d_render_obj_line(e1, line, &e1->obj);
+            render_line(e1, in, line);
+        }
         if (sLogoOn) {   // the sub screen's BG2 line (before this line's hblank, as the sequential loop)
             Engine *e1 = &sEngine[1];
             u32 *lp = sLogo + line * SCREEN_W;
@@ -1318,6 +1331,15 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         }
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
+    }
+    sMirrorReady = 0;
+    if (sMirrorOn) {
+        const u32 *o = sEngine[1].out;
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+            u32 c = argb(o[i]);
+            sLogo[i] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | 0xff000000u;
+        }
+        sMirrorReady = 1;
     }
     sLogoReady = sLogoOn && !sLogoFull;
     sPromptSnap = gHostTitlePrompt;
@@ -1505,7 +1527,9 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     const int mainOnly = 1;  // the Vita shows only the main screen: never render the top screen (engine 1)
     {   // ... except its logo on the title screen (render_engine0_mt_prepass)
         extern unsigned Scene_GetCurrent(void);
-        sLogoOn = Scene_GetCurrent() == 0x2c;
+        unsigned sc = Scene_GetCurrent();
+        sLogoOn = sc == 0x2c;
+        sMirrorOn = sc == 0x3f;
     }
 #else
     static int forceMain = -1;
@@ -1552,7 +1576,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     }
     sExtRows = 0;
     if (sSingle && !sSingleBlank && !sGpu && !sDefer3d) render_ext_sky(in);
-    for (int n = 0; n < (mainOnly ? 1 : 2); n++) {
+    for (int n = 0; n < (mainOnly && !sMirrorOn ? 1 : 2); n++) {
         Engine *e = &sEngine[n];
         for (int line = SCREEN_H + 1; line < FRAME_LINES; line++) window_vertical(e, line);
         gpu2d_render_obj_line(e, 0, &e->objNextLine0);

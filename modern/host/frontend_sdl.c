@@ -417,6 +417,7 @@ static void pad_removed(SDL_JoystickID id) {
 
 static struct { int held, x, y; } sMouse, sFinger;
 static SDL_FingerID sFingerId;
+static SDL_TouchID sFingerTouch;   // the device the held finger is on
 static void window_to_logical(int wx, int wy, int *x, int *y) {
     if (!sGpu) { *x = wx, *y = wy; return; }
     int w, h;
@@ -619,16 +620,21 @@ static void handle_event(const SDL_Event *e) {
         break;
     case SDL_FINGERDOWN:
         if (sFinger.held) break;
+#if HOST_VITA
+        // only the front screen; the rear touch pad is not the DS touch screen
+        if (SDL_GetTouchDeviceType(e->tfinger.touchId) != SDL_TOUCH_DEVICE_DIRECT) break;
+#endif
+        sFingerTouch = e->tfinger.touchId;
         sFingerId = e->tfinger.fingerId;
         sFinger.held = 1;
         finger_to_logical(e->tfinger.x, e->tfinger.y, &sFinger.x, &sFinger.y);
         break;
     case SDL_FINGERMOTION:
-        if (sFinger.held && e->tfinger.fingerId == sFingerId)
+        if (sFinger.held && e->tfinger.fingerId == sFingerId && e->tfinger.touchId == sFingerTouch)
             finger_to_logical(e->tfinger.x, e->tfinger.y, &sFinger.x, &sFinger.y);
         break;
     case SDL_FINGERUP:
-        if (sFinger.held && e->tfinger.fingerId == sFingerId) sFinger.held = 0;
+        if (sFinger.held && e->tfinger.fingerId == sFingerId && e->tfinger.touchId == sFingerTouch) sFinger.held = 0;
         break;
     default: break;
     }

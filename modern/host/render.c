@@ -855,7 +855,8 @@ static void render_frame_mt(void) {
         {   // the title screen: the sub screen's logo is drawn onto the main screen (gpu2d), so keep its banks too
             extern unsigned Scene_GetCurrent(void);
             extern int gHostSnapSub;
-            gHostSnapSub = Scene_GetCurrent() == 0x2c;
+            unsigned sc = Scene_GetCurrent();
+            gHostSnapSub = sc == 0x2c || sc == 0x3f;   // the title's logo; the boot screens' Nintendo logo
         }
 #endif
         if (mainOnly) host_vram_snapshot_banks(sSnapBank, slot, gpu2d_main_vram_display());
