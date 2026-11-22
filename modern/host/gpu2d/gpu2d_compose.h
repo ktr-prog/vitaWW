@@ -197,8 +197,8 @@ static const char kBlitVertexShaderCg[] =
     "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
 static const char kBlitFragmentShaderCg[] =
-    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz) : COLOR {\n"
-    "  float2 tx = vTex * uSz.xy;\n"
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz, uniform float2 uShift) : COLOR {\n"
+    "  float2 tx = vTex * uSz.xy + uShift;\n"
     "  float2 fl = floor(tx);\n"
     "  float2 d = tx - fl - 0.5;\n"
     "  float2 r = 0.5 - 0.5 / uSz.zw;\n"

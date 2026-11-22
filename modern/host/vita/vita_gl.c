@@ -108,7 +108,7 @@ static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 enum { GC_W = 341, GC_TEX_W = 352 };
 static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1, sGcObjMove = -1, sGcObjShift = -1;
 static GLuint sBlitProg;   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
-static GLint sBlitPos = -1, sBlitTex = -1;
+static GLint sBlitPos = -1, sBlitTex = -1, sBlitShift = -1;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -333,6 +333,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         if (sBlitProg) {
             sBlitPos = glGetAttribLocation(sBlitProg, "aPos");
             sBlitTex = glGetAttribLocation(sBlitProg, "aTex");
+            sBlitShift = glGetUniformLocation(sBlitProg, "uShift");
             glUseProgram(sBlitProg);
             glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
             glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
@@ -349,6 +350,11 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         static const float kTex[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(sBlitProg);
+        {   // The title logo with its year is 179 lines tall, leaving 13 free: even gaps (6.5 each) need half a DS
+            // line, so while it is shown the picture goes up half a DS line here (still sharp; 1.4 Vita pixels).
+            extern int gpu2d_logo_shown(void);
+            glUniform2f(sBlitShift, 0.0f, gpu2d_logo_shown() ? 0.5f : 0.0f);
+        }
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, sGcCanvas);
         glEnableVertexAttribArray((GLuint)sBlitPos);

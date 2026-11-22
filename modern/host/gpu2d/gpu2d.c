@@ -822,6 +822,7 @@ int gpu2d_gc_objmove(int rect[4]) {
     rect[0] = sClockXSnap + CLOCK_BOX_DX, rect[1] = sClockYSnap + CLOCK_BOX_DY, rect[2] = 256, rect[3] = 192;
     return sClockSnap;
 }
+int gpu2d_logo_shown(void) { return sLogoReady && !sMirrorReady; }   // (Vita) the title logo is drawn
 int gpu2d_sub_shown(void) { return (sPowCnt & 0x8000) != 0; }   // (Vita) engine B is the screen shown
 int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror) {
     *mirror = sMirrorReady;
@@ -1295,9 +1296,79 @@ static int sMtBnd[N2DBANDS + 1];
 static int s2dNB = N2DBANDS;   // bands in use (2 on the Vita with the render thread: the render thread + one helper)
 static int sMtPending;   // a prepass ran in deferred mode and is waiting for its bands to be run by the worker
 
+// The sub screen's pictures the Vita draws on the CPU (the title logo, the mirrored engine B) are redrawn only when
+// what they are drawn from changed: the frame's start state (registers, palettes, OAM, the VRAM banks behind it)
+// and, one frame late, the registers the hblank IRQs set line by line. On the title the logo cost 4.3 ms of the
+// game thread every frame for a picture that rarely changes.
+// Two murmur3-style lanes (rotations carry every bit into every other; a plain multiply only carries upwards, so
+// the same change seen twice - one VRAM bank behind two granules - could cancel out).
+static inline u32 mix32(u32 h, u32 k) {
+    k *= 0xcc9e2d51u; k = k << 15 | k >> 17; k *= 0x1b873593u;
+    h ^= k; h = h << 13 | h >> 19;
+    return h * 5u + 0xe6546b64u;
+}
+static u32 hash_words(u32 h, u32 g, const void *p, u32 n, u32 *g_out) {
+    const u32 *q = (const u32 *)p;
+    for (u32 i = 0; i + 1 < n / 4; i += 2) {
+        h = mix32(h, q[i]);
+        g = mix32(g, q[i + 1]);
+    }
+    *g_out = g;
+    return h;
+}
+// The registers a picture is drawn from: engine B's all for the mirror; for the logo only BG2's (DISPCNT, BG2CNT,
+// BG2 scroll, BG2 affine parameters and reference point, MOSAIC) - the title's clouds scroll BG3 every frame.
+static u32 sub_regs_hash(const Engine *e1, int mirror, u32 h) {
+    u32 g;
+    if (mirror) {   // (engine B's line also takes engine A's DISPCNT and master brightness: render_line, sSingle)
+        h = mix32(mix32(h, reg32(&sEngine[0], REG_DISPCNT)), reg16(&sEngine[0], REG_MASTER_BRIGHT));
+        h = hash_words(h, 0, e1->regs, REG_SIZE, &g);
+        return mix32(h, g);
+    }
+    u32 v[12] = {reg32(e1, 0x00), reg16(e1, 0x0c), reg32(e1, 0x18), reg32(e1, 0x20), reg32(e1, 0x24), reg32(e1, 0x28),
+                 reg32(e1, 0x2c), reg16(e1, 0x4c), 0, 0, 0, 0};
+    h = hash_words(h, 0, v, sizeof v, &g);
+    return mix32(h, g);
+}
+static u32 sub_state_hash(const Engine *e1, int mirror) {
+    u32 g = 0x9e3779b9u, h = mix32(2166136261u, (u32)mirror);
+    h = sub_regs_hash(e1, mirror, h);
+    h = hash_words(h, g, e1->palette, mirror ? 0x400 : 0x200, &g);
+    for (int i = 0; i < 8; i++) {   // engine B: 128 KB of BG VRAM (and of OBJ VRAM), 16 KB granules, each once
+        int seen = 0;
+        for (int j = 0; j < i; j++) seen |= e1->bgGran[j] == e1->bgGran[i];
+        h = mix32(h, (u32)(uintptr_t)e1->bgGran[i]);
+        if (e1->bgGran[i] && !seen) h = hash_words(h, g, e1->bgGran[i], 0x4000, &g);
+    }
+    for (int i = 0; i < 4; i++)
+        if (e1->bgExtPal[i]) h = hash_words(h, g, e1->bgExtPal[i], 0x2000, &g);
+    if (mirror) {
+        h = hash_words(h, g, e1->oam, 0x400, &g);
+        for (int i = 0; i < 8; i++) {
+            int seen = 0;
+            for (int j = 0; j < i; j++) seen |= e1->objGran[j] == e1->objGran[i];
+            h = mix32(h, (u32)(uintptr_t)e1->objGran[i]);
+            if (e1->objGran[i] && !seen) h = hash_words(h, g, e1->objGran[i], 0x4000, &g);
+        }
+        if (e1->objExtPal) h = hash_words(h, g, e1->objExtPal, 0x2000, &g);
+    }
+    return mix32(h, g);
+}
+static u32 sSubSig, sSubLines;
+static int sSubDirty = 1;
+
 static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
-    sLogoFull = 0;
+    // the sub screen's picture: redrawn only when its inputs changed (above)
+    int subDraw = 0;
+    u32 subLines = 2166136261u;
+    if (sMirrorOn || sLogoOn) {
+        u32 sig = sub_state_hash(&sEngine[1], sMirrorOn);
+        subDraw = sSubDirty || sig != sSubSig || (sMirrorOn && !sMirrorReady) || (sLogoOn && !sLogoReady && !sLogoFull);
+        sSubSig = sig;
+    } else
+        sSubDirty = 1;
+    if (subDraw) sLogoFull = 0;
     sIrisSnap = gHostIrisRadius;
     for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
     int bi = 0;
@@ -1316,7 +1387,10 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
-        if (sMirrorOn) {   // the boot screens: the sub screen's whole line (before this line's hblank)
+        if (sMirrorOn || sLogoOn) {   // what the hblank IRQs leave in engine B's registers, line by line
+            subLines = sub_regs_hash(&sEngine[1], sMirrorOn, mix32(subLines, (u32)line));
+        }
+        if (sMirrorOn && subDraw) {   // the boot screens, the menus: the sub screen's whole line (before this line's hblank)
             Engine *e1 = &sEngine[1];
             window_vertical(e1, line);
             if (line == 0 && e1->haveNextLine0) e1->obj = e1->objNextLine0;
@@ -1324,7 +1398,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
             else gpu2d_render_obj_line(e1, line, &e1->obj);
             render_line(e1, in, line);
         }
-        if (sLogoOn) {   // the sub screen's BG2 line (before this line's hblank, as the sequential loop)
+        if (sLogoOn && subDraw) {   // the sub screen's BG2 line (before this line's hblank, as the sequential loop)
             Engine *e1 = &sEngine[1];
             u32 *lp = sLogo + line * SCREEN_W;
             if (reg32(e1, REG_DISPCNT) & 0x400) {
@@ -1344,8 +1418,12 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
     }
-    sMirrorReady = 0;
-    if (sMirrorOn) {
+    if (sMirrorOn || sLogoOn) {   // hblank-set registers changed while the frame start did not: redraw next frame
+        sSubDirty = subLines != sSubLines;
+        sSubLines = subLines;
+    }
+    if (!sMirrorOn) sMirrorReady = 0;
+    if (sMirrorOn && subDraw) {
         const u32 *o = sEngine[1].out;
         for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
             u32 c = argb(o[i]);
