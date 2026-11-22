@@ -144,6 +144,33 @@ static void host_pace_frame(void) {
     if (sFast < 0) sFast = getenv("ACWW_FAST") ? (atoi(getenv("ACWW_FAST")) > 1 ? atoi(getenv("ACWW_FAST")) : 1) : 0;   // (host tests)
     if (sFast == 1 || host_frame() < (u64)sFast) return;
 #endif
+#if HOST_VITA
+    // The Vita: one frame per display refresh, paced on the display's vblanks rather than a 60.000 Hz timer. The
+    // render thread's swap waits for a vblank anyway; with a separate timer the two drifted against each other and
+    // every ~10 s a run of frames each waited a whole extra refresh in the swap (logs: swap 15-20 ms, in bursts).
+    // A late frame starts the next one at once instead of waiting for another vblank (no catching up later).
+    {
+        extern unsigned host_vita_vcount(void);
+        extern void host_vita_wait_vblank(void);
+        static unsigned target;
+        u64 now = host_plat_time_ns();
+        unsigned vc = host_vita_vcount();
+        if (sNextFrame == 0) sNextFrame = 1, target = vc;
+        target++;
+        if (sPaceLast && now - sPaceLast > sWorstFrameNs) {
+            sWorstFrameNs = now - sPaceLast;
+            sWorstWaitNs = gHoFrameWaitNs;
+            sWorstHoNs = gHoFrameNs;
+        }
+        if ((int)(vc - target) >= 0) {   // the vblank that starts the next frame has passed: late
+            sLateFrames++;
+            target = vc;
+        } else
+            HOST_PHASE(PH_PACE, while ((int)(host_vita_vcount() - target) < 0) host_vita_wait_vblank());
+        sPaceLast = host_plat_time_ns();
+        return;
+    }
+#endif
     // Frame cap at exactly 60 fps (1/60 s; 16666666 ns plus 2 ns every 3 frames). A late frame moves the schedule
     // instead of building up a debt to catch up on later, so the game never runs faster than 60 to make up time.
     static unsigned sub;

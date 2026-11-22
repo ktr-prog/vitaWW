@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <psp2/display.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/power.h>
 
@@ -244,3 +245,8 @@ int main(int argc, char **argv) {
     args[2] = NULL;
     return host_main(2, args);
 }
+
+// Frame pacing on the display's own clock (hw.c host_pace_frame): the count of vblanks so far, and waiting for the
+// next one.
+unsigned host_vita_vcount(void) { return (unsigned)sceDisplayGetVcount(); }
+void host_vita_wait_vblank(void) { sceDisplayWaitVblankStart(); }
