@@ -170,8 +170,6 @@ static const char kGcVertexShader[] =
     "    vec4 lg = texture2D(uLogo, lu);\n" \
     "    if (lg.a > 0.5 && lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) o = floor(lg.rgb * 63.0 + 0.5);\n" \
     "  }\n" \
-    "  if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) o = brighten(o, mbf, 0.0);\n" \
-    "  else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) o = darken(o, mbf, 15.0);\n" \
     "  vec3 o8 = (o * 4.0 + floor(o / 16.0)) / 255.0;\n" \
     "  if (uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) {\n" \
     "    vec4 ov = texture2D(uOvl, vec2(uv.x, (y + 0.5) / 16.0));\n" \
@@ -195,14 +193,16 @@ static const char kGcVertexShaderCg[] =
 // 192 lines go to 544, a non-integer 2.83x, which plain linear filtering blurs and nearest makes uneven).
 // The 3D at the screen's resolution: where a canvas pixel is exactly the compose's sample of the 3D (u3d, the 960x544
 // colour buffer; the compose read it at the middle of the pixel's block, as below) with nothing over or blended into
-// it, the screen pixel takes the 3D pixel under it instead, in the same DS colour depth. 2D, blending, fades and
-// anything else drawn over the 3D keep the composed pixel. uP: x = 3D on, y = the canvas columns (GC_W).
+// it, the screen pixel takes the 3D pixel under it instead, in the same DS colour depth. 2D and anything drawn or
+// blended over the 3D keep the composed pixel. The master brightness (the fades) is applied here, after that, to
+// whichever it is - so a fade darkens the full-resolution picture (the compose leaves it out). uP: x = 3D on,
+// y = the canvas columns (GC_W), z = brightness on. uPar: the compose's per-line parameters (texel 2: b = mode, a = factor).
 static const char kBlitVertexShaderCg[] =
     "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
 static const char kBlitFragmentShaderCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform sampler2D u3d, uniform float4 uSz,\n"
-    "            uniform float4 uP) : COLOR {\n"
+    "            uniform sampler2D uPar, uniform float4 uP) : COLOR {\n"
     "  float2 tx = vTex * uSz.xy;\n"
     "  float2 fl = floor(tx);\n"
     "  float2 d = tx - fl - 0.5;\n"
@@ -219,6 +219,12 @@ static const char kBlitFragmentShaderCg[] =
     "      float3 h6 = floor(hi.rgb / 4.0);\n"
     "      o = (h6 * 4.0 + floor(h6 / 16.0)) / 255.0;\n"
     "    }\n"
+    "  }\n"
+    "  float4 mb = floor(tex2D(uPar, float2(2.5 / 8.0, (fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
+    "  if (uP.z > 0.5 && mb.a > 0.5 && mb.b > 0.5 && mb.b < 2.5) {\n"
+    "    float3 c = floor(floor(o * 255.0 + 0.5) / 4.0);\n"
+    "    c = mb.b < 1.5 ? c + floor(((63.0 - c) * mb.a) / 16.0) : c - floor((c * mb.a + 15.0) / 16.0);\n"
+    "    o = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
     "  }\n"
     "  return float4(o, 1.0);\n"
     "}\n";

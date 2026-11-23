@@ -388,6 +388,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             glUseProgram(sBlitProg);
             glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
             glUniform1i(glGetUniformLocation(sBlitProg, "u3d"), 1);
+            glUniform1i(glGetUniformLocation(sBlitProg, "uPar"), 2);
             sBlitP = glGetUniformLocation(sBlitProg, "uP");
             glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
                         (float)SCREEN_H / 192.0f);
@@ -403,9 +404,11 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         static const float kTex[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(sBlitProg);
-        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, 0.0f, 0.0f);
+        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, mirrorNow ? 0.0f : 1.0f, 0.0f);
         glActiveTexture(GL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, tex3d);
+        glActiveTexture(GL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_2D, t[6]);   // uPar
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, sGcCanvas);
         glEnableVertexAttribArray((GLuint)sBlitPos);
