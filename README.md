@@ -8,8 +8,8 @@ A native PlayStation Vita port of *Animal Crossing: Wild World*, built from the 
 ## Features
 
 - Vita native 960x544 resolution (30:17 Widescreen)
+- Adapted to displays 59.94 Hz refresh (~60 FPS)
 - Pixel-Perfect 2D rendering
-- 60 FPS
 - Camera Controls
 - Adapted to single screen
 
