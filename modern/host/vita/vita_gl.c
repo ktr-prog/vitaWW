@@ -133,7 +133,7 @@ static GLuint gc_shader(GLenum type, const char *src) {
     if (!ok) {
         char log[1024] = "";
         glGetShaderInfoLog(sh, sizeof log, NULL, log);
-        fprintf(stderr, "vita_gl: compose shader failed to compile: %s\n", log);
+        fprintf(stderr, "vita_gl: a shader failed to compile: %s\n", log);
         return 0;
     }
     return sh;
@@ -168,6 +168,12 @@ static GLuint cached_program(const char *vsrc, const char *fsrc, const char *nam
     }
     if (!fromCache) {
         fprintf(stderr, "vita_gl: %s shaders: compiling (first start only)\n", name);
+        static int compilerUp;   // the Cg compiler module, loaded before the first compile (vita_gl3d.c loads it
+        if (!compilerUp) {       // only with the first 3D frame, which can come after the first picture)
+            extern int shark_init(const char *path);
+            for (int i = 0; kShaderCompilerPaths[i] && !compilerUp; i++) compilerUp = shark_init(kShaderCompilerPaths[i]) >= 0;
+            fprintf(stderr, "vita_gl: shader compiler %s\n", compilerUp ? "loaded" : "could not be loaded");
+        }
         GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, vsrc);
         GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, fsrc) : 0;
         if (!vs || !fs) return 0;

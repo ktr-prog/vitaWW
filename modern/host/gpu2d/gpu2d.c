@@ -564,9 +564,24 @@ static void compose_line(Engine *e, int line, const u32 *line3d, u32 *dst) {
     if (evy > 16) evy = 16;
     u32 backdrop = rgb6(pal16(e->palette, 0));
     u32 effectsUsed = 0;
-    if (e->num == 0 && !sSingle && !defer3d && !top3d && !sDiagnostics) {
+    // Engine B (the menus over the scene) takes the fast path too unless the sprite window is on: the per-pixel
+    // loop below was most of a menu redraw's cost on the Vita. What it records besides the colour - which pixels
+    // show only the backdrop (sBBack) - comes from the layers' opaque pixels; sBKeep needs the sprite window, so 0.
+    if ((e->num == 0 || (line < SCREEN_H && !(dispcnt & 0x8000))) && !sSingle && !defer3d && !top3d && !sDiagnostics) {
         compose_line_fast(e, dispcnt, obj, mask, order, layers, has3d, hofs3d, line3d, backdrop, effect, first, second,
                           eva, evb, evy, dst, &effectsUsed);
+        if (e->num == 1) {
+            u8 *bb = sBBack + line * SCREEN_W;
+            memset(sBKeep + line * SCREEN_W, 0, SCREEN_W);
+            for (int x = 0; x < SCREEN_W; x++) bb[x] = 1;
+            for (int n = 0; n < 4; n++)
+                if (dispcnt & 0x100u << n)
+                    for (int x = 0; x < SCREEN_W; x++)
+                        if ((mask[x] & 1 << n) && (e->bg[n][x] & PIX_OPAQUE)) bb[x] = 0;
+            if (dispcnt & 0x1000)
+                for (int x = obj->lo < 0 ? 0 : obj->lo, xe = obj->hi > SCREEN_W ? SCREEN_W : obj->hi; x < xe; x++)
+                    if ((mask[x] & 0x10) && obj->source[x]) bb[x] = 0;
+        }
         goto features;
     }
     for (int x = 0; x < SCREEN_W; x++) {
