@@ -639,7 +639,7 @@ void Camera::updateMode()
 void Camera::setDefaultProjection()
 {
 #if HOST_VITA
-    aspect = 0x1c71;   // 16:9, the Vita's screen (the widescreen AR code 0203B74C 00001C71: the picture fills it)
+    aspect = 0x1c3c;   // 30:17 (960x544), the Vita's screen: the picture fills it (the 16:9 widescreen AR code used 0x1c71)
 #else
     aspect = 0x1548;
 #endif

@@ -104,9 +104,11 @@ unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
-// The composed canvas is 16:9 at the DS's 192 lines: GC_W columns (the 3D view across all of them, the 2D layers
+// The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
+// canvas pixels come out square on the screen): GC_W columns (the 3D view across all of them, the 2D layers
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
-enum { GC_W = 341, GC_TEX_W = 352 };
+enum { GC_W = 339, GC_TEX_W = 352 };
+enum { GC_L = (GC_W - 256) / 2, GC_R = GC_W - 256 - GC_L };   // the side bars beside the DS's 256 columns: 41 left, 42 right
 static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1, sGcObjMove = -1, sGcObjShift = -1;
 static GLuint sBlitProg;
 // The menu over the scene (gpu2d: engine B's picture, alpha 0 where it has nothing): a small pass of its own over
@@ -321,13 +323,13 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         sOvlNow = mirror == 2 && on;
         mirrorNow = on && mirror == 1;   // a menu: drawn over the composed picture below (its own small pass)
         glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
-        glUniform1f(sGcBg3Shift, prompt ? (float)(GC_W - 256) / 2.0f : 0.0f);
+        glUniform1f(sGcBg3Shift, prompt ? (float)GC_R : 0.0f);   // (to the screen's right edge)
         // the HUD clock's sprites moved right by the side bar's width, to the screen's right edge (gpu2d)
         extern int gpu2d_gc_objmove(int rect[4]);
         int r[4];
         int mv = gpu2d_gc_objmove(r);
         glUniform4f(sGcObjMove, (float)r[0], (float)r[1], (float)r[2], (float)r[3]);
-        glUniform1f(sGcObjShift, mv ? (float)(GC_W - 256) / 2.0f : 0.0f);
+        glUniform1f(sGcObjShift, mv ? (float)GC_R : 0.0f);
     }
     glActiveTexture(GL_TEXTURE0);
 
@@ -363,7 +365,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         }
         if (sOvlProg != (GLuint)-1) {
             static const float kTex[8] = {0, 0, 1, 0, 0, 1, 1, 1};
-            glViewport((GC_W - 256) / 2, 0, 256, 192);
+            glViewport(GC_L, 0, 256, 192);
             glUseProgram(sOvlProg);
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
@@ -426,7 +428,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
 }
 
 // Present one frame: upload the composited DS canvas (XRGB8888 == GL_BGRA bytes, a zero-conversion upload) and
-// blit the sub-rectangle [sx,sy,sw,sh] of it to the whole screen (16:9).
+// blit the sub-rectangle [sx,sy,sw,sh] of it to the whole screen (30:17).
 void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int sx, int sy, int sw, int sh) {
     if (!sReady) return;
 
@@ -435,7 +437,7 @@ void vita_gl_present_canvas(const void *pixels, int canvas_w, int canvas_h, int 
 }
 
 static void blit_canvas(GLuint fbo, int sx, int sy, int sw, int sh) {
-    // The whole 16:9 screen: the GPU-composed canvas is already 16:9 (3D view across it, the 2D layers unstretched
+    // The whole 30:17 screen: the GPU-composed canvas is already 30:17 (3D view across it, the 2D layers unstretched
     // in the middle; vita_gl_present_gc), so it scales evenly to 960x544. (The CPU fallback canvas is stretched.)
     const int dx = 0, dy = 0, dw = SCREEN_W, dh = SCREEN_H;
     // The read source is our FBO (canvas texture); the draw target is the default framebuffer (the screen). The

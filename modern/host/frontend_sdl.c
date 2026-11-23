@@ -429,8 +429,8 @@ static void window_to_logical(int wx, int wy, int *x, int *y) {
 }
 static void finger_to_logical(float fx, float fy, int *x, int *y) {
 #if HOST_VITA
-    // the 341x192 canvas fills the panel; the DS screen is its columns 42..297 (vita_gl.c GC_W, gpu2d_compose.h)
-    *x = (int)SDL_floorf(fx * 341.0f) - 42;
+    // the 339x192 canvas fills the panel; the DS screen is its columns 41..296 (vita_gl.c GC_W, gpu2d_compose.h)
+    *x = (int)SDL_floorf(fx * 339.0f) - 41;
     *y = 192 + (int)SDL_floorf(fy * 192.0f);
     return;
 #endif
@@ -459,7 +459,7 @@ void frontend_backend_touch_read(int held) {
 static int raw_touch(int *x, int *y, unsigned *presses) {
 #if HOST_VITA
     // Touch reaches the game only for the title screen's "touch to start" (scene 0x2c while the prompt is up), not
-    // its menus: a touch counts only when it began while the prompt was shown. The panel shows the 16:9 canvas with
+    // its menus: a touch counts only when it began while the prompt was shown. The panel shows the 30:17 canvas with
     // the DS screen 1:1 in its middle (finger_to_logical).
     extern unsigned Scene_GetCurrent(void);
     extern int gHostTitlePrompt;

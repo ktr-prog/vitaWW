@@ -25,7 +25,7 @@
 #define VW 256
 #define VH 192
 // The colour buffers are the Vita's screen size: with the GPU compose the 3D is drawn at 960x544, the whole screen
-// (the DS's view widened to 16:9, the canvas's GC_W columns), one 3D pixel per screen pixel; the compose takes its
+// (the DS's view widened to the screen's 30:17, the canvas's GC_W columns), one 3D pixel per screen pixel; the compose takes its
 // DS-resolution sample from it and the present puts the full-resolution picture wherever the 3D shows unchanged
 // (vita_gl.c). The readback path (no GPU compose) draws 256x192 in the corner.
 #define FBO_W 960
