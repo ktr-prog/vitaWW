@@ -1443,70 +1443,118 @@ static void oam_mark(u8 *dirty, const u8 *ent) {   // the lines an OAM entry (at
         if (y < SCREEN_H) dirty[y] = 1;
     }
 }
-// Engine B's VRAM against last frame's copy, in 32-byte pieces: a change marks only the lines drawn from the changed
-// pieces - the lines of the sprites using changed OBJ tiles, the lines showing changed BG tiles or map entries.
-// (The menus write their cursor's and their text's graphics while open; a change anywhere meant redrawing it all.)
-static u8 sPrevV[2][0x20000], sChgV[2][0x20000 / 32];
-static int sChgAny[2];
-static void vram_diff(const Engine *e1) {
-    static const u8 zero[32];
-    for (int k = 0; k < 2; k++) {
-        const u8 *const *gran = k ? (const u8 *const *)e1->objGran : (const u8 *const *)e1->bgGran;
-        sChgAny[k] = 0;
-        for (int i = 0; i < 8; i++)
-            for (int c = 0; c < 0x4000 / 32; c++) {
-                const u8 *src = gran[i] ? gran[i] + c * 32 : zero;
-                u8 *q = sPrevV[k] + i * 0x4000 + c * 32;
-                int d = memcmp(src, q, 32) != 0;
-                if (d) memcpy(q, src, 32), sChgAny[k] = 1;
-                sChgV[k][i * (0x4000 / 32) + c] = (u8)d;
-            }
-    }
+// Engine B's VRAM against last frame's, only where its picture reads it: the map entries of the BGs shown, the
+// tiles they point to, the tiles of the sprites shown. Each 32-byte piece is compared (and its copy refreshed) at
+// most once a frame, when first needed. A change marks only the lines drawn from it. (Comparing all of engine B's
+// VRAM every frame cost 3.8 ms of the game thread on the Vita.)
+static u8 sPrevV[2][0x20000];
+static u16 sChkStamp[2][0x20000 / 32];
+static u8 sChkRes[2][0x20000 / 32];
+static u16 sChkFrame;
+static const u8 *vram_ptr(const Engine *e1, int k, u32 a) {
+    a &= 0x1ffff;
+    const u8 *g = k ? e1->objGran[a >> 14] : e1->bgGran[a >> 14];
+    return g ? g + (a & 0x3fff) : NULL;
 }
-static int vram_chg(int k, u32 a, u32 b) {   // any changed piece in [a, b) (wrapping in the 128 KB)
-    if (!sChgAny[k]) return 0;
-    for (u32 x = a & ~31u; x < b; x += 32)
-        if (sChgV[k][(x & 0x1ffff) >> 5]) return 1;
-    return 0;
+static int piece_changed(const Engine *e1, int k, u32 a) {   // the 32-byte piece at a (wrapping in 128 KB)
+    u32 c = (a & 0x1ffff) >> 5;
+    if (sChkStamp[k][c] == sChkFrame) return sChkRes[k][c];
+    static const u8 zero[32];
+    const u8 *src = vram_ptr(e1, k, c << 5);
+    if (!src) src = zero;
+    u8 *q = sPrevV[k] + (c << 5);
+    int d = memcmp(src, q, 32) != 0;
+    if (d) memcpy(q, src, 32);
+    sChkStamp[k][c] = sChkFrame;
+    sChkRes[k][c] = (u8)d;
+    return d;
+}
+static int range_changed(const Engine *e1, int k, u32 a, u32 b) {
+    int d = 0;
+    for (u32 x = a & ~31u; x < b; x += 32) d |= piece_changed(e1, k, x);   // (all of it: keep the copies current)
+    return d;
 }
 static void oam_mark(u8 *dirty, const u8 *ent);
-static void vram_mark(const Engine *e1, const u8 (*regs)[REG_SIZE], u8 *dirty) {
+// Marks the lines drawn from changed VRAM; returns 1 when that cannot be narrowed (all lines then).
+static int vram_mark(const Engine *e1, const u8 (*regs)[REG_SIZE], u8 *dirty) {
+    if (++sChkFrame == 0) { memset(sChkStamp, 0, sizeof sChkStamp); sChkFrame = 1; }
     const u8 *r0 = regs[0];
     u32 dc = (u32)(r0[0] | r0[1] << 8 | r0[2] << 16 | (u32)r0[3] << 24);
-    if (sChgAny[1]) {   // sprites whose tiles changed
+    int all = 0;
+    if (dc & 0x1000) {   // sprites: the ones whose tiles changed, or whose rotation/scaling group changed
         static const u8 kW[3][4] = {{8, 16, 32, 64}, {16, 32, 32, 64}, {8, 8, 16, 32}};
         static const u8 kH[3][4] = {{8, 16, 32, 64}, {8, 8, 16, 32}, {16, 32, 32, 64}};
+        static u8 prevRot[32][8];
+        u32 rotChg = 0;
+        for (int g = 0; g < 32; g++) {
+            u8 cur[8];
+            for (int j = 0; j < 4; j++) cur[j * 2] = e1->oam[(g * 4 + j) * 8 + 6], cur[j * 2 + 1] = e1->oam[(g * 4 + j) * 8 + 7];
+            if (memcmp(cur, prevRot[g], 8)) rotChg |= 1u << g, memcpy(prevRot[g], cur, 8);
+        }
         for (int i = 0; i < 128; i++) {
             const u8 *o = e1->oam + i * 8;
             u16 a0 = (u16)(o[0] | o[1] << 8), a1 = (u16)(o[2] | o[3] << 8), a2 = (u16)(o[4] | o[5] << 8);
             if ((!(a0 & 0x100) && (a0 & 0x200)) || (a0 >> 14) == 3) continue;
-            if ((a0 >> 10 & 3) == 3) { oam_mark(dirty, o); continue; }   // bitmap sprite
-            u32 w = kW[a0 >> 14][a1 >> 14], h = kH[a0 >> 14][a1 >> 14], tb = (a0 & 0x2000) ? 64 : 32, start, len;
-            if (dc & 0x10) start = (u32)(a2 & 0x3ff) * (32u << (dc >> 20 & 3)), len = (w / 8) * (h / 8) * tb;
-            else start = (u32)(a2 & 0x3ff) * 32, len = (h / 8) * 1024 + (w / 8) * tb;
-            if (vram_chg(1, start, start + len)) oam_mark(dirty, o);
+            int chg = (a0 & 0x100) && (rotChg >> (a1 >> 9 & 31) & 1);
+            if ((a0 >> 10 & 3) == 3) {   // bitmap sprite
+                u32 w = kW[a0 >> 14][a1 >> 14], h = kH[a0 >> 14][a1 >> 14];
+                u32 start = (dc & 0x40) ? (u32)(a2 & 0x3ff) * (128u << (dc >> 22 & 1)) : (u32)(a2 & 0x3ff) * 16;
+                chg |= range_changed(e1, 1, start, start + w * h * 2 + ((dc & 0x40) ? 0 : 512 * h));
+            } else {
+                u32 w = kW[a0 >> 14][a1 >> 14], h = kH[a0 >> 14][a1 >> 14], tb = (a0 & 0x2000) ? 64 : 32;
+                if (dc & 0x10) {
+                    u32 start = (u32)(a2 & 0x3ff) * (32u << (dc >> 20 & 3));
+                    chg |= range_changed(e1, 1, start, start + (w / 8) * (h / 8) * tb);
+                } else {
+                    for (u32 ty = 0; ty < h / 8; ty++) {   // 2D mapping: rows of 32 tiles
+                        u32 start = ((u32)(a2 & 0x3ff) + ty * 32) * 32;
+                        chg |= range_changed(e1, 1, start, start + (w / 8) * tb);
+                    }
+                }
+            }
+            if (chg) oam_mark(dirty, o);
         }
     }
-    if (!sChgAny[0]) return;
-    for (int n = 0; n < 4; n++) {   // BG lines showing changed tiles or map entries
+    for (int n = 0; n < 4; n++) {   // BG lines showing changed map entries or tiles
         if (!(dc >> (8 + n) & 1)) continue;
         u16 cnt = (u16)(r0[8 + 2 * n] | r0[9 + 2 * n] << 8);
         u32 mode = dc & 7;
         int text = n <= 1 || (n == 2 && (mode == 0 || mode == 1 || mode == 3)) || (n == 3 && mode == 0);
-        if (!text) { memset(dirty, 1, SCREEN_H); return; }   // affine/bitmap BGs: all of it
-        u32 cb = (u32)(cnt >> 2 & 15) * 0x4000, sb = (u32)(cnt >> 8 & 31) * 0x800, tb = (cnt & 0x80) ? 64 : 32;
+        u32 cb = (u32)(cnt >> 2 & 15) * 0x4000, sb = (u32)(cnt >> 8 & 31) * 0x800;
+        if (!text) {   // affine / extended / bitmap BGs: any change in what they can read redraws all
+            int sz = cnt >> 14;
+            if (!(cnt & 0x80) || (mode != 3 && mode != 4 && mode != 5) || n < 2) {
+                u32 side = 128u << sz, mapb = (side / 8) * (side / 8);   // affine: 8-bit map, 64-byte tiles
+                if ((mode == 3 || mode == 4 || mode == 5) && n >= 2) mapb *= 2;   // extended: 16-bit map entries
+                all |= range_changed(e1, 0, sb, sb + mapb);
+                for (u32 m = 0; m < mapb && !all; m += (mapb == (side / 8) * (side / 8) ? 1 : 2)) {
+                    const u8 *mp = vram_ptr(e1, 0, sb + m);
+                    u32 t = mp ? (mapb == (side / 8) * (side / 8) ? mp[0] : (u32)(mp[0] | mp[1] << 8) & 0x3ff) : 0;
+                    all |= range_changed(e1, 0, cb + t * 64, cb + t * 64 + 64);
+                }
+            } else {   // bitmap BG
+                static const u16 kBw[4] = {128, 256, 512, 512}, kBh[4] = {128, 256, 256, 512};
+                u32 bytes = (u32)kBw[sz] * kBh[sz] * ((cnt & 4) ? 2 : 1);
+                all |= range_changed(e1, 0, sb * 8, sb * 8 + bytes);
+            }
+            if (all) break;
+            continue;
+        }
+        u32 tb = (cnt & 0x80) ? 64 : 32;
         int sz = cnt >> 14, bw = (sz == 1 || sz == 3) ? 2 : 1, bh = (sz >= 2) ? 2 : 1;
         uint64_t rows = 0;
         for (int b = 0; b < bw * bh; b++)
-            for (int rr = 0; rr < 32; rr++)
+            for (int rr = 0; rr < 32; rr++) {
+                int rowChg = 0;
                 for (int c = 0; c < 32; c++) {
-                    u32 a = (sb + (u32)b * 0x800 + (u32)(rr * 32 + c) * 2) & 0x1ffff;
-                    u32 t = (u32)(sPrevV[0][a] | sPrevV[0][a + 1] << 8) & 0x3ff;
-                    if (sChgV[0][a >> 5] || vram_chg(0, cb + t * tb, cb + t * tb + tb)) {
-                        rows |= 1ull << ((b / bw) * 32 + rr);
-                        break;
-                    }
+                    u32 a = sb + (u32)b * 0x800 + (u32)(rr * 32 + c) * 2;
+                    rowChg |= piece_changed(e1, 0, a);
+                    const u8 *mp = vram_ptr(e1, 0, a);
+                    u32 t = mp ? (u32)(mp[0] | mp[1] << 8) & 0x3ff : 0;
+                    rowChg |= range_changed(e1, 0, cb + t * tb, cb + t * tb + tb);
                 }
+                if (rowChg) rows |= 1ull << ((b / bw) * 32 + rr);
+            }
         if (!rows) continue;
         u32 mh = bh * 256 - 1;
         for (int y = 0; y < SCREEN_H; y++) {
@@ -1514,12 +1562,14 @@ static void vram_mark(const Engine *e1, const u8 (*regs)[REG_SIZE], u8 *dirty) {
             if (rows >> (((y + vofs) & mh) >> 3) & 1) dirty[y] = 1;
         }
     }
+    return all;
 }
-static u32 ext_pal_hash(const Engine *e1) {
-    u32 g = 0x9e3779b9u, h = 0x85ebca6bu;
-    for (int i = 0; i < 4; i++)
-        if (e1->bgExtPal[i]) h = hash_words(h, g, e1->bgExtPal[i], 0x2000, &g);
-    if (e1->objExtPal) h = hash_words(h, g, e1->objExtPal, 0x2000, &g);
+static u32 ext_pal_hash(const Engine *e1) {   // the extended palettes engine B has switched on
+    u32 g = 0x9e3779b9u, h = 0x85ebca6bu, dc = reg32(e1, REG_DISPCNT);
+    if (dc & 0x40000000u)
+        for (int i = 0; i < 4; i++)
+            if (e1->bgExtPal[i]) h = hash_words(h, g, e1->bgExtPal[i], 0x2000, &g);
+    if ((dc & 0x80000000u) && e1->objExtPal) h = hash_words(h, g, e1->objExtPal, 0x2000, &g);
     return mix32(h, g);
 }
 static u8 sBDirty[SCREEN_H];
@@ -1548,15 +1598,11 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         sBVramSig = vs;
         sBMode = mode;
         memset(sBDirty, 0, sizeof sBDirty);
-        if (!bAll) {   // OAM entries that changed: the lines they covered and cover now
-            int rot = 0;
+        if (!bAll)   // OAM entries that changed: the lines they covered and cover now
             for (int i = 0; i < 128; i++) {
                 const u8 *o = e1->oam + i * 8, *p = sBOam + i * 8;
                 if (memcmp(o, p, 6)) oam_mark(sBDirty, p), oam_mark(sBDirty, o);
-                rot |= o[6] != p[6] || o[7] != p[7];   // rotation/scaling parameters
             }
-            if (rot) bAll = 1;
-        }
         memcpy(sBOam, e1->oam, 0x400);
         gSubCheckNs += host_plat_time_ns() - t0;
         gSubFrames++;
@@ -1660,8 +1706,10 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     int bLines = 0;
     if (whole) {
         uint64_t t0 = host_plat_time_ns();
-        vram_diff(&sEngine[1]);
-        if (!bAll) vram_mark(&sEngine[1], overlayBand ? (const u8 (*)[REG_SIZE])s2dRegSnapB : (const u8 (*)[REG_SIZE])s2dRegSnap, sBDirty);
+        if (vram_mark(&sEngine[1], overlayBand ? (const u8 (*)[REG_SIZE])s2dRegSnapB : (const u8 (*)[REG_SIZE])s2dRegSnap,
+                      sBDirty))
+            memset(sBDirty, 1, sizeof sBDirty);
+        if (bAll) memset(sBDirty, 1, sizeof sBDirty);
         gSubCheckNs += host_plat_time_ns() - t0;
         for (int i = 0; i < SCREEN_H; i++) bLines += sBDirty[i];
         sBValid = 1;

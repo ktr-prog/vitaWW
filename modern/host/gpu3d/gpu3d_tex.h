@@ -132,7 +132,9 @@ static void g3_tex_setup(void) {
 // texture not drawn this frame is checked when it is next drawn.
 static u8 sSyncedImg[4 * IMG_SLOT / G3_TEX_BLK], sSyncedPal[8 * PAL_SLOT / G3_TEX_BLK];
 static inline u64 g3_blk_key(const s32 *src, int nsrc) {
-    if (nsrc != 1 || !gG3BankGenValid) return 0;
+    if (!gG3BankGenValid) return 0;
+    if (!nsrc) return ~0ull;   // no bank in the slot: zeros, which never change
+    if (nsrc != 1) return 0;
     return (u64)((u32)src[0] + 1) << 32 | gG3BankGenFrame[src[0] >> 20];
 }
 static const u8 kZeroBlk[G3_TEX_BLK] __attribute__((aligned(16)));
