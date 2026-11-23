@@ -64,6 +64,7 @@ int vita_gl_init(void) {
     if (!vita_gl_enabled()) return 0;
     // No immediate-mode/legacy pool needed: we only use glClear + glBlitFramebuffer (precompiled shaders).
     vglInitExtended(0, SCREEN_W, SCREEN_H, 8 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    vglWaitVblankStart(GL_TRUE);   // V-Sync: each picture is flipped at a vblank of the display (59.94 Hz), one per refresh
     fprintf(stderr, "vita_gl: shader compiler (libshacccg.suprx) %s - needed for the GPU 3D path\n",
             vita_gl_have_shader_compiler() ? "found" : "NOT found; install it to ur0:/data/");
     glViewport(0, 0, SCREEN_W, SCREEN_H);

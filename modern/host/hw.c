@@ -150,7 +150,9 @@ static void host_pace_frame(void) {
     // runs at the display's rate with the queue absorbing the GPU's frame-to-frame variation. A second pacer here
     // (a 60 Hz timer, then the vblank count) fought the queue: each time the GPU finished a frame a bit late the
     // queue filled, the swap blocked a whole refresh and the game lost a frame (logs: 1-5 a second, swap ~20 ms).
-    // This only keeps a floor of 16 ms for when no frames are being shown (no back-pressure then).
+    // V-Sync locks the rate to the display's hardware refresh (59.94 Hz): vitaGL flips each picture at a vblank, one
+    // per refresh. When nothing waits on the display (no picture flipped since: the queue cannot push back), the
+    // game waits for the display's next vblank itself, so it never runs ahead of the refresh either.
     {
         u64 now = host_plat_time_ns();
         if (sNextFrame == 0) sNextFrame = 1;
@@ -162,7 +164,11 @@ static void host_pace_frame(void) {
                 sWorstHoNs = gHoFrameNs;
             }
             if (dt > 25000000ull) sLateFrames++;   // over 1.5 refreshes: a refresh went by without a new frame
-            if (dt < 16000000ull) HOST_PHASE(PH_PACE, host_plat_sleep_until_ns(sPaceLast + 16000000ull));
+            extern unsigned host_vita_vcount(void);
+            extern void host_vita_wait_vblank(void);
+            static unsigned sVcLast;
+            if (host_vita_vcount() == sVcLast) HOST_PHASE(PH_PACE, host_vita_wait_vblank());   // still the same refresh
+            sVcLast = host_vita_vcount();
         }
         sPaceLast = host_plat_time_ns();
         return;
