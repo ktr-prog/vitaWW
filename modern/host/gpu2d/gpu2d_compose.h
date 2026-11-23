@@ -193,17 +193,34 @@ static const char kGcVertexShaderCg[] =
 
 // The canvas to the screen, "sharp bilinear": each canvas pixel a crisp block, only the block edges blended (the
 // 192 lines go to 544, a non-integer 2.83x, which plain linear filtering blurs and nearest makes uneven).
+// The 3D at the screen's resolution: where a canvas pixel is exactly the compose's sample of the 3D (u3d, the 960x544
+// colour buffer; the compose read it at the middle of the pixel's block, as below) with nothing over or blended into
+// it, the screen pixel takes the 3D pixel under it instead, in the same DS colour depth. 2D, blending, fades and
+// anything else drawn over the 3D keep the composed pixel. uP: x = 3D on, y = the canvas columns (GC_W).
 static const char kBlitVertexShaderCg[] =
     "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
 static const char kBlitFragmentShaderCg[] =
-    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz) : COLOR {\n"
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform sampler2D u3d, uniform float4 uSz,\n"
+    "            uniform float4 uP) : COLOR {\n"
     "  float2 tx = vTex * uSz.xy;\n"
     "  float2 fl = floor(tx);\n"
     "  float2 d = tx - fl - 0.5;\n"
     "  float2 r = 0.5 - 0.5 / uSz.zw;\n"
     "  float2 f = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
-    "  return float4(tex2D(uTex, (fl + f) / uSz.xy).rgb, 1.0);\n"
+    "  float3 o = tex2D(uTex, (fl + f) / uSz.xy).rgb;\n"
+    "  if (uP.x > 0.5) {\n"
+    "    float3 cv = floor(tex2D(uTex, (fl + 0.5) / uSz.xy).rgb * 255.0 + 0.5);\n"
+    "    float4 lo = floor(tex2D(u3d, float2((fl.x + 0.5) / uP.y, (191.0 - fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
+    "    float4 hi = floor(tex2D(u3d, float2(tx.x / uP.y, 1.0 - vTex.y)) * 255.0 + 0.5);\n"
+    "    float3 c6 = floor(lo.rgb / 4.0);\n"
+    "    float3 dd = abs(cv - (c6 * 4.0 + floor(c6 / 16.0)));\n"
+    "    if (lo.a > 247.5 && hi.a > 247.5 && dd.x + dd.y + dd.z < 0.5) {\n"
+    "      float3 h6 = floor(hi.rgb / 4.0);\n"
+    "      o = (h6 * 4.0 + floor(h6 / 16.0)) / 255.0;\n"
+    "    }\n"
+    "  }\n"
+    "  return float4(o, 1.0);\n"
     "}\n";
 
 #endif

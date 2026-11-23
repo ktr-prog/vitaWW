@@ -121,7 +121,7 @@ static const char kMenuVertexShaderCg[] =
 static const char kMenuFragmentShaderCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
     "  float4 c = tex2D(uTex, vTex);\n  if (c.a < 0.25) discard;\n  return float4(c.rgb, 1.0);\n}\n";   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
-static GLint sBlitPos = -1, sBlitTex = -1;
+static GLint sBlitPos = -1, sBlitTex = -1, sBlitP = -1;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -209,7 +209,9 @@ int vita_gl_gc_init(void) {
     glUseProgram(sGcProg);
     glUniform1f(glGetUniformLocation(sGcProg, "uW"), (float)GC_W);
     glUniform1f(glGetUniformLocation(sGcProg, "u3dCols"), (float)GC_W);   // the 3D is drawn GC_W wide (vita_gl3d.c)
-    glUniform1f(glGetUniformLocation(sGcProg, "u3dTexW"), 352.0f);
+    // The 3D colour buffer is the screen's 960 columns for the canvas's GC_W (vita_gl3d.c): the compose's sample of
+    // canvas column x lands in screen column (x + 0.5) * 960 / GC_W, the 3D pixel under the middle of that column.
+    glUniform1f(glGetUniformLocation(sGcProg, "u3dTexW"), (float)GC_W);
     static const char *const kNames[10] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d", "uLogo"};
     for (int i = 0; i < 10; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
     sGcLogoOn = glGetUniformLocation(sGcProg, "uLogoOn");
@@ -287,6 +289,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     }
     glActiveTexture(GL_TEXTURE0 + 8);
     glBindTexture(GL_TEXTURE_2D, tex3d);
+    int mirrorNow = 0;   // the boot screens: no 3D shown
     {   // the title screen: the logo (gpu2d: the top screen's BG2), 1:1, centred on the screen; "touch to start"
         // (BG3) moved right by the side bar's width, into the screen's bottom-right corner
         extern int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror);
@@ -309,7 +312,8 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glUseProgram(sGcProg);
         glUniform1f(sGcLogoOn, on && !mirror ? 1.0f : 0.0f);
         glUniform1f(sGcMirror, mirror == 1 ? 1.0f : 0.0f);   // the boot screens: the top screen's picture instead
-        sOvlNow = mirror == 2 && on;   // a menu: drawn over the composed picture below (its own small pass)
+        sOvlNow = mirror == 2 && on;
+        mirrorNow = on && mirror == 1;   // a menu: drawn over the composed picture below (its own small pass)
         glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
         glUniform1f(sGcBg3Shift, prompt ? (float)(GC_W - 256) / 2.0f : 0.0f);
         // the HUD clock's sprites moved right by the side bar's width, to the screen's right edge (gpu2d)
@@ -377,6 +381,8 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             sBlitTex = glGetAttribLocation(sBlitProg, "aTex");
             glUseProgram(sBlitProg);
             glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
+            glUniform1i(glGetUniformLocation(sBlitProg, "u3d"), 1);
+            sBlitP = glGetUniformLocation(sBlitProg, "uP");
             glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
                         (float)SCREEN_H / 192.0f);
             glUseProgram(0);
@@ -391,6 +397,9 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         static const float kTex[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(sBlitProg);
+        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, 0.0f, 0.0f);
+        glActiveTexture(GL_TEXTURE0 + 1);
+        glBindTexture(GL_TEXTURE_2D, tex3d);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, sGcCanvas);
         glEnableVertexAttribArray((GLuint)sBlitPos);
