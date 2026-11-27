@@ -140,6 +140,7 @@ static void present_swap(void);
 // straight into the canvas texture (gpu2d_compose.h): no 3D readback, no CPU compose, no canvas upload.
 extern uint64_t host_plat_time_ns(void);
 unsigned gVitaRepeats;   // display refreshes that repeated a picture (render.c reports it)
+unsigned gVitaRepeatsTotal;   // (never reset: vita_gl3d.c's GPU probe)
 unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
@@ -166,8 +167,7 @@ static const char kMenuFragmentShaderCg[] =
 static GLint sBlitPos = -1, sBlitTex = -1, sBlitP = -1;
 static GLuint sMaskProg, sGcCanvas2, sGcFbo2;   // the 3D mark + brightness pass (gpu2d_compose.h kMask*)
 static GLint sMaskPos = -1, sMaskP = -1;
-// GPU time probe: one 3D frame in 300 (the first ten) is drawn with the GPU waited for after each pass (that frame
-// can be late).
+// GPU time probe (vita_gl3d.c starts it): a frame drawn with the GPU waited for after each pass, logged.
 uint64_t gVitaGpu3dNs, gVitaGpuComposeNs, gVitaGpuPresentNs;
 int gVitaGpuProbe, gVitaGpuProbed;
 static GLuint sGcLogoTex;
@@ -574,7 +574,7 @@ static void do_swap(void) {
         extern unsigned host_vita_vcount(void);
         static unsigned last;
         unsigned vc = host_vita_vcount();
-        if (last && vc - last > 1) gVitaRepeats += vc - last - 1;
+        if (last && vc - last > 1) { gVitaRepeats += vc - last - 1; gVitaRepeatsTotal += vc - last - 1; }
         last = vc;
     }
 }
