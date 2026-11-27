@@ -244,6 +244,12 @@ unsigned vita_gl3d_frame_tex(void) { return sReady && sPrevDraw >= 0 ? sColorTex
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
+    {   // the GPU time probe (vita_gl.c): one frame in 300 starts its 3D with the GPU idle, so the wait for it at the
+        // present is the 3D's GPU time alone
+        extern int gVitaGpuProbe;
+        static unsigned n;
+        if (++n % 300 == 0) { glFinish(); gVitaGpuProbe = 1; }
+    }
     uint64_t tSync = host_plat_time_ns();
     gG3FrameTexNs = gG3FrameUploads = 0;
     // Group the polygons by texture once (a hash of texparam/texpal, O(n)): each distinct texture is synced,

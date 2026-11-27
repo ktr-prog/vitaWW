@@ -191,40 +191,58 @@ static const char kGcVertexShaderCg[] =
 
 // The canvas to the screen, "sharp bilinear": each canvas pixel a crisp block, only the block edges blended (the
 // 192 lines go to 544, a non-integer 2.83x, which plain linear filtering blurs and nearest makes uneven).
-// The 3D at the screen's resolution: where a canvas pixel is exactly the compose's sample of the 3D (u3d, the 960x544
-// colour buffer; the compose read it at the middle of the pixel's block, as below) with nothing over or blended into
-// it, the screen pixel takes the 3D pixel under it instead, in the same DS colour depth. 2D and anything drawn or
-// blended over the 3D keep the composed pixel. The master brightness (the fades) is applied here, after that, to
-// whichever it is - so a fade darkens the full-resolution picture (the compose leaves it out). uP: x = 3D on,
-// y = the canvas columns (GC_W), z = brightness on. uPar: the compose's per-line parameters (texel 2: b = mode, a = factor).
+// The 3D at the screen's resolution, in two passes. The mask pass (at the canvas's DS resolution: cheap) marks each
+// canvas pixel that is exactly the compose's sample of the 3D (u3d, the 960x544 colour buffer, read where the compose
+// read it) with nothing over or blended into it, and applies the master brightness (the fades; the compose leaves it
+// out) to the canvas: rgb = the canvas pixel with the brightness, a = 0 for "not the 3D", else 1 + mode * 32 +
+// factor of that line's brightness. The present (every screen pixel: kept short) takes the canvas sharp-bilinear and,
+// where the mark is set, the 3D pixel under the screen pixel instead, in the DS colour depth, with that brightness.
+// Mask uP: x = 3D on, y = the canvas columns (GC_W), z = brightness on, w = the canvas texture width.
+static const char kMaskVertexShaderCg[] =
+    "void main(float2 aPos, out float4 oPos : POSITION) { oPos = float4(aPos, 0.0, 1.0); }\n";
+static const char kMaskFragmentShaderCg[] =
+    "float4 main(float4 fc : WPOS, uniform sampler2D uTex, uniform sampler2D u3d, uniform sampler2D uPar,\n"
+    "            uniform float4 uP) : COLOR {\n"
+    "  float2 fl = floor(fc.xy);\n"
+    "  float3 cv = floor(tex2D(uTex, (fl + 0.5) / float2(uP.w, 192.0)).rgb * 255.0 + 0.5);\n"
+    "  float4 mb = floor(tex2D(uPar, float2(2.5 / 8.0, (fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
+    "  float md = (uP.z > 0.5 && mb.a > 0.5 && mb.b > 0.5 && mb.b < 2.5) ? mb.b : 0.0;\n"
+    "  float ev = min(mb.a, 31.0);\n"
+    "  float3 c = floor(cv / 4.0);\n"
+    "  float code = 0.0;\n"
+    "  if (uP.x > 0.5) {\n"
+    "    float4 lo = floor(tex2D(u3d, float2((fl.x + 0.5) / uP.y, (191.0 - fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
+    "    float3 c6 = floor(lo.rgb / 4.0);\n"
+    "    float3 dd = abs(cv - (c6 * 4.0 + floor(c6 / 16.0)));\n"
+    "    if (lo.a > 247.5 && dd.x + dd.y + dd.z < 0.5) code = md > 0.5 ? 1.0 + md * 32.0 + ev : 1.0;\n"
+    "  }\n"
+    "  if (md > 0.5) c = md < 1.5 ? c + floor(((63.0 - c) * ev) / 16.0) : c - floor((c * ev + 15.0) / 16.0);\n"
+    "  return float4((c * 4.0 + floor(c / 16.0)) / 255.0, code / 255.0);\n"
+    "}\n";
+// Present uP: x = the mask's marks used (0: the canvas as it is), y = the canvas columns (GC_W).
 static const char kBlitVertexShaderCg[] =
     "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
 static const char kBlitFragmentShaderCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform sampler2D u3d, uniform float4 uSz,\n"
-    "            uniform sampler2D uPar, uniform float4 uP) : COLOR {\n"
+    "            uniform float4 uP) : COLOR {\n"
     "  float2 tx = vTex * uSz.xy;\n"
     "  float2 fl = floor(tx);\n"
     "  float2 d = tx - fl - 0.5;\n"
     "  float2 r = 0.5 - 0.5 / uSz.zw;\n"
     "  float2 f = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
     "  float3 o = tex2D(uTex, (fl + f) / uSz.xy).rgb;\n"
-    "  if (uP.x > 0.5) {\n"
-    "    float3 cv = floor(tex2D(uTex, (fl + 0.5) / uSz.xy).rgb * 255.0 + 0.5);\n"
-    "    float4 lo = floor(tex2D(u3d, float2((fl.x + 0.5) / uP.y, (191.0 - fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
+    "  float code = uP.x > 0.5 ? floor(tex2D(uTex, (fl + 0.5) / uSz.xy).a * 255.0 + 0.5) : 0.0;\n"
+    "  if (code > 0.5) {\n"
     "    float4 hi = floor(tex2D(u3d, float2(tx.x / uP.y, 1.0 - vTex.y)) * 255.0 + 0.5);\n"
-    "    float3 c6 = floor(lo.rgb / 4.0);\n"
-    "    float3 dd = abs(cv - (c6 * 4.0 + floor(c6 / 16.0)));\n"
-    "    if (lo.a > 247.5 && hi.a > 247.5 && dd.x + dd.y + dd.z < 0.5) {\n"
-    "      float3 h6 = floor(hi.rgb / 4.0);\n"
-    "      o = (h6 * 4.0 + floor(h6 / 16.0)) / 255.0;\n"
+    "    if (hi.a > 247.5) {\n"
+    "      float3 c = floor(hi.rgb / 4.0);\n"
+    "      if (code > 1.5) {\n"
+    "        float k = code - 1.0, md = floor(k / 32.0), ev = k - md * 32.0;\n"
+    "        c = md < 1.5 ? c + floor(((63.0 - c) * ev) / 16.0) : c - floor((c * ev + 15.0) / 16.0);\n"
+    "      }\n"
+    "      o = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
     "    }\n"
-    "  }\n"
-    "  float4 mb = floor(tex2D(uPar, float2(2.5 / 8.0, (fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
-    "  if (uP.z > 0.5 && mb.a > 0.5 && mb.b > 0.5 && mb.b < 2.5) {\n"
-    "    float3 c = floor(floor(o * 255.0 + 0.5) / 4.0);\n"
-    "    c = mb.b < 1.5 ? c + floor(((63.0 - c) * mb.a) / 16.0) : c - floor((c * mb.a + 15.0) / 16.0);\n"
-    "    o = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
     "  }\n"
     "  return float4(o, 1.0);\n"
     "}\n";
