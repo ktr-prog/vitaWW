@@ -52,14 +52,13 @@ const char *const kShaderCompilerPaths[] = {
     0,
 };
 // The Cg compiler module (~0.4 s to load) is needed only to compile a shader that is not cached yet. It is loaded
-// on a thread of its own from start-up, behind the boot screen, instead of in the first 3D frame (a ~380 ms stop on
-// the title screen at every start). Every place that may compile waits for it first (vita_shader_compiler_ensure).
-#include <pthread.h>
-static pthread_t sShThr;
-static pthread_mutex_t sShMx = PTHREAD_MUTEX_INITIALIZER;
-static int sShState, sShOk;   // 0 not started, 1 loading on its thread, 2 done
+// once at start-up, behind the boot screen (vita_gl_init), not in the first 3D frame (a ~380 ms stop at every
+// start). Every place that may compile makes sure of it first (vita_shader_compiler_ensure).
 extern uint64_t host_plat_time_ns(void);
-static void shader_compiler_load(void) {
+static int sShTried, sShOk;
+int vita_shader_compiler_ensure(void) {
+    if (sShTried) return sShOk;
+    sShTried = 1;
     extern int shark_init(const char *path);
     uint64_t t = host_plat_time_ns();
     for (int i = 0; kShaderCompilerPaths[i] && !sShOk; i++)
@@ -69,24 +68,6 @@ static void shader_compiler_load(void) {
                     (unsigned long long)((host_plat_time_ns() - t) / 1000000));
         }
     if (!sShOk) fprintf(stderr, "vita_gl: the shader compiler could not be loaded (shaders not cached cannot compile)\n");
-}
-static void *shader_compiler_thread(void *a) { (void)a; shader_compiler_load(); return 0; }
-static void vita_shader_compiler_preload(void) {
-    pthread_mutex_lock(&sShMx);
-    if (sShState == 0) {
-        pthread_attr_t at;
-        pthread_attr_init(&at);
-        pthread_attr_setstacksize(&at, 256 << 10);
-        sShState = pthread_create(&sShThr, &at, shader_compiler_thread, 0) == 0 ? 1 : 0;
-    }
-    pthread_mutex_unlock(&sShMx);
-}
-int vita_shader_compiler_ensure(void) {
-    pthread_mutex_lock(&sShMx);
-    if (sShState == 1) pthread_join(sShThr, 0);
-    else if (sShState == 0) shader_compiler_load();
-    sShState = 2;
-    pthread_mutex_unlock(&sShMx);
     return sShOk;
 }
 int vita_gl_have_shader_compiler(void) {
@@ -105,7 +86,7 @@ int vita_gl_init(void) {
     vglWaitVblankStart(GL_TRUE);   // V-Sync: each picture is flipped at a vblank of the display (59.94 Hz), one per refresh
     fprintf(stderr, "vita_gl: shader compiler (libshacccg.suprx) %s - needed for the GPU 3D path\n",
             vita_gl_have_shader_compiler() ? "found" : "NOT found; install it to ur0:/data/");
-    vita_shader_compiler_preload();
+    vita_shader_compiler_ensure();
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     glGenTextures(1, &sTex);
     glGenFramebuffers(1, &sFbo);
@@ -140,7 +121,6 @@ static void present_swap(void);
 // straight into the canvas texture (gpu2d_compose.h): no 3D readback, no CPU compose, no canvas upload.
 extern uint64_t host_plat_time_ns(void);
 unsigned gVitaRepeats;   // display refreshes that repeated a picture (render.c reports it)
-unsigned gVitaRepeatsTotal;   // (never reset: vita_gl3d.c's GPU probe)
 unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
@@ -167,9 +147,6 @@ static const char kMenuFragmentShaderCg[] =
 static GLint sBlitPos = -1, sBlitTex = -1, sBlitP = -1;
 static GLuint sMaskProg, sGcCanvas2, sGcFbo2;   // the 3D mark + brightness pass (gpu2d_compose.h kMask*)
 static GLint sMaskPos = -1, sMaskP = -1;
-// GPU time probe (vita_gl3d.c starts it): a frame drawn with the GPU waited for after each pass, logged.
-uint64_t gVitaGpu3dNs, gVitaGpuComposeNs, gVitaGpuPresentNs;
-int gVitaGpuProbe, gVitaGpuProbed;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -329,9 +306,6 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     if (!sReady || sGcState <= 0) return;
     static int first = 1;
     if (first) fprintf(stderr, "vita_gl: GPU compose: first frame\n");
-    const int probe = gVitaGpuProbe;   // (vita_gl3d.c waited for the GPU before this frame's 3D)
-    uint64_t tp = 0;
-    if (probe) { tp = host_plat_time_ns(); glFinish(); gVitaGpu3dNs = host_plat_time_ns() - tp; }
     uint64_t t0 = host_plat_time_ns();
     GLuint *t = sGcTex[gc->set & 1];   // the bands wrote this set's texture memory directly
     for (int i = 0; i < 7; i++) {
@@ -470,7 +444,6 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         glDisableVertexAttribArray((GLuint)sMaskPos);
     }
-    if (probe) { tp = host_plat_time_ns(); glFinish(); gVitaGpuComposeNs = host_plat_time_ns() - tp; }
     gVitaComposeNs += host_plat_time_ns() - t0;
     glUseProgram(0);
     glDepthMask(GL_TRUE);
@@ -511,11 +484,6 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glDisableVertexAttribArray((GLuint)sBlitPos);
         glDisableVertexAttribArray((GLuint)sBlitTex);
         glUseProgram(0);
-        if (probe) {
-            tp = host_plat_time_ns(); glFinish(); gVitaGpuPresentNs = host_plat_time_ns() - tp;
-            gVitaGpuProbe = 0;
-            __atomic_store_n(&gVitaGpuProbed, 1, __ATOMIC_RELEASE);
-        }
         present_swap();
     } else
         blit_canvas(masked ? sGcFbo2 : sGcFbo, 0, 0, GC_W, 192);   // (the brightness is in the second canvas)
@@ -574,7 +542,7 @@ static void do_swap(void) {
         extern unsigned host_vita_vcount(void);
         static unsigned last;
         unsigned vc = host_vita_vcount();
-        if (last && vc - last > 1) { gVitaRepeats += vc - last - 1; gVitaRepeatsTotal += vc - last - 1; }
+        if (last && vc - last > 1) gVitaRepeats += vc - last - 1;
         last = vc;
     }
 }
