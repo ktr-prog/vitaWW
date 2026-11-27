@@ -51,6 +51,44 @@ const char *const kShaderCompilerPaths[] = {
     "ur0:data/external/libshacccg.suprx",
     0,
 };
+// The Cg compiler module (~0.4 s to load) is needed only to compile a shader that is not cached yet. It is loaded
+// on a thread of its own from start-up, behind the boot screen, instead of in the first 3D frame (a ~380 ms stop on
+// the title screen at every start). Every place that may compile waits for it first (vita_shader_compiler_ensure).
+#include <pthread.h>
+static pthread_t sShThr;
+static pthread_mutex_t sShMx = PTHREAD_MUTEX_INITIALIZER;
+static int sShState, sShOk;   // 0 not started, 1 loading on its thread, 2 done
+extern uint64_t host_plat_time_ns(void);
+static void shader_compiler_load(void) {
+    extern int shark_init(const char *path);
+    uint64_t t = host_plat_time_ns();
+    for (int i = 0; kShaderCompilerPaths[i] && !sShOk; i++)
+        if (shark_init(kShaderCompilerPaths[i]) >= 0) {
+            sShOk = 1;
+            fprintf(stderr, "vita_gl: shader compiler loaded from %s (%llu ms)\n", kShaderCompilerPaths[i],
+                    (unsigned long long)((host_plat_time_ns() - t) / 1000000));
+        }
+    if (!sShOk) fprintf(stderr, "vita_gl: the shader compiler could not be loaded (shaders not cached cannot compile)\n");
+}
+static void *shader_compiler_thread(void *a) { (void)a; shader_compiler_load(); return 0; }
+static void vita_shader_compiler_preload(void) {
+    pthread_mutex_lock(&sShMx);
+    if (sShState == 0) {
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 256 << 10);
+        sShState = pthread_create(&sShThr, &at, shader_compiler_thread, 0) == 0 ? 1 : 0;
+    }
+    pthread_mutex_unlock(&sShMx);
+}
+int vita_shader_compiler_ensure(void) {
+    pthread_mutex_lock(&sShMx);
+    if (sShState == 1) pthread_join(sShThr, 0);
+    else if (sShState == 0) shader_compiler_load();
+    sShState = 2;
+    pthread_mutex_unlock(&sShMx);
+    return sShOk;
+}
 int vita_gl_have_shader_compiler(void) {
     for (int i = 0; kShaderCompilerPaths[i]; i++) {
         FILE *f = fopen(kShaderCompilerPaths[i], "rb");
@@ -67,6 +105,7 @@ int vita_gl_init(void) {
     vglWaitVblankStart(GL_TRUE);   // V-Sync: each picture is flipped at a vblank of the display (59.94 Hz), one per refresh
     fprintf(stderr, "vita_gl: shader compiler (libshacccg.suprx) %s - needed for the GPU 3D path\n",
             vita_gl_have_shader_compiler() ? "found" : "NOT found; install it to ur0:/data/");
+    vita_shader_compiler_preload();
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     glGenTextures(1, &sTex);
     glGenFramebuffers(1, &sFbo);
@@ -177,12 +216,7 @@ static GLuint cached_program(const char *vsrc, const char *fsrc, const char *nam
     }
     if (!fromCache) {
         fprintf(stderr, "vita_gl: %s shaders: compiling (first start only)\n", name);
-        static int compilerUp;   // the Cg compiler module, loaded before the first compile (vita_gl3d.c loads it
-        if (!compilerUp) {       // only with the first 3D frame, which can come after the first picture)
-            extern int shark_init(const char *path);
-            for (int i = 0; kShaderCompilerPaths[i] && !compilerUp; i++) compilerUp = shark_init(kShaderCompilerPaths[i]) >= 0;
-            fprintf(stderr, "vita_gl: shader compiler %s\n", compilerUp ? "loaded" : "could not be loaded");
-        }
+        vita_shader_compiler_ensure();
         GLuint vs = gc_shader(GL_CG_VERTEX_SHADER_EXT, vsrc);
         GLuint fs = vs ? gc_shader(GL_CG_FRAGMENT_SHADER_EXT, fsrc) : 0;
         if (!vs || !fs) return 0;
