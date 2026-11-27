@@ -446,8 +446,42 @@ static const char kGcTileFragmentShaderCg[] =
 // lines of the moved HUD clock, full. Returns the number of fast tiles.
 enum { GC_TILE_VERTS = 24 * 18 * 6 };
 static int *gGcTileWhy;   // (optional) per line: whole, not a fast line, iris, overlay/clock rows, all 16 groups, both sides, no 3D, 3D shifted
+// The tile cells (as gc_tile_quads numbers them) of each line that the title's logo (RGBA, opaque where alpha >= 128,
+// drawn at (ofsX, ofsY) in the 2D area) or the moved BG3 (bg3Shift columns right; gc_line's p[27..28]) cover.
+static inline int gc_tile_cell(int c, int W) {
+    const int left = (W - 256) / 2;
+    return c < left ? 0 : c >= left + 256 ? 17 : 1 + (c - left) / 16;
+}
+static inline void gc_tile_extra(const unsigned char *par, int stride, int W, const unsigned *logo, int ofsX, int ofsY,
+                                 int bg3Shift, unsigned *extra) {
+    const int left = (W - 256) / 2;
+    for (int y = 0; y < 192; y++) extra[y] = 0;
+    if (logo)
+        for (int ly = 0; ly < 192; ly++) {
+            int y = ly + ofsY;
+            if (y < 0 || y >= 192) continue;
+            for (int lx = 0; lx < 256; lx++)
+                if (logo[ly * 256 + lx] >> 31) {
+                    int c = left + lx + ofsX;
+                    if (c >= 0 && c < W) extra[y] |= 1u << gc_tile_cell(c, W);
+                }
+        }
+    if (bg3Shift)
+        for (int y = 0; y < 192; y++) {
+            const unsigned char *p = par + y * stride;
+            unsigned g = (unsigned)(p[27] | p[28] << 8);
+            for (int k = 0; k < 16; k++)
+                if (g >> k & 1) {
+                    int c0 = left + 16 * k + bg3Shift, c1 = c0 + 15;
+                    if (c0 < 0) c0 = 0;
+                    if (c1 >= W) c1 = W - 1;
+                    for (int c = c0; c <= c1; c++) extra[y] |= 1u << gc_tile_cell(c, W);
+                }
+        }
+}
 static inline int gc_tile_quads(const unsigned char *par, int stride, int W, float u3dCols, int flip, int whole, int ovl,
-                                int objY0, int objY1, float (*fv)[2], int *nf, float (*sv)[2], int *ns) {
+                                int objY0, int objY1, const unsigned *extra, float (*fv)[2], int *nf, float (*sv)[2],
+                                int *ns) {
     const int left = (W - 256) / 2;
     int fast = 0;
     *nf = *ns = 0;
@@ -466,6 +500,7 @@ static inline int gc_tile_quads(const unsigned char *par, int stride, int W, flo
             }
             if (lineSlow) { slow = 0x3ffff; continue; }
             slow |= (unsigned)(p[26] & 1) | (unsigned)(p[24] | p[25] << 8) << 1 | (unsigned)(p[26] >> 1 & 1) << 17;
+            if (extra) slow |= extra[y];
         }
         if (left <= 0) slow |= 1u | 1u << 17;   // (no side bars: those cells are empty either way)
         float y0 = r * 8 / 96.0f - 1.0f, y1 = (r * 8 + 8) / 96.0f - 1.0f;

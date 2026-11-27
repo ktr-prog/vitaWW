@@ -1277,6 +1277,10 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
             if ((ax[x] & 0xc0) || (oc[x] & 0x8000) || !(ax[x] & 1)) g |= 1u << (x >> 4);
         p[24] = (u8)g; p[25] = (u8)(g >> 8);
         p[26] = (u8)((uni || !(ax[0] & 1) ? 1 : 0) | (uni || !(ax[SCREEN_W - 1] & 1) ? 2 : 0));
+        u32 g3 = 0;   // p[27..28]: the groups with a BG3 pixel (the title moves BG3 sideways: the tiles follow it)
+        for (int x = 0; x < SCREEN_W; x++)
+            if (ax[x] & 0x40) g3 |= 1u << (x >> 4);
+        p[27] = (u8)g3; p[28] = (u8)(g3 >> 8);
     }
     memcpy(sGc.obj + line * SCREEN_W, oc, sizeof oc);
     memcpy(sGc.aux + line * SCREEN_W, ax, sizeof ax);

@@ -136,6 +136,7 @@ static GLint sGcTileAttr = -1;
 static float sGcFlip;      // the GPU's pixel rows against the quad's y (measured at start: gc_flip_measure)
 static int sGcTiled = 1, sGcTileFast;
 static uint64_t sGcOneNs, sGcTileNs;
+static const unsigned *sGcLogoPx;   // this frame's title logo (RGBA), for the tiles
 static int sGcWhy[8];
 static float sGcWhole[4];
 void vita_gl_gc_why(int w[8], float f[4]) { memcpy(w, sGcWhy, sizeof sGcWhy); memcpy(f, sGcWhole, sizeof sGcWhole); }
@@ -539,10 +540,29 @@ static void gc_draw(const Gpu2dGc *gc, const float *quad, int tiled) {
     if (tiled) {
         static float fv[GC_TILE_VERTS][2], sv[GC_TILE_VERTS][2];
         int nf = 0, ns = 0;
-        const int whole = sGcU.have3d < 0.5f || sGcU.logoOn > 0.5f || sGcU.mirror > 0.5f || sGcU.bg3 > 0.5f;
+        // (the title's logo and moved BG3: their tiles get the full compose, the rest of the picture need not)
+        const int whole = sGcU.have3d < 0.5f || sGcU.mirror > 0.5f;
+        static unsigned extra[192], logoCells[192];
+        static unsigned logoGen = ~0u;
+        static int logoKey[3] = {-1, 0, 0};
+        if (sGcU.logoOn > 0.5f && sGcLogoPx) {   // (the logo's cells: worked out again only when it changes)
+            extern unsigned gpu2d_gc_logo_gen(void);
+            unsigned gen = gpu2d_gc_logo_gen();
+            int key[3] = {1, (int)sGcU.ofs[0], (int)sGcU.ofs[1]};
+            if (gen != logoGen || memcmp(key, logoKey, sizeof key)) {
+                gc_tile_extra(gc->par, GPU2D_GC_PAR * 4, GC_W, sGcLogoPx, key[1], key[2], 0, logoCells);
+                logoGen = gen;
+                memcpy(logoKey, key, sizeof key);
+            }
+        } else {
+            logoKey[0] = -1;
+        }
+        gc_tile_extra(gc->par, GPU2D_GC_PAR * 4, GC_W, NULL, 0, 0, (int)sGcU.bg3, extra);
+        if (logoKey[0] == 1)
+            for (int y = 0; y < 192; y++) extra[y] |= logoCells[y];
         const int oy0 = sGcU.objShift > 0.5f ? (int)sGcU.mv[1] : 999, oy1 = sGcU.objShift > 0.5f ? (int)sGcU.mv[3] : 999;
         sGcTileFast = gc_tile_quads(gc->par, GPU2D_GC_PAR * 4, GC_W, (float)GC_W, sGcFlip > 0.5f, whole,
-                                    sGcU.ovlOn > 0.5f, oy0, oy1, fv, &nf, sv, &ns);
+                                    sGcU.ovlOn > 0.5f, oy0, oy1, extra, fv, &nf, sv, &ns);
         if (nf) {
             gc_frame_uniforms(sGcTileProg);
             glUseProgram(sGcTileProg);
@@ -624,6 +644,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             }
         }
         sGcU.logoOn = on && !mirror ? 1.0f : 0.0f;
+        sGcLogoPx = on && !mirror ? (const unsigned *)lp : NULL;
         sGcU.mirror = mirror == 1 ? 1.0f : 0.0f;   // the boot screens: the top screen's picture instead
         sOvlNow = mirror == 2 && on;
         mirrorNow = on && mirror == 1;   // a menu: drawn over the composed picture below (its own small pass)
