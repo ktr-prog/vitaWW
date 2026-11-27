@@ -1,37 +1,48 @@
-// TEST BUILD ONLY: GPU timings of compose and present variants, measured in the probe frames (vita_gl3d.c starts a
-// probe) and logged. Each variant: drawn three times with the GPU waited for before and after, the fastest kept.
-// Included by vita_gl.c (uses its statics). The compose variants draw into the canvas before the real compose
-// (which then overwrites it); the present variants draw into an offscreen 960x544 picture, not the screen.
+// TEST BUILD ONLY: GPU timings measured in the probe frames (vita_gl3d.c starts a probe) and logged. Each item:
+// drawn three times with the GPU waited for before and after, the fastest kept. Included by vita_gl.c (uses its
+// statics). The compose items draw into the canvas before the real compose (which then overwrites it); the present
+// steps draw into their real targets before the real present (which redraws them).
+//  - the compose (old one, the current one) and five diagnostic shaders that tell texture reads from arithmetic
+//    and whether a branch not taken saves its cost on this GPU
+//  - the present's steps
 #include "vita_bench_old.h"
-static const char kBenchBlitqVertexCg[] =
-    "void main(float2 aPos, float2 aTex, float2 aT3, out float4 oPos : POSITION,\n"
-    "          out float2 vTex : TEXCOORD0, out float2 vT3 : TEXCOORD1) {\n"
-    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; vT3 = aT3; }\n";
-static const char kBenchBlitqFragmentCg[] =
-    "float4 main(float2 vTex : TEXCOORD0, float2 vT3 : TEXCOORD1, uniform sampler2D uTex,\n"
-    "            uniform sampler2D u3d, uniform sampler2D uLp, uniform float4 uSz, uniform float4 uP) : COLOR {\n"
-    "  float2 tx = vTex * uSz.xy;\n"
-    "  float2 fl = floor(tx);\n"
-    "  float2 d = tx - fl - 0.5;\n"
-    "  float2 r = 0.5 - 0.5 / uSz.zw;\n"
-    "  float2 f2 = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
-    "  float4 cv = tex2D(uTex, (fl + f2) / uSz.xy);\n"
-    "  float4 h = tex2D(u3d, vT3);\n"
-    "  float2 mb = floor(tex2D(uLp, float2(2.5 / 8.0, (fl.y + 0.5) / 192.0)).zw * 255.0 + 0.5);\n"
-    "  float3 c = floor(h.rgb * 63.75 + 0.125);\n"
-    "  float3 cb = mb.x < 1.5 ? c + floor(((63.0 - c) * mb.y) / 16.0) : c - floor((c * mb.y + 15.0) / 16.0);\n"
-    "  c = mb.x > 0.5 && mb.x < 2.5 && mb.y > 0.5 ? cb : c;\n"
-    "  float3 h8 = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
-    "  float f = uP.x > 0.5 && h.a > 0.016 ? cv.a : 1.0;\n"
-    "  return float4(lerp(h8, cv.rgb, f), 1.0);\n"
-    "}\n";
-static const char kBenchTrivVertexCg[] =
-    "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
-    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
-static const char kBenchTrivFragmentCg[] =
-    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR { return tex2D(uTex, vTex); }\n";
+static const char kBenchVertexCg[] =
+    "void main(float2 aPos, out float4 oPos : POSITION) { oPos = float4(aPos, 0.0, 1.0); }\n";
+#define BENCH_UV "  float2 uv = float2((floor(fc.x) - 41.0 + 0.5) / 256.0, (floor(fc.y) + 0.5) / 192.0);\n"
+static const char kBench3dCg[] =   // the 3D sample only
+    "float4 main(float4 fc : WPOS, uniform sampler2D u3d) : COLOR {\n" BENCH_UV
+    "  return tex2D(u3d, float2((floor(fc.x) + 0.5) / 339.0, uv.y));\n}\n";
+static const char kBenchParCg[] =   // + the six line-parameter reads
+    "float4 main(float4 fc : WPOS, uniform sampler2D u3d, uniform sampler2D uLp) : COLOR {\n" BENCH_UV
+    "  float4 s = tex2D(u3d, float2((floor(fc.x) + 0.5) / 339.0, uv.y));\n"
+    "  for (int i = 0; i < 6; i++) s += tex2D(uLp, float2((i + 0.5) / 8.0, uv.y));\n"
+    "  return s;\n}\n";
+static const char kBenchFetchCg[] =   // every texture read the compose makes, summed (no arithmetic)
+    "float4 main(float4 fc : WPOS, uniform sampler2D u3d, uniform sampler2D uLp, uniform sampler2D uBg0,\n"
+    "            uniform sampler2D uBg1, uniform sampler2D uBg2, uniform sampler2D uBg3, uniform sampler2D uObj,\n"
+    "            uniform sampler2D uAux, uniform sampler2D uLogo) : COLOR {\n" BENCH_UV
+    "  float4 s = tex2D(u3d, float2((floor(fc.x) + 0.5) / 339.0, uv.y));\n"
+    "  for (int i = 0; i < 6; i++) s += tex2D(uLp, float2((i + 0.5) / 8.0, uv.y));\n"
+    "  s += tex2D(uBg0, uv) + tex2D(uBg1, uv) + tex2D(uBg2, uv) + tex2D(uBg3, uv) + tex2D(uObj, uv);\n"
+    "  s += tex2D(uAux, uv) + tex2D(uAux, float2(0.5 / 256.0, uv.y)) + tex2D(uLogo, uv);\n"
+    "  return s;\n}\n";
+#define BENCH_HEAVY \
+    "    float4 a = q;\n" \
+    "    for (int i = 0; i < 48; i++) a = floor(a * 1.37 + 0.5) - floor(a / 3.0);\n" \
+    "    q = a;\n"
+static const char kBenchBranchCg[] =   // 3D sample + ~200 operations in a branch never taken
+    "float4 main(float4 fc : WPOS, uniform sampler2D u3d) : COLOR {\n" BENCH_UV
+    "  float4 q = tex2D(u3d, float2((floor(fc.x) + 0.5) / 339.0, uv.y));\n"
+    "  if (q.a > 2.0) {\n" BENCH_HEAVY "  }\n"
+    "  return q;\n}\n";
+static const char kBenchAluCg[] =   // the same operations always run
+    "float4 main(float4 fc : WPOS, uniform sampler2D u3d) : COLOR {\n" BENCH_UV
+    "  float4 q = tex2D(u3d, float2((floor(fc.x) + 0.5) / 339.0, uv.y));\n"
+    "  {\n" BENCH_HEAVY "  }\n"
+    "  return q;\n}\n";
 
-static GLuint sBenchOld, sBenchLines, sBenchBlitq, sBenchTriv, sBenchTex, sBenchFbo;
+enum { BENCH_N = 5 };
+static GLuint sBenchOld, sBenchDiag[BENCH_N];
 static int sBenchState;   // 0 untried, 1 ready, -1 failed
 
 #define BENCH_TIME(var, code)                                                       \
@@ -45,124 +56,71 @@ static int sBenchState;   // 0 untried, 1 ready, -1 failed
             uint64_t d_ = host_plat_time_ns() - t_;                                 \
             if (d_ < best_) best_ = d_;                                             \
         }                                                                           \
-        var = best_;                                                                \
+        var = best_ / 1000;                                                         \
     } while (0)
 
-static void bench_quad(GLuint prog, const float *pos, const float *tex, const float *t3) {
-    GLint a0 = glGetAttribLocation(prog, "aPos"), a1 = tex ? glGetAttribLocation(prog, "aTex") : -1;
-    GLint a2 = t3 ? glGetAttribLocation(prog, "aT3") : -1;
+static void bench_quad(GLuint prog) {
+    GLint a0 = glGetAttribLocation(prog, "aPos");
     glUseProgram(prog);
     glEnableVertexAttribArray((GLuint)a0);
-    glVertexAttribPointer((GLuint)a0, 2, GL_FLOAT, GL_FALSE, 0, pos);
-    if (a1 >= 0) { glEnableVertexAttribArray((GLuint)a1); glVertexAttribPointer((GLuint)a1, 2, GL_FLOAT, GL_FALSE, 0, tex); }
-    if (a2 >= 0) { glEnableVertexAttribArray((GLuint)a2); glVertexAttribPointer((GLuint)a2, 2, GL_FLOAT, GL_FALSE, 0, t3); }
+    glVertexAttribPointer((GLuint)a0, 2, GL_FLOAT, GL_FALSE, 0, kFullPos);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)a0);
-    if (a1 >= 0) glDisableVertexAttribArray((GLuint)a1);
-    if (a2 >= 0) glDisableVertexAttribArray((GLuint)a2);
 }
 
+static uint64_t sBenchC[2 + BENCH_N];
 static void bench_run(const Gpu2dGc *gc, unsigned tex3d, int mirrorNow) {
+    (void)gc; (void)tex3d; (void)mirrorNow;
     if (sBenchState < 0) return;
     if (!sBenchState) {
         sBenchState = -1;
         fprintf(stderr, "bench: compiling the variants (first start only)\n");
         sBenchOld = cached_program(kOldGcVertexShaderCg, kOldGcFragmentShaderCg, "bench-old");
-        sBenchLines = cached_program(kGcVertexShaderCg, kGcFragmentShaderCg, "compose");
-        sBenchBlitq = cached_program(kBenchBlitqVertexCg, kBenchBlitqFragmentCg, "bench-blitq");
-        sBenchTriv = cached_program(kBenchTrivVertexCg, kBenchTrivFragmentCg, "bench-triv");
-        if (!sBenchOld || !sBenchLines || !sBenchBlitq || !sBenchTriv || sBlitProg == 0 || sBlitProg == (GLuint)-1) {
-            fprintf(stderr, "bench: a variant failed to build; no timings\n");
-            return;
+        const char *src[BENCH_N] = {kBench3dCg, kBenchParCg, kBenchFetchCg, kBenchBranchCg, kBenchAluCg};
+        const char *nm[BENCH_N] = {"bench-3d", "bench-par", "bench-fetch", "bench-branch", "bench-alu"};
+        for (int i = 0; i < BENCH_N; i++) {
+            sBenchDiag[i] = cached_program(kBenchVertexCg, src[i], nm[i]);
+            if (!sBenchDiag[i]) { fprintf(stderr, "bench: %s failed; no timings\n", nm[i]); return; }
+            gc_static_uniforms(sBenchDiag[i]);
         }
+        if (!sBenchOld) { fprintf(stderr, "bench: old compose failed; no timings\n"); return; }
         gc_static_uniforms(sBenchOld);
-        gc_static_uniforms(sBenchLines);
-        glUseProgram(sBenchBlitq);
-        glUniform1i(glGetUniformLocation(sBenchBlitq, "uTex"), 0);
-        glUniform1i(glGetUniformLocation(sBenchBlitq, "u3d"), 1);
-        glUniform1i(glGetUniformLocation(sBenchBlitq, "uLp"), 10);
-        glUniform4f(glGetUniformLocation(sBenchBlitq, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
-                    (float)SCREEN_H / 192.0f);
-        glUseProgram(sBenchTriv);
-        glUniform1i(glGetUniformLocation(sBenchTriv, "uTex"), 0);
-        glUseProgram(0);
-        glGenTextures(1, &sBenchTex);
-        glBindTexture(GL_TEXTURE_2D, sBenchTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, SCREEN_W, SCREEN_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glGenFramebuffers(1, &sBenchFbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, sBenchFbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sBenchTex, 0);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
         sBenchState = 1;
         fprintf(stderr, "bench: ready\n");
     }
-    static const float kQ[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
-    static const float kTexQ[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
-    static const float kT3Q[8] = {0, 0, 1, 0, 0, 1, 1, 1};
-    uint64_t cOld, cLines, cTex, pLines, pQuad, pTriv;
-
-    // compose variants, into the canvas (the units 0..10 are bound as for the real compose)
+    if (!sGcLogoTex) {   // (the fetch diagnostic reads the logo unit: never texture 0)
+        glActiveTexture(GL_TEXTURE0 + 9);
+        glBindTexture(GL_TEXTURE_2D, sGcTex[gc->set & 1][7]);
+        glActiveTexture(GL_TEXTURE0);
+    }
+    // compose items, into the canvas (the units 0..10 are bound as for the real compose)
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glViewport(0, 0, GC_W, 192);
     gc_frame_uniforms(sBenchOld);
-    gc_frame_uniforms(sBenchLines);
     gc_frame_uniforms(sGcProg);
-    BENCH_TIME(cOld, bench_quad(sBenchOld, kQ, NULL, NULL));
-    BENCH_TIME(cTex, bench_quad(sGcProg, kQ, NULL, NULL));
-    static float gcPos[GC_VERTS][2], gcL[6][GC_VERTS][4];
-    gc_line_quads(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, gcPos, gcL);
-    GLint la[7];
-    la[0] = glGetAttribLocation(sBenchLines, "aPos");
-    for (int k = 0; k < 6; k++) { char an[4] = {'a', 'L', (char)('0' + k), 0}; la[k + 1] = glGetAttribLocation(sBenchLines, an); }
-    BENCH_TIME(cLines, {
-        glUseProgram(sBenchLines);
-        for (int k = 0; k < 7; k++)
-            if (la[k] >= 0) {
-                glEnableVertexAttribArray((GLuint)la[k]);
-                glVertexAttribPointer((GLuint)la[k], k ? 4 : 2, GL_FLOAT, GL_FALSE, 0, k ? (const void *)gcL[k - 1] : (const void *)gcPos);
-            }
-        glDrawArrays(GL_TRIANGLES, 0, GC_VERTS);
-        for (int k = 0; k < 7; k++) if (la[k] >= 0) glDisableVertexAttribArray((GLuint)la[k]);
-    });
-    // the real compose's picture for the present variants to read
-    bench_quad(sGcProg, kQ, NULL, NULL);
+    BENCH_TIME(sBenchC[0], bench_quad(sBenchOld));
+    BENCH_TIME(sBenchC[1], bench_quad(sGcProg));
+    for (int i = 0; i < BENCH_N; i++) BENCH_TIME(sBenchC[2 + i], bench_quad(sBenchDiag[i]));
+}
 
-    // present variants, into the offscreen 960x544 picture
-    glBindFramebuffer(GL_FRAMEBUFFER, sBenchFbo);
+static void bench_present(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
+    if (sBenchState <= 0) return;
+    uint64_t pre, p3d = 0, fade = 0, fin, all;
+    BENCH_TIME(pre, present_pre());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
-    glActiveTexture(GL_TEXTURE0 + 1);
-    glBindTexture(GL_TEXTURE_2D, tex3d ? tex3d : sGcCanvas);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, sGcCanvas);
-    static float pv[4][GC_VERTS][2];
-    present_line_quads(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, (float)GC_TEX_W, pv);
-    glUseProgram(sBlitProg);
-    glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
-    BENCH_TIME(pLines, {
-        glUseProgram(sBlitProg);
-        for (int k = 0; k < 4; k++) {
-            glEnableVertexAttribArray((GLuint)sBlitAttr[k]);
-            glVertexAttribPointer((GLuint)sBlitAttr[k], 2, GL_FLOAT, GL_FALSE, 0, pv[k]);
-        }
-        glDrawArrays(GL_TRIANGLES, 0, GC_VERTS);
-        for (int k = 0; k < 4; k++) glDisableVertexAttribArray((GLuint)sBlitAttr[k]);
-    });
-    glUseProgram(sBenchBlitq);
-    glUniform4f(glGetUniformLocation(sBenchBlitq, "uP"), tex3d && !mirrorNow ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
-    BENCH_TIME(pQuad, bench_quad(sBenchBlitq, kQ, kTexQ, kT3Q));
-    BENCH_TIME(pTriv, bench_quad(sBenchTriv, kQ, kTexQ, NULL));
+    if (has3d) {
+        BENCH_TIME(p3d, present_3d(tex3d));
+        BENCH_TIME(fade, present_fades(gc));
+    }
+    BENCH_TIME(fin, present_final(has3d));
+    BENCH_TIME(all, present_draw(gc, tex3d, has3d));
     glUseProgram(0);
-
-    // back to the real compose's state: units 0 and 1 hold BG0 and BG1, the canvas is drawn next
-    GLuint *t = sGcTex[gc->set & 1];
-    glActiveTexture(GL_TEXTURE0 + 1);
-    glBindTexture(GL_TEXTURE_2D, t[1]);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, t[0]);
-    fprintf(stderr, "bench (GPU, us): compose old %llu, per-line quads %llu, line-parameter texture %llu | present "
-            "(offscreen 960x544) per-line quads %llu, one quad %llu, plain copy %llu\n",
-            (unsigned long long)(cOld / 1000), (unsigned long long)(cLines / 1000), (unsigned long long)(cTex / 1000),
-            (unsigned long long)(pLines / 1000), (unsigned long long)(pQuad / 1000), (unsigned long long)(pTriv / 1000));
+    fprintf(stderr, "bench (GPU, us): compose old %llu, current %llu | diagnostics: 3D read only %llu, + 6 parameter "
+            "reads %llu, all the compose's reads %llu, 200 ops in a branch not taken %llu, 200 ops %llu | present: "
+            "3x canvas %llu, 3D copy %llu, fades %llu, final blend %llu, all %llu\n",
+            (unsigned long long)sBenchC[0], (unsigned long long)sBenchC[1], (unsigned long long)sBenchC[2],
+            (unsigned long long)sBenchC[3], (unsigned long long)sBenchC[4], (unsigned long long)sBenchC[5],
+            (unsigned long long)sBenchC[6], (unsigned long long)pre, (unsigned long long)p3d,
+            (unsigned long long)fade, (unsigned long long)fin, (unsigned long long)all);
 }

@@ -136,7 +136,6 @@ static GLuint sGcLp[2];   // the per-line parameters, decoded (gpu2d_compose.h g
 enum { GC_W = 339, GC_TEX_W = 352 };
 enum { GC_L = (GC_W - 256) / 2, GC_R = GC_W - 256 - GC_L };   // the side bars beside the DS's 256 columns: 41 left, 42 right
 static GLint sGcLogoOn = -1, sGcLogoOfs = -1, sGcBg3Shift = -1, sGcMirror = -1, sGcObjMove = -1, sGcObjShift = -1;
-static GLuint sBlitProg;
 // The menu over the scene (gpu2d: engine B's picture, alpha 0 where it has nothing): a small pass of its own over
 // the composed canvas, in the 256 DS columns. (Kept out of the big compose shader, which is near the limits of the
 // Vita's shader compiler.)
@@ -149,7 +148,6 @@ static const char kMenuVertexShaderCg[] =
 static const char kMenuFragmentShaderCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
     "  float4 c = tex2D(uTex, vTex);\n  if (c.a < 0.25) discard;\n  return float4(c.rgb, 1.0);\n}\n";   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
-static GLint sBlitAttr[4] = {-1, -1, -1, -1}, sBlitP = -1;   // aPos, aTex, aT3, aMb
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -246,6 +244,133 @@ static void gc_frame_uniforms(GLuint prog) {
     glUniform4f(glGetUniformLocation(prog, "uObjMove"), sGcU.mv[0], sGcU.mv[1], sGcU.mv[2], sGcU.mv[3]);
     glUniform1f(glGetUniformLocation(prog, "uObjShift"), sGcU.objShift);
 }
+// The present, built from plain texture copies and the GPU's blending (per-pixel arithmetic at the screen's
+// 960x544 is what costs on the Vita: a shader of a few dozen operations took 10 ms, a copy 1.2 ms):
+//  1. the canvas, nearest, 3x into an offscreen picture (1017x576): each canvas pixel a 3x3 block
+//  2. the 3D colour buffer (960x544, full resolution) copied to the screen
+//  3. on DS lines with a master brightness (the fades): that brightness over the 3D, by blending white or black
+//  4. the 3x picture to the screen, linear (= "sharp bilinear": crisp blocks, only the block edges blended), blended
+//     by the canvas alpha - 0 where the compose marked the pixel as exactly the 3D (the full-resolution 3D shows),
+//     1 elsewhere (the 2D, anything blended, the menus)
+enum { PRE_W = GC_W * 3, PRE_H = 192 * 3 };
+static const char kCopyVertexCg[] =
+    "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
+static const char kCopyFragmentCg[] =
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR { return tex2D(uTex, vTex); }\n";
+static const char kFillVertexCg[] =
+    "void main(float2 aPos, float4 aCol, out float4 oPos : POSITION, out float4 vCol : COLOR) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vCol = aCol; }\n";
+static const char kFillFragmentCg[] =
+    "float4 main(float4 vCol : COLOR) : COLOR { return vCol; }\n";
+static GLuint sCopyProg, sFillProg, sPreTex, sPreFbo;
+static GLint sCopyPos = -1, sCopyTex = -1, sFillPos = -1, sFillCol = -1;
+static void present_init(void) {
+    sCopyProg = cached_program(kCopyVertexCg, kCopyFragmentCg, "copy");
+    sFillProg = cached_program(kFillVertexCg, kFillFragmentCg, "fill");
+    if (sCopyProg && sFillProg) {
+        sCopyPos = glGetAttribLocation(sCopyProg, "aPos");
+        sCopyTex = glGetAttribLocation(sCopyProg, "aTex");
+        sFillPos = glGetAttribLocation(sFillProg, "aPos");
+        sFillCol = glGetAttribLocation(sFillProg, "aCol");
+        glUseProgram(sCopyProg);
+        glUniform1i(glGetUniformLocation(sCopyProg, "uTex"), 0);
+        glUseProgram(0);
+    }
+    if (!sCopyProg || !sFillProg || sCopyPos < 0 || sCopyTex < 0 || sFillPos < 0 || sFillCol < 0) {
+        fprintf(stderr, "vita_gl: present shaders unavailable (linear blit)\n");
+        sCopyProg = (GLuint)-1;
+        return;
+    }
+    glGenTextures(1, &sPreTex);
+    glBindTexture(GL_TEXTURE_2D, sPreTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, PRE_W, PRE_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenFramebuffers(1, &sPreFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, sPreFbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sPreTex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    fprintf(stderr, "vita_gl: present ready (3x canvas + full-resolution 3D, blended)\n");
+}
+static const float kFullPos[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+static void copy_quad(GLuint tex, const float *uv) {
+    glUseProgram(sCopyProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glEnableVertexAttribArray((GLuint)sCopyPos);
+    glEnableVertexAttribArray((GLuint)sCopyTex);
+    glVertexAttribPointer((GLuint)sCopyPos, 2, GL_FLOAT, GL_FALSE, 0, kFullPos);
+    glVertexAttribPointer((GLuint)sCopyTex, 2, GL_FLOAT, GL_FALSE, 0, uv);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)sCopyPos);
+    glDisableVertexAttribArray((GLuint)sCopyTex);
+}
+// canvas (row 0 = DS line 0 = the top of the picture) into the 3x picture, nearest (the canvas texture's filter)
+static const float kCanvasUv[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
+static const float kFlatUv[8] = {0, 0, 1, 0, 0, 1, 1, 1};   // the 3D buffer / the 3x picture: row 0 at the bottom
+static void present_pre(void) {
+    glBindFramebuffer(GL_FRAMEBUFFER, sPreFbo);
+    glViewport(0, 0, PRE_W, PRE_H);
+    glDisable(GL_BLEND);
+    copy_quad(sGcCanvas, kCanvasUv);
+}
+static void present_3d(unsigned tex3d) {
+    glDisable(GL_BLEND);
+    copy_quad(tex3d, kFlatUv);
+}
+// The fades over the 3D: per DS line with a master brightness, white (up) or black (down) at factor / 16.
+static int present_fades(const Gpu2dGc *gc) {
+    static float pos[GC_VERTS][2], col[GC_VERTS][4];
+    int n = 0;
+    for (int y = 0; y < 192; y++) {
+        const unsigned char *p = gc->par + y * GPU2D_GC_PAR * 4;
+        const int mode = p[10], f = p[11] > 16 ? 16 : p[11];
+        if (!(mode == 1 || mode == 2) || !f) continue;
+        const float ya = 1.0f - 2.0f * (float)y / 192.0f, yb = 1.0f - 2.0f * (float)(y + 1) / 192.0f;
+        const float q[6][2] = {{-1, ya}, {1, ya}, {-1, yb}, {-1, yb}, {1, ya}, {1, yb}};
+        const float c = mode == 1 ? 1.0f : 0.0f, a = (float)f / 16.0f;
+        for (int k = 0; k < 6; k++, n++) {
+            pos[n][0] = q[k][0]; pos[n][1] = q[k][1];
+            col[n][0] = col[n][1] = col[n][2] = c; col[n][3] = a;
+        }
+    }
+    if (!n) return 0;
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(sFillProg);
+    glEnableVertexAttribArray((GLuint)sFillPos);
+    glEnableVertexAttribArray((GLuint)sFillCol);
+    glVertexAttribPointer((GLuint)sFillPos, 2, GL_FLOAT, GL_FALSE, 0, pos);
+    glVertexAttribPointer((GLuint)sFillCol, 4, GL_FLOAT, GL_FALSE, 0, col);
+    glDrawArrays(GL_TRIANGLES, 0, n);
+    glDisableVertexAttribArray((GLuint)sFillPos);
+    glDisableVertexAttribArray((GLuint)sFillCol);
+    glDisable(GL_BLEND);
+    return 1;
+}
+static void present_final(int has3d) {
+    if (has3d) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else
+        glDisable(GL_BLEND);
+    copy_quad(sPreTex, kFlatUv);
+    glDisable(GL_BLEND);
+}
+static void present_draw(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
+    present_pre();   // (first: the offscreen picture, then the screen in one go)
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, SCREEN_W, SCREEN_H);
+    if (has3d) {
+        present_3d(tex3d);
+        present_fades(gc);
+    }
+    present_final(has3d);
+    glUseProgram(0);
+}
 #include "vita_bench.h"   // (TEST BUILD: GPU timings of compose/present variants, logged with the probe)
 int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
@@ -308,8 +433,8 @@ int vita_gl_gc_init(void) {
     glGenTextures(1, &sGcCanvas);
     glBindTexture(GL_TEXTURE_2D, sGcCanvas);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GC_TEX_W, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);   // (copied 3x, nearest: present_pre)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glGenFramebuffers(1, &sGcFbo);
@@ -450,42 +575,11 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glUseProgram(0);
     glDepthMask(GL_TRUE);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
-    if (!sBlitProg) {
-        sBlitProg = cached_program(kBlitVertexShaderCg, kBlitFragmentShaderCg, "blit");
-        if (sBlitProg) {
-            static const char *const kAttr[4] = {"aPos", "aTex", "aT3", "aMb"};
-            for (int k = 0; k < 4; k++) sBlitAttr[k] = glGetAttribLocation(sBlitProg, kAttr[k]);
-            glUseProgram(sBlitProg);
-            glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
-            glUniform1i(glGetUniformLocation(sBlitProg, "u3d"), 1);
-            sBlitP = glGetUniformLocation(sBlitProg, "uP");
-            glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
-                        (float)SCREEN_H / 192.0f);
-            glUseProgram(0);
-            if (sBlitAttr[0] < 0 || sBlitAttr[1] < 0 || sBlitAttr[2] < 0 || sBlitAttr[3] < 0) sBlitProg = 0;
-            fprintf(stderr, "vita_gl: sharp-bilinear present %s\n", sBlitProg ? "on" : "unavailable (linear blit)");
-        }
-        if (!sBlitProg) sBlitProg = (GLuint)-1;
-    }
-    if (sBlitProg != (GLuint)-1) {
-        // The canvas (GC_W of its GC_TEX_W columns; row 0 = DS line 0 at the top) across the whole screen, one quad
-        // per DS line (its brightness for the full-resolution 3D); the 3D colour buffer where the compose marked it.
-        static float pv[4][GC_VERTS][2];
-        present_line_quads(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, (float)GC_TEX_W, pv);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glUseProgram(sBlitProg);
-        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
-        glActiveTexture(GL_TEXTURE0 + 1);
-        glBindTexture(GL_TEXTURE_2D, tex3d ? tex3d : sGcCanvas);   // (always a valid texture: the shader reads it)
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, sGcCanvas);
-        for (int k = 0; k < 4; k++) {
-            glEnableVertexAttribArray((GLuint)sBlitAttr[k]);
-            glVertexAttribPointer((GLuint)sBlitAttr[k], 2, GL_FLOAT, GL_FALSE, 0, pv[k]);
-        }
-        glDrawArrays(GL_TRIANGLES, 0, GC_VERTS);
-        for (int k = 0; k < 4; k++) glDisableVertexAttribArray((GLuint)sBlitAttr[k]);
-        glUseProgram(0);
+    if (!sCopyProg) present_init();
+    if (sCopyProg != (GLuint)-1) {
+        const int has3d = tex3d && !mirrorNow;
+        if (probe) bench_present(gc, tex3d, has3d);   // (TEST BUILD)
+        present_draw(gc, tex3d, has3d);
         if (probe) {
             tp = host_plat_time_ns(); glFinish(); gVitaGpuPresentNs = host_plat_time_ns() - tp;
             gVitaGpuProbe = 0;
