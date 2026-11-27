@@ -297,6 +297,49 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
         }
     }
 }
+// The compose drawn as one quad over the canvas, the per-line parameters read from a small texture the CPU fills
+// once per frame (gc_line_texels: 8 RGBA texels per line, already decoded - no per-pixel decoding). (One quad per
+// line carrying them as vertex attributes measured slower on the Vita: 1-pixel-high triangles.)
+#define GC_TEX_FETCH \
+    "  float lv = (floor(fc.y) + 0.5) / 192.0;\n" \
+    "  vec4 L0 = texture2D(uLp, vec2(0.5 / 8.0, lv)) * 255.0;\n" \
+    "  vec4 L1 = texture2D(uLp, vec2(1.5 / 8.0, lv)) * 255.0;\n" \
+    "  vec4 L2 = texture2D(uLp, vec2(2.5 / 8.0, lv)) * 255.0;\n" \
+    "  vec4 L3 = texture2D(uLp, vec2(3.5 / 8.0, lv)) * 255.0;\n" \
+    "  vec4 L4 = texture2D(uLp, vec2(4.5 / 8.0, lv)) * 255.0;\n" \
+    "  vec4 L5 = texture2D(uLp, vec2(5.5 / 8.0, lv)) * 255.0;\n" \
+    "  L3.w = L5.x + L5.y * 256.0 - 1024.0;\n" \
+    "  L5 = vec4(L5.z + L5.w * 256.0 - 1024.0, 0.0, 0.0, 0.0);\n"
+static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
+    "precision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
+    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_TEX_FETCH
+    "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5); }\n";
+static const char kGcqVertexShader[] =
+    "attribute vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+static const char kGcqFragmentShaderCg[] =
+    "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D tex2D\n" GC_GMOD
+    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
+    "float4 main(float4 fc : WPOS) : COLOR {\n" GC_TEX_FETCH
+    "  return compose(fc.xy, L0, L1, L2, L3, L4, L5);\n"
+    "}\n";
+static const char kGcqVertexShaderCg[] =
+    "void main(float2 aPos, out float4 oPos : POSITION) { oPos = float4(aPos, 0.0, 1.0); }\n";
+// That texture's contents: per line 8 RGBA8 texels = aL0..aL5's values (gc_line_params), with L3.w and L5.x (signed,
+// beyond a byte) as value + 1024 in texel 5's bytes (lo, hi).
+static inline void gc_line_texels(const unsigned char *par, int parStride, float u3dCols, unsigned char (*o)[8][4]) {
+    for (int y = 0; y < 192; y++) {
+        float L[24];
+        gc_line_params(par + y * parStride, y, u3dCols, L);
+        unsigned char *t = &o[y][0][0];
+        for (int i = 0; i < 20; i++) t[i] = (unsigned char)L[i];
+        t[15] = 0;
+        const int s = (int)L[15] + 1024, h = (L[20] > 30000.0f ? 30000 : (int)L[20]) + 1024;
+        t[20] = (unsigned char)(s & 255); t[21] = (unsigned char)(s >> 8);
+        t[22] = (unsigned char)(h & 255); t[23] = (unsigned char)(h >> 8);
+        for (int i = 24; i < 32; i++) t[i] = 0;
+    }
+}
+
 // (GLSL ES twins of the present, for the host check)
 static const char kBlitVertexShader[] =
     "attribute vec2 aPos, aTex, aT3, aMb;\n"

@@ -129,7 +129,7 @@ unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
-static GLint sGcL[6] = {-1, -1, -1, -1, -1, -1};   // the per-line parameter attributes aL0..aL5 (gpu2d_compose.h)
+static GLuint sGcLp[2];   // the per-line parameters, decoded (gpu2d_compose.h gc_line_texels): one per layer set
 // The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
 // canvas pixels come out square on the screen): GC_W columns (the 3D view across all of them, the 2D layers
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
@@ -221,6 +221,32 @@ static GLuint cached_program(const char *vsrc, const char *fsrc, const char *nam
     }
     return prog;
 }
+// The compose's fixed uniforms (any of the compose programs).
+static void gc_static_uniforms(GLuint prog) {
+    glUseProgram(prog);
+    glUniform1f(glGetUniformLocation(prog, "uW"), (float)GC_W);
+    glUniform1f(glGetUniformLocation(prog, "u3dCols"), (float)GC_W);   // the 3D is drawn GC_W wide (vita_gl3d.c)
+    // The 3D colour buffer is the screen's 960 columns for the canvas's GC_W (vita_gl3d.c): the compose's sample of
+    // canvas column x lands in screen column (x + 0.5) * 960 / GC_W, the 3D pixel under the middle of that column.
+    glUniform1f(glGetUniformLocation(prog, "u3dTexW"), (float)GC_W);
+    static const char *const kNames[11] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d", "uLogo", "uLp"};
+    for (int i = 0; i < 11; i++) glUniform1i(glGetUniformLocation(prog, kNames[i]), i);
+    glUseProgram(0);
+}
+// This frame's compose uniforms (vita_gl_present_gc), set on whichever compose program draws.
+static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift; } sGcU;
+static void gc_frame_uniforms(GLuint prog) {
+    glUseProgram(prog);
+    glUniform1f(glGetUniformLocation(prog, "uHave3d"), sGcU.have3d);
+    glUniform1f(glGetUniformLocation(prog, "uOvlOn"), sGcU.ovlOn);
+    glUniform1f(glGetUniformLocation(prog, "uLogoOn"), sGcU.logoOn);
+    glUniform1f(glGetUniformLocation(prog, "uMirror"), sGcU.mirror);
+    glUniform2f(glGetUniformLocation(prog, "uLogoOfs"), sGcU.ofs[0], sGcU.ofs[1]);
+    glUniform1f(glGetUniformLocation(prog, "uBg3Shift"), sGcU.bg3);
+    glUniform4f(glGetUniformLocation(prog, "uObjMove"), sGcU.mv[0], sGcU.mv[1], sGcU.mv[2], sGcU.mv[3]);
+    glUniform1f(glGetUniformLocation(prog, "uObjShift"), sGcU.objShift);
+}
+#include "vita_bench.h"   // (TEST BUILD: GPU timings of compose/present variants, logged with the probe)
 int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
     sGcState = -1;
@@ -228,25 +254,15 @@ int vita_gl_gc_init(void) {
     // Cg sources compiled as is (GL_CG_*: not through vitaGL's GLSL translator). Compiling takes seconds on the
     // Vita, so the linked program is kept in ux0:data/vitaWW (keyed by a hash of the sources) and loaded from there
     // on later starts. Each step is logged, so a failure on a device shows where it happened.
-    sGcProg = cached_program(kGcVertexShaderCg, kGcFragmentShaderCg, "compose");
+    sGcProg = cached_program(kGcqVertexShaderCg, kGcqFragmentShaderCg, "composeq");
     if (!sGcProg) return 0;
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
     fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
     if (sGcAttr < 0) return 0;
-    for (int k = 0; k < 6; k++) {
-        char an[4] = {'a', 'L', (char)('0' + k), 0};
-        sGcL[k] = glGetAttribLocation(sGcProg, an);
-    }
     sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
+    gc_static_uniforms(sGcProg);
     glUseProgram(sGcProg);
-    glUniform1f(glGetUniformLocation(sGcProg, "uW"), (float)GC_W);
-    glUniform1f(glGetUniformLocation(sGcProg, "u3dCols"), (float)GC_W);   // the 3D is drawn GC_W wide (vita_gl3d.c)
-    // The 3D colour buffer is the screen's 960 columns for the canvas's GC_W (vita_gl3d.c): the compose's sample of
-    // canvas column x lands in screen column (x + 0.5) * 960 / GC_W, the 3D pixel under the middle of that column.
-    glUniform1f(glGetUniformLocation(sGcProg, "u3dTexW"), (float)GC_W);
-    static const char *const kNames[10] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d", "uLogo"};
-    for (int i = 0; i < 10; i++) glUniform1i(glGetUniformLocation(sGcProg, kNames[i]), i);
     sGcLogoOn = glGetUniformLocation(sGcProg, "uLogoOn");
     sGcLogoOfs = glGetUniformLocation(sGcProg, "uLogoOfs");
     sGcBg3Shift = glGetUniformLocation(sGcProg, "uBg3Shift");
@@ -279,6 +295,15 @@ int vita_gl_gc_init(void) {
         }
         uint16_t *bg[4] = {ptr[0], ptr[1], ptr[2], ptr[3]};
         gpu2d_set_gc_buffers(set, bg, ptr[4], ptr[5], ptr[6]);
+    }
+    glGenTextures(2, sGcLp);
+    for (int i = 0; i < 2; i++) {
+        glBindTexture(GL_TEXTURE_2D, sGcLp[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
     glGenTextures(1, &sGcCanvas);
     glBindTexture(GL_TEXTURE_2D, sGcCanvas);
@@ -349,19 +374,25 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
             }
         }
-        glUseProgram(sGcProg);
-        glUniform1f(sGcLogoOn, on && !mirror ? 1.0f : 0.0f);
-        glUniform1f(sGcMirror, mirror == 1 ? 1.0f : 0.0f);   // the boot screens: the top screen's picture instead
+        sGcU.logoOn = on && !mirror ? 1.0f : 0.0f;
+        sGcU.mirror = mirror == 1 ? 1.0f : 0.0f;   // the boot screens: the top screen's picture instead
         sOvlNow = mirror == 2 && on;
         mirrorNow = on && mirror == 1;   // a menu: drawn over the composed picture below (its own small pass)
-        glUniform2f(sGcLogoOfs, (float)dx, (float)dy);
-        glUniform1f(sGcBg3Shift, prompt ? (float)GC_R : 0.0f);   // (to the screen's right edge)
+        sGcU.ofs[0] = (float)dx; sGcU.ofs[1] = (float)dy;
+        sGcU.bg3 = prompt ? (float)GC_R : 0.0f;   // (to the screen's right edge)
         // the HUD clock's sprites moved right by the side bar's width, to the screen's right edge (gpu2d)
         extern int gpu2d_gc_objmove(int rect[4]);
         int r[4];
         int mv = gpu2d_gc_objmove(r);
-        glUniform4f(sGcObjMove, (float)r[0], (float)r[1], (float)r[2], (float)r[3]);
-        glUniform1f(sGcObjShift, mv ? (float)GC_R : 0.0f);
+        for (int i = 0; i < 4; i++) sGcU.mv[i] = (float)r[i];
+        sGcU.objShift = mv ? (float)GC_R : 0.0f;
+    }
+    {   // this frame's per-line parameters, decoded once per line
+        static unsigned char lt[192][8][4];
+        gc_line_texels(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, lt);
+        glActiveTexture(GL_TEXTURE0 + 10);
+        glBindTexture(GL_TEXTURE_2D, sGcLp[gc->set & 1]);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 8, 192, GL_RGBA, GL_UNSIGNED_BYTE, lt);
     }
     glActiveTexture(GL_TEXTURE0);
 
@@ -373,25 +404,19 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_FALSE);
-    glUseProgram(sGcProg);
-    glUniform1f(sGcHave3d, tex3d ? 1.0f : 0.0f);
-    glUniform1f(sGcOvlOn, ovl ? 1.0f : 0.0f);
+    sGcU.have3d = tex3d ? 1.0f : 0.0f;
+    sGcU.ovlOn = ovl ? 1.0f : 0.0f;
     static const float kQuad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
-    // One quad per DS line carrying that line's parameters (decoded here once per line, not per pixel).
-    static float gcPos[GC_VERTS][2], gcL[6][GC_VERTS][4];
-    gc_line_quads(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, gcPos, gcL);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+    if (probe) bench_run(gc, tex3d, mirrorNow);   // (TEST BUILD) before the real compose, which overwrites the canvas
+    glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
+    glViewport(0, 0, GC_W, 192);
+    gc_frame_uniforms(sGcProg);
+    glUseProgram(sGcProg);
     glEnableVertexAttribArray((GLuint)sGcAttr);
-    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, gcPos);
-    for (int k = 0; k < 6; k++)
-        if (sGcL[k] >= 0) {
-            glEnableVertexAttribArray((GLuint)sGcL[k]);
-            glVertexAttribPointer((GLuint)sGcL[k], 4, GL_FLOAT, GL_FALSE, 0, gcL[k]);
-        }
-    glDrawArrays(GL_TRIANGLES, 0, GC_VERTS);
+    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sGcAttr);
-    for (int k = 0; k < 6; k++)
-        if (sGcL[k] >= 0) glDisableVertexAttribArray((GLuint)sGcL[k]);
     if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
         if (!sOvlProg) {
             sOvlProg = cached_program(kMenuVertexShaderCg, kMenuFragmentShaderCg, "menu");
