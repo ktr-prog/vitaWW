@@ -97,9 +97,30 @@ static const char kGcVertexShader[] =
     "    float x3b = x - uBg3Shift;\n" \
     "    use3 = x3b >= 0.0 && x3b < 256.0 ? 1.0 : 0.0;\n" \
     "    uv3 = vec2((x3b + 0.5) / 256.0, uv.y);\n" \
-    "    covBg3 = 1.0;\n" \
+    "    covBg3 = use3 > 0.5 ? bitOf(by(texture2D(uAux, uv3).r), 64.0) : 0.0;\n" \
     "  }\n" \
     "  float m = in2d > 0.5 ? axl : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
+    /* Fast path: nothing but the 3D (or, where it has no pixel, the backdrop) can show here - no 2D pixel, the \
+       line's colour effects leave the 3D and the backdrop as they are (L5.y, gc_line_params), no logo, overlay or \
+       translucent 3D pixel - so the result is that colour with the master brightness: the rest is skipped (a \
+       branch not taken costs nothing on the Vita's GPU; the arithmetic below is what costs). */ \
+    "  if (L5.y > 0.5 && covMain < 0.5 && covBg3 < 0.5 && bitOf(m, 1.0) > 0.5 && uHave3d > 0.5 &&\n" \
+    "      !(uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) && !(uObjShift > 0.5 && y >= uObjMove.y && y < uObjMove.w)) {\n" \
+    "    vec4 q = texture2D(u3d, vec2((x3 + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
+    "    float qa = floor(by(q.a) / 8.0);\n" \
+    "    float lgOn = 0.0;\n" \
+    "    if (uLogoOn > 0.5) {\n" \
+    "      vec2 qlu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
+    "      vec4 qlg = texture2D(uLogo, qlu);\n" \
+    "      lgOn = qlg.a > 0.5 && qlu.x > 0.0 && qlu.x < 1.0 && qlu.y > 0.0 && qlu.y < 1.0 ? 1.0 : 0.0;\n" \
+    "    }\n" \
+    "    if ((qa > 30.5 || qa < 0.5) && lgOn < 0.5) {\n" \
+    "      vec3 qo = qa > 30.5 ? floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0) : bd;\n" \
+    "      if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) qo = brighten(qo, mbf, 0.0);\n" \
+    "      else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) qo = darken(qo, mbf, 15.0);\n" \
+    "      return vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 ? 0.0 : 1.0);\n" \
+    "    }\n" \
+    "  }\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
     "  float k; vec3 c; vec4 tv;\n" \
@@ -255,7 +276,12 @@ static inline void gc_line_params(const unsigned char *p, int y, float u3dCols, 
         (float)(p[6] >> 2 & 1), (float)(p[6] >> 3 & 1), p[23], p[22] ? 1.0f : 0.0f,
         hr, 0, 0, 0,
     };
+    // L5.y: the compose's fast path may be taken on this line (the 3D shown, not shifted, and the line's colour effect
+    // leaves a 3D or backdrop pixel unchanged: no effect, alpha blending (which never blends these two with each
+    // other the way the compose resolves them), or a brightness change of 0, or neither is a first target)
+    const int effect = p[6] & 3, on3d = p[6] >> 3 & 1;
     for (int i = 0; i < 24; i++) L[i] = v[i];
+    if (on3d && v[15] == 0.0f && (effect <= 1 || p[7] == 0 || !(p[4] & 0x21))) L[21] = 1.0f;
 }
 // The compose's vertices: one quad (two triangles) per DS line over the whole canvas: GC_VERTS positions (pos) and
 // the line's parameters as six arrays of 4 floats (lp[k] = attribute aLk; separate arrays, as vitaGL copies each
@@ -308,8 +334,9 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
     "  vec4 L3 = texture2D(uLp, vec2(3.5 / 8.0, lv)) * 255.0;\n" \
     "  vec4 L4 = texture2D(uLp, vec2(4.5 / 8.0, lv)) * 255.0;\n" \
     "  vec4 L5 = texture2D(uLp, vec2(5.5 / 8.0, lv)) * 255.0;\n" \
+    "  float lfast = L3.w;\n" \
     "  L3.w = L5.x + L5.y * 256.0 - 1024.0;\n" \
-    "  L5 = vec4(L5.z + L5.w * 256.0 - 1024.0, 0.0, 0.0, 0.0);\n"
+    "  L5 = vec4(L5.z + L5.w * 256.0 - 1024.0, lfast, 0.0, 0.0);\n"
 static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
     "precision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
     "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_TEX_FETCH
@@ -332,7 +359,7 @@ static inline void gc_line_texels(const unsigned char *par, int parStride, float
         gc_line_params(par + y * parStride, y, u3dCols, L);
         unsigned char *t = &o[y][0][0];
         for (int i = 0; i < 20; i++) t[i] = (unsigned char)L[i];
-        t[15] = 0;
+        t[15] = (unsigned char)L[21];   // (the fast-path flag: GC_TEX_FETCH)
         const int s = (int)L[15] + 1024, h = (L[20] > 30000.0f ? 30000 : (int)L[20]) + 1024;
         t[20] = (unsigned char)(s & 255); t[21] = (unsigned char)(s >> 8);
         t[22] = (unsigned char)(h & 255); t[23] = (unsigned char)(h >> 8);

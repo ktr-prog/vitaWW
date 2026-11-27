@@ -238,7 +238,6 @@ int g3w_init(void *device, void *queue, int scale) {
 }
 void *g3w_picture(void) { return 0; }
 // The colour texture of the last frame drawn (GPU compose samples it), 0 before the first.
-GLuint vita_gl3d_fbo_of(GLuint tex) { for (int i = 0; i < 2; i++) if (sColorTex[i] == tex) return sFbo[i]; return 0; }   // (test-build diagnostic)
 unsigned vita_gl3d_frame_tex(void) { return sReady && sPrevDraw >= 0 ? sColorTex[sPrevDraw] : 0; }   // readback path only (out buffer), no shared picture
 
 #define BATCH_V 0xC000  // vertices per draw: vitaGL's glDrawArrays index limit (MAX_IDX_NUMBER)

@@ -258,16 +258,30 @@ static const char kCopyVertexCg[] =
     "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
 static const char kCopyFragmentCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR { return tex2D(uTex, vTex); }\n";
+// The 3x copy of the canvas: the texel under each pixel by its index (exact blocks whatever the texture's filter).
+static const char kNearFragmentCg[] =
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz) : COLOR {\n"
+    "  return tex2D(uTex, (floor(vTex * uSz.xy) + 0.5) * uSz.zw); }\n";
 static const char kFillVertexCg[] =
     "void main(float2 aPos, float4 aCol, out float4 oPos : POSITION, out float4 vCol : COLOR) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vCol = aCol; }\n";
 static const char kFillFragmentCg[] =
     "float4 main(float4 vCol : COLOR) : COLOR { return vCol; }\n";
-static GLuint sCopyProg, sFillProg, sPreTex, sPreFbo;
+static GLuint sCopyProg, sFillProg, sNearProg, sPreTex, sPreFbo;
+static GLint sNearPos = -1, sNearTex = -1;
 static GLint sCopyPos = -1, sCopyTex = -1, sFillPos = -1, sFillCol = -1;
 static void present_init(void) {
     sCopyProg = cached_program(kCopyVertexCg, kCopyFragmentCg, "copy");
     sFillProg = cached_program(kFillVertexCg, kFillFragmentCg, "fill");
+    sNearProg = cached_program(kCopyVertexCg, kNearFragmentCg, "near");
+    if (sNearProg) {
+        sNearPos = glGetAttribLocation(sNearProg, "aPos");
+        sNearTex = glGetAttribLocation(sNearProg, "aTex");
+        glUseProgram(sNearProg);
+        glUniform1i(glGetUniformLocation(sNearProg, "uTex"), 0);
+        glUniform4f(glGetUniformLocation(sNearProg, "uSz"), (float)GC_TEX_W, 192.0f, 1.0f / GC_TEX_W, 1.0f / 192.0f);
+        glUseProgram(0);
+    }
     if (sCopyProg && sFillProg) {
         sCopyPos = glGetAttribLocation(sCopyProg, "aPos");
         sCopyTex = glGetAttribLocation(sCopyProg, "aTex");
@@ -277,7 +291,8 @@ static void present_init(void) {
         glUniform1i(glGetUniformLocation(sCopyProg, "uTex"), 0);
         glUseProgram(0);
     }
-    if (!sCopyProg || !sFillProg || sCopyPos < 0 || sCopyTex < 0 || sFillPos < 0 || sFillCol < 0) {
+    if (!sCopyProg || !sFillProg || !sNearProg || sCopyPos < 0 || sCopyTex < 0 || sFillPos < 0 || sFillCol < 0 ||
+        sNearPos < 0 || sNearTex < 0) {
         fprintf(stderr, "vita_gl: present shaders unavailable (linear blit)\n");
         sCopyProg = (GLuint)-1;
         return;
@@ -315,7 +330,16 @@ static void present_pre(void) {
     glBindFramebuffer(GL_FRAMEBUFFER, sPreFbo);
     glViewport(0, 0, PRE_W, PRE_H);
     glDisable(GL_BLEND);
-    copy_quad(sGcCanvas, kCanvasUv);
+    glUseProgram(sNearProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sGcCanvas);
+    glEnableVertexAttribArray((GLuint)sNearPos);
+    glEnableVertexAttribArray((GLuint)sNearTex);
+    glVertexAttribPointer((GLuint)sNearPos, 2, GL_FLOAT, GL_FALSE, 0, kFullPos);
+    glVertexAttribPointer((GLuint)sNearTex, 2, GL_FLOAT, GL_FALSE, 0, kCanvasUv);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)sNearPos);
+    glDisableVertexAttribArray((GLuint)sNearTex);
 }
 static void present_3d(unsigned tex3d) {
     glDisable(GL_BLEND);
@@ -373,7 +397,6 @@ static void present_draw(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
     present_final(has3d);
     glUseProgram(0);
 }
-#include "vita_bench.h"   // (TEST BUILD: GPU timings of compose/present variants, logged with the probe)
 int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
     sGcState = -1;
@@ -535,7 +558,6 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     sGcU.ovlOn = ovl ? 1.0f : 0.0f;
     static const float kQuad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    if (probe) bench_run(gc, tex3d, mirrorNow);   // (TEST BUILD) before the real compose, which overwrites the canvas
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glViewport(0, 0, GC_W, 192);
     gc_frame_uniforms(sGcProg);
@@ -580,7 +602,6 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     if (!sCopyProg) present_init();
     if (sCopyProg != (GLuint)-1) {
         const int has3d = tex3d && !mirrorNow;
-        if (probe) bench_present(gc, tex3d, has3d);   // (TEST BUILD)
         present_draw(gc, tex3d, has3d);
         if (probe) {
             tp = host_plat_time_ns(); glFinish(); gVitaGpuPresentNs = host_plat_time_ns() - tp;
