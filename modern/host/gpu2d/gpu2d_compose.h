@@ -417,6 +417,68 @@ static const char kGcqVertexShaderCg[] =
     "          out float2 vP1 : TEXCOORD5, out float2 vP2 : TEXCOORD6, out float2 vP3 : TEXCOORD7, out float2 vP4 : TEXCOORD8,\n"
     "          out float2 vP5 : TEXCOORD9) {\n"
     "  oPos = float4(aPos, 0.0, 1.0);\n" GC_VS_BODY "}\n";
+// The compose in tiles (8 lines x 16 columns; the side bars one tile each): where a tile can only show the 3D or the
+// backdrop - no 2D pixel, no sprite, the 3D not hidden by a window (gc_line's p[24..26]) on lines whose colour
+// effects leave those as they are (L5.y), no iris, no overlay - a small program draws it from the 3D texel and the
+// line's backdrop, brightness and 2nd-target bit alone (exactly what the full compose gives there, translucent 3D
+// over the backdrop included); the rest gets the full compose. Same vertex shader: same coordinates.
+#define GC_TILE_FAST_MAIN(TEX) \
+    "  vec4 L1 = floor(" TEX "(uLp, vP1) * 255.0 + 0.5), L2 = floor(" TEX "(uLp, vP2) * 255.0 + 0.5);\n" \
+    "  vec4 L3 = floor(" TEX "(uLp, vP3) * 255.0 + 0.5), q = " TEX "(u3d, v3d);\n" \
+    "  float qa = floor(by(q.a) / 8.0), b2 = bitOf(L1.y, 32.0);\n" \
+    "  vec3 c = floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0), bd = L3.xyz;\n" \
+    "  vec3 o = qa > 30.5 ? c : (qa < 0.5 ? bd : (b2 > 0.5 ? blend3d(c, bd, qa) : c));\n" \
+    "  float al = qa < 0.5 || (qa < 30.5 && b2 > 0.5) ? 1.0 : 0.0;\n" \
+    "  if (L2.z > 0.5 && L2.z < 1.5 && L2.w > 0.5) o = brighten(o, L2.w, 0.0);\n" \
+    "  else if (L2.z > 1.5 && L2.z < 2.5 && L2.w > 0.5) o = darken(o, L2.w, 15.0);\n" \
+    "  vec4 res = vec4((o * 4.0 + floor(o / 16.0)) / 255.0, al);\n"
+static const char kGcTileFragmentShader[] =   // GLSL ES 1.00 (host check)
+    "precision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_VARYINGS_GLSL GC_FRAGMENT_BODY
+    "void main() {\n" GC_TILE_FAST_MAIN("texture2D") "  gl_FragColor = res; }\n";
+static const char kGcTileFragmentShaderCg[] =
+    "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
+    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
+    "float4 main(float2 v3d : TEXCOORD2, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6, float2 vP3 : TEXCOORD7) : COLOR {\n"
+    GC_TILE_FAST_MAIN("tex2D") "  return res;\n}\n";
+// The tiles as two lists of triangles (x, y in clip space; 6 vertices a tile run): fast (the program above) and full.
+// W: canvas columns (the 2D area from column (W - 256) / 2); flip: the GPU's rows against y (vita_gl.c); whole: every
+// tile full (no 3D, the logo, the boot screens' mirror ...); ovl: the overlay's rows (0-15) full; objY0..objY1: the
+// lines of the moved HUD clock, full. Returns the number of fast tiles.
+enum { GC_TILE_VERTS = 24 * 18 * 6 };
+static inline int gc_tile_quads(const unsigned char *par, int stride, int W, float u3dCols, int flip, int whole, int ovl,
+                                int objY0, int objY1, float (*fv)[2], int *nf, float (*sv)[2], int *ns) {
+    const int left = (W - 256) / 2;
+    int fast = 0;
+    *nf = *ns = 0;
+    for (int r = 0; r < 24; r++) {
+        unsigned slow = 0;   // bit c: cell c of this row (0 left side, 1..16 the 2D columns, 17 right side)
+        for (int y = r * 8; y < r * 8 + 8; y++) {
+            const unsigned char *p = par + y * stride;
+            float L[24];
+            gc_line_params(p, y, u3dCols, L);
+            int lineSlow = whole || L[21] < 0.5f || p[22] || (ovl && y < 16) || (y >= objY0 && y < objY1);
+            if (lineSlow) { slow = 0x3ffff; break; }
+            slow |= (unsigned)(p[26] & 1) | (unsigned)(p[24] | p[25] << 8) << 1 | (unsigned)(p[26] >> 1 & 1) << 17;
+        }
+        if (left <= 0) slow |= 1u | 1u << 17;   // (no side bars: those cells are empty either way)
+        float y0 = r * 8 / 96.0f - 1.0f, y1 = (r * 8 + 8) / 96.0f - 1.0f;
+        if (flip) { y0 = -y0; y1 = -y1; }
+        for (int c = 0; c < 18;) {
+            int k = slow >> c & 1, e = c;
+            while (e < 18 && (slow >> e & 1) == (unsigned)k) e++;
+            int x0 = c == 0 ? 0 : left + (c - 1) * 16, x1 = e == 18 ? W : left + (e - 1) * 16;
+            if (x1 > x0) {
+                float a = x0 * 2.0f / W - 1.0f, b = x1 * 2.0f / W - 1.0f;
+                float (*v)[2] = k ? sv + *ns : fv + *nf;
+                const float q[6][2] = {{a, y0}, {b, y0}, {a, y1}, {b, y0}, {b, y1}, {a, y1}};
+                for (int i = 0; i < 6; i++) { v[i][0] = q[i][0]; v[i][1] = q[i][1]; }
+                if (k) *ns += 6; else { *nf += 6; fast += e - c; }
+            }
+            c = e;
+        }
+    }
+    return fast;
+}
 // (Vita, once at start) which way the GPU's pixel rows run against the quad's y: red 1 where they agree
 static const char kFlipCalFragmentCg[] =
     "float4 main(float4 fc : WPOS, float2 vUv : TEXCOORD0) : COLOR {\n"

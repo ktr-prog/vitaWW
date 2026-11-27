@@ -1268,6 +1268,16 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
         }
     }
     if (anyObj) __atomic_fetch_or(&sGc.used, 1u << 4, __ATOMIC_RELAXED);
+    {   // Where on this line the compose may show just the 3D or the backdrop (gpu2d_compose.h gc_tile_quads): bit k of
+        // p[24..25] = some pixel of columns 16k..16k+15 has a 2D pixel or a sprite or hides the 3D by its window;
+        // p[26] bit 0/1: the left/right side beside the 2D area can't (a layer carried there, or the edge column's
+        // window hides the 3D).
+        u32 g = 0;
+        for (int x = 0; x < SCREEN_W; x++)
+            if ((ax[x] & 0xc0) || (oc[x] & 0x8000) || !(ax[x] & 1)) g |= 1u << (x >> 4);
+        p[24] = (u8)g; p[25] = (u8)(g >> 8);
+        p[26] = (u8)((uni || !(ax[0] & 1) ? 1 : 0) | (uni || !(ax[SCREEN_W - 1] & 1) ? 2 : 0));
+    }
     memcpy(sGc.obj + line * SCREEN_W, oc, sizeof oc);
     memcpy(sGc.aux + line * SCREEN_W, ax, sizeof ax);
     memcpy(sGc.par + line * GPU2D_GC_PAR * 4, p, sizeof p);

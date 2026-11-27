@@ -129,14 +129,13 @@ int gVitaGpuProbe, gVitaGpuProbed;
 unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;
-// The compose's first pass (GC_FASTONLY): the fast path's pixels only, written with depth; the full compose then
-// runs under the depth test, so the GPU shades it only where the first pass wrote nothing (the depth test rejects
-// pixels before shading). One shader with an if/else ran the full arithmetic for every pixel on the Vita (13 ms).
-static GLuint sGcFastProg, sGcDepthRb;
-static GLint sGcFastAttr = -1;
+// The compose in tiles (gpu2d_compose.h gc_tile_quads): where a tile can only show the 3D or the backdrop, a small
+// program draws it; the rest gets the full compose. Measured against the one-quad compose on the probe frames.
+static GLuint sGcTileProg;
+static GLint sGcTileAttr = -1;
 static float sGcFlip;      // the GPU's pixel rows against the quad's y (measured at start: gc_flip_measure)
-static int sGcTwoPass;     // the two-pass compose is the faster one (measured on the probe frames)
-static uint64_t sGcOneNs, sGcTwoNs, sGcFirstNs;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
+static int sGcTiled = 1, sGcTileFast;
+static uint64_t sGcOneNs, sGcTileNs;
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 static GLuint sGcLp[2];   // the per-line parameters, decoded (gpu2d_compose.h gc_line_texels): one per layer set
 // The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
@@ -461,13 +460,13 @@ int vita_gl_gc_init(void) {
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
     fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
     if (sGcAttr < 0) return 0;
-    sGcFastProg = cached_program(kGcqVertexShaderCg, kGcqFastFragmentShaderCg, "composef");
-    if (sGcFastProg) {
-        sGcFastAttr = glGetAttribLocation(sGcFastProg, "aPos");
-        if (sGcFastAttr < 0) sGcFastProg = 0;
-        else gc_static_uniforms(sGcFastProg);
+    sGcTileProg = cached_program(kGcqVertexShaderCg, kGcTileFragmentShaderCg, "composet");
+    if (sGcTileProg) {
+        sGcTileAttr = glGetAttribLocation(sGcTileProg, "aPos");
+        if (sGcTileAttr < 0) sGcTileProg = 0;
+        else gc_static_uniforms(sGcTileProg);
     }
-    fprintf(stderr, "vita_gl: GPU compose: first pass %s\n", sGcFastProg ? "ready" : "unavailable (one pass)");
+    fprintf(stderr, "vita_gl: GPU compose: tiles %s\n", sGcTileProg ? "ready" : "unavailable (one quad)");
     sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     gc_static_uniforms(sGcProg);
@@ -524,12 +523,6 @@ int vita_gl_gc_init(void) {
     glGenFramebuffers(1, &sGcFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sGcCanvas, 0);
-    if (sGcFastProg) {
-        glGenRenderbuffers(1, &sGcDepthRb);
-        glBindRenderbuffer(GL_RENDERBUFFER, sGcDepthRb);
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, GC_TEX_W, 192);
-        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sGcDepthRb);
-    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     gc_flip_measure();
     sGcState = 1;
@@ -538,25 +531,32 @@ int vita_gl_gc_init(void) {
     return 1;
 }
 
-// The compose's draw into the canvas: one pass, or (two) the fast pixels first, marking them in the depth buffer,
-// then the full compose only where the first pass wrote nothing. timed: wait for the GPU after each pass.
-static void gc_draw(const float *quad, int two, int timed) {
-    if (two) {
-        uint64_t t = host_plat_time_ns();
-        glClearDepthf(1.0f);
-        glDepthMask(GL_TRUE);
-        glClear(GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_ALWAYS);
-        gc_frame_uniforms(sGcFastProg);
-        glUseProgram(sGcFastProg);
-        glEnableVertexAttribArray((GLuint)sGcFastAttr);
-        glVertexAttribPointer((GLuint)sGcFastAttr, 2, GL_FLOAT, GL_FALSE, 0, quad);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray((GLuint)sGcFastAttr);
-        if (timed) { glFinish(); sGcFirstNs = host_plat_time_ns() - t; }
-        glDepthFunc(GL_LESS);
-        glDepthMask(GL_FALSE);
+// The compose's draw into the canvas: one quad, or the tiles (fast ones by the small program, the rest in full).
+static void gc_draw(const Gpu2dGc *gc, const float *quad, int tiled) {
+    if (tiled) {
+        static float fv[GC_TILE_VERTS][2], sv[GC_TILE_VERTS][2];
+        int nf = 0, ns = 0;
+        const int whole = sGcU.have3d < 0.5f || sGcU.logoOn > 0.5f || sGcU.mirror > 0.5f || sGcU.bg3 > 0.5f;
+        const int oy0 = sGcU.objShift > 0.5f ? (int)sGcU.mv[1] : 999, oy1 = sGcU.objShift > 0.5f ? (int)sGcU.mv[3] : 999;
+        sGcTileFast = gc_tile_quads(gc->par, GPU2D_GC_PAR * 4, GC_W, (float)GC_W, sGcFlip > 0.5f, whole,
+                                    sGcU.ovlOn > 0.5f, oy0, oy1, fv, &nf, sv, &ns);
+        if (nf) {
+            gc_frame_uniforms(sGcTileProg);
+            glUseProgram(sGcTileProg);
+            glEnableVertexAttribArray((GLuint)sGcTileAttr);
+            glVertexAttribPointer((GLuint)sGcTileAttr, 2, GL_FLOAT, GL_FALSE, 0, fv);
+            glDrawArrays(GL_TRIANGLES, 0, nf);
+            glDisableVertexAttribArray((GLuint)sGcTileAttr);
+        }
+        if (ns) {
+            gc_frame_uniforms(sGcProg);
+            glUseProgram(sGcProg);
+            glEnableVertexAttribArray((GLuint)sGcAttr);
+            glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, sv);
+            glDrawArrays(GL_TRIANGLES, 0, ns);
+            glDisableVertexAttribArray((GLuint)sGcAttr);
+        }
+        return;
     }
     gc_frame_uniforms(sGcProg);
     glUseProgram(sGcProg);
@@ -564,11 +564,9 @@ static void gc_draw(const float *quad, int two, int timed) {
     glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, quad);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sGcAttr);
-    if (timed) glFinish();
-    if (two) { glDisable(GL_DEPTH_TEST); glDepthFunc(GL_LESS); }
 }
-void vita_gl_gc_times(uint64_t *one, uint64_t *two, uint64_t *first, int *usingTwo) {
-    *one = sGcOneNs; *two = sGcTwoNs; *first = sGcFirstNs; *usingTwo = sGcTwoPass;
+void vita_gl_gc_times(uint64_t *one, uint64_t *tiles, int *fastTiles, int *usingTiles) {
+    *one = sGcOneNs; *tiles = sGcTileNs; *fastTiles = sGcTileFast; *usingTiles = sGcTiled;
 }
 // Compose gc + the 3D colour buffer tex3d (0: none yet) into the canvas texture and present it. ovl: the FPS
 // overlay rows (256x16, alpha byte 0 = overlay pixel) or NULL.
@@ -658,17 +656,19 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glViewport(0, 0, GC_W, 192);
-    if (probe && sGcFastProg) {   // both ways, each waited for: keep the faster for the frames that follow
+    if (probe && sGcTileProg) {   // both ways, each waited for: keep the faster for the frames that follow
+        glFinish();
         uint64_t ta = host_plat_time_ns();
-        gc_draw(kQuad, 0, 0);
+        gc_draw(gc, kQuad, 0);
         glFinish();
         uint64_t tb = host_plat_time_ns();
-        gc_draw(kQuad, 1, 1);
+        gc_draw(gc, kQuad, 1);
+        glFinish();
         uint64_t tc = host_plat_time_ns();
-        sGcOneNs = tb - ta; sGcTwoNs = tc - tb;
-        sGcTwoPass = sGcTwoNs < sGcOneNs;
+        sGcOneNs = tb - ta; sGcTileNs = tc - tb;
+        sGcTiled = sGcTileNs < sGcOneNs;
     } else
-        gc_draw(kQuad, sGcFastProg && sGcTwoPass, 0);
+        gc_draw(gc, kQuad, sGcTileProg && sGcTiled);
 
     if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
         if (!sOvlProg) {

@@ -993,12 +993,12 @@ static void render_frame_mt(void) {
                 fprintf(stderr, "gpu (one frame, the GPU waited for after each pass): 3d %llu us, compose %llu us, "
                         "present %llu us\n", (unsigned long long)(gVitaGpu3dNs / 1000),
                         (unsigned long long)(gVitaGpuComposeNs / 1000), (unsigned long long)(gVitaGpuPresentNs / 1000));
-                    extern void vita_gl_gc_times(uint64_t *one, uint64_t *two, uint64_t *first, int *usingTwo);
-                    uint64_t one, two, firstp; int u;
-                    vita_gl_gc_times(&one, &two, &firstp, &u);
-                    if (one) fprintf(stderr, "gpu compose: one pass %llu us, two passes %llu us (first pass %llu us) - "
-                                     "using %s\n", (unsigned long long)(one / 1000), (unsigned long long)(two / 1000),
-                                     (unsigned long long)(firstp / 1000), u ? "two" : "one");
+                    extern void vita_gl_gc_times(uint64_t *one, uint64_t *tiles, int *fastTiles, int *usingTiles);
+                    uint64_t one, tiles; int ft, u;
+                    vita_gl_gc_times(&one, &tiles, &ft, &u);
+                    if (one) fprintf(stderr, "gpu compose: one quad %llu us, tiles %llu us (%d of 432 tiles the fast program) - "
+                                     "using %s\n", (unsigned long long)(one / 1000), (unsigned long long)(tiles / 1000), ft,
+                                     u ? "tiles" : "one quad");
             }
             extern unsigned gVitaRepeats;
             fprintf(stderr, "display: %u refreshes repeated the previous picture (last 60 frames)\n",
