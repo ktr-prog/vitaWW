@@ -129,6 +129,7 @@ unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
+static GLint sGcL[6] = {-1, -1, -1, -1, -1, -1};   // the per-line parameter attributes aL0..aL5 (gpu2d_compose.h)
 // The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
 // canvas pixels come out square on the screen): GC_W columns (the 3D view across all of them, the 2D layers
 // 1:1 in the middle 256), in a texture GC_TEX_W wide (a multiple of 32 for the GPU surface).
@@ -148,7 +149,7 @@ static const char kMenuVertexShaderCg[] =
 static const char kMenuFragmentShaderCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
     "  float4 c = tex2D(uTex, vTex);\n  if (c.a < 0.25) discard;\n  return float4(c.rgb, 1.0);\n}\n";   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
-static GLint sBlitPos = -1, sBlitTex = -1, sBlitP = -1;
+static GLint sBlitAttr[4] = {-1, -1, -1, -1}, sBlitP = -1;   // aPos, aTex, aT3, aMb
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -232,6 +233,10 @@ int vita_gl_gc_init(void) {
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
     fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
     if (sGcAttr < 0) return 0;
+    for (int k = 0; k < 6; k++) {
+        char an[4] = {'a', 'L', (char)('0' + k), 0};
+        sGcL[k] = glGetAttribLocation(sGcProg, an);
+    }
     sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     glUseProgram(sGcProg);
@@ -319,7 +324,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 16, GL_RGBA, GL_UNSIGNED_BYTE, o);
     }
     glActiveTexture(GL_TEXTURE0 + 8);
-    glBindTexture(GL_TEXTURE_2D, tex3d);
+    glBindTexture(GL_TEXTURE_2D, tex3d ? tex3d : t[7]);   // (no 3D yet: any valid texture; uHave3d 0 keeps it unread)
     int mirrorNow = 0;   // the boot screens: no 3D shown
     {   // the title screen: the logo (gpu2d: the top screen's BG2), 1:1, centred on the screen; "touch to start"
         // (BG3) moved right by the side bar's width, into the screen's bottom-right corner
@@ -372,11 +377,21 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glUniform1f(sGcHave3d, tex3d ? 1.0f : 0.0f);
     glUniform1f(sGcOvlOn, ovl ? 1.0f : 0.0f);
     static const float kQuad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    // One quad per DS line carrying that line's parameters (decoded here once per line, not per pixel).
+    static float gcPos[GC_VERTS][2], gcL[6][GC_VERTS][4];
+    gc_line_quads(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, gcPos, gcL);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glEnableVertexAttribArray((GLuint)sGcAttr);
-    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, gcPos);
+    for (int k = 0; k < 6; k++)
+        if (sGcL[k] >= 0) {
+            glEnableVertexAttribArray((GLuint)sGcL[k]);
+            glVertexAttribPointer((GLuint)sGcL[k], 4, GL_FLOAT, GL_FALSE, 0, gcL[k]);
+        }
+    glDrawArrays(GL_TRIANGLES, 0, GC_VERTS);
     glDisableVertexAttribArray((GLuint)sGcAttr);
+    for (int k = 0; k < 6; k++)
+        if (sGcL[k] >= 0) glDisableVertexAttribArray((GLuint)sGcL[k]);
     if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
         if (!sOvlProg) {
             sOvlProg = cached_program(kMenuVertexShaderCg, kMenuFragmentShaderCg, "menu");
@@ -413,41 +428,38 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     if (!sBlitProg) {
         sBlitProg = cached_program(kBlitVertexShaderCg, kBlitFragmentShaderCg, "blit");
         if (sBlitProg) {
-            sBlitPos = glGetAttribLocation(sBlitProg, "aPos");
-            sBlitTex = glGetAttribLocation(sBlitProg, "aTex");
+            static const char *const kAttr[4] = {"aPos", "aTex", "aT3", "aMb"};
+            for (int k = 0; k < 4; k++) sBlitAttr[k] = glGetAttribLocation(sBlitProg, kAttr[k]);
             glUseProgram(sBlitProg);
             glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
             glUniform1i(glGetUniformLocation(sBlitProg, "u3d"), 1);
-            glUniform1i(glGetUniformLocation(sBlitProg, "uPar"), 2);
             sBlitP = glGetUniformLocation(sBlitProg, "uP");
             glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
                         (float)SCREEN_H / 192.0f);
             glUseProgram(0);
-            if (sBlitPos < 0 || sBlitTex < 0) sBlitProg = 0;
+            if (sBlitAttr[0] < 0 || sBlitAttr[1] < 0 || sBlitAttr[2] < 0 || sBlitAttr[3] < 0) sBlitProg = 0;
             fprintf(stderr, "vita_gl: sharp-bilinear present %s\n", sBlitProg ? "on" : "unavailable (linear blit)");
         }
         if (!sBlitProg) sBlitProg = (GLuint)-1;
     }
     if (sBlitProg != (GLuint)-1) {
-        // The canvas (GC_W of its GC_TEX_W columns; row 0 = DS line 0 at the top) across the whole screen.
-        static const float kPos[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
-        static const float kTex[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
+        // The canvas (GC_W of its GC_TEX_W columns; row 0 = DS line 0 at the top) across the whole screen, one quad
+        // per DS line (its brightness for the full-resolution 3D); the 3D colour buffer where the compose marked it.
+        static float pv[4][GC_VERTS][2];
+        present_line_quads(gc->par, GPU2D_GC_PAR * 4, (float)GC_W, (float)GC_TEX_W, pv);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(sBlitProg);
-        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, mirrorNow ? 0.0f : 1.0f, 0.0f);
+        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
         glActiveTexture(GL_TEXTURE0 + 1);
-        glBindTexture(GL_TEXTURE_2D, tex3d);
-        glActiveTexture(GL_TEXTURE0 + 2);
-        glBindTexture(GL_TEXTURE_2D, t[6]);   // uPar
+        glBindTexture(GL_TEXTURE_2D, tex3d ? tex3d : sGcCanvas);   // (always a valid texture: the shader reads it)
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, sGcCanvas);
-        glEnableVertexAttribArray((GLuint)sBlitPos);
-        glEnableVertexAttribArray((GLuint)sBlitTex);
-        glVertexAttribPointer((GLuint)sBlitPos, 2, GL_FLOAT, GL_FALSE, 0, kPos);
-        glVertexAttribPointer((GLuint)sBlitTex, 2, GL_FLOAT, GL_FALSE, 0, kTex);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray((GLuint)sBlitPos);
-        glDisableVertexAttribArray((GLuint)sBlitTex);
+        for (int k = 0; k < 4; k++) {
+            glEnableVertexAttribArray((GLuint)sBlitAttr[k]);
+            glVertexAttribPointer((GLuint)sBlitAttr[k], 2, GL_FLOAT, GL_FALSE, 0, pv[k]);
+        }
+        glDrawArrays(GL_TRIANGLES, 0, GC_VERTS);
+        for (int k = 0; k < 4; k++) glDisableVertexAttribArray((GLuint)sBlitAttr[k]);
         glUseProgram(0);
         if (probe) {
             tp = host_plat_time_ns(); glFinish(); gVitaGpuPresentNs = host_plat_time_ns() - tp;

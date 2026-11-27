@@ -1231,13 +1231,27 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     // (built here and copied out whole: the destination may be uncached GPU memory)
     u16 oc[SCREEN_W], ax[SCREEN_W];
     int anyObj = 0;
-    for (int x = 0; x < SCREEN_W; x++) ax[x] = mask[x];
+    // Coverage for the compose (it skips the layers of pixels without any): bit 7 of the low byte = an opaque pixel
+    // of a shown 2D BG 0-2 or a sprite, bit 6 = of BG3 (the title moves BG3 sideways: it is looked up apart). The
+    // window mask uses bits 0-5.
+    const u16 *cb[3];
+    int ncb = 0;
+    for (int n = 0; n < 3; n++)
+        if (p[n] != 4 && !(n == 0 && (dispcnt & 8))) cb[ncb++] = e->bg[n];
+    const int cov3 = p[3] != 4;
+    for (int x = 0; x < SCREEN_W; x++) {
+        u16 a = mask[x];
+        for (int i = 0; i < ncb; i++)
+            if (cb[i][x] & PIX_OPAQUE) { a |= 0x80; break; }
+        if (cov3 && (e->bg[3][x] & PIX_OPAQUE)) a |= 0x40;
+        ax[x] = a;
+    }
     memset(oc, 0, SCREEN_W * sizeof *oc);
     if (dispcnt & 0x1000) {
         for (int x = obj->lo < 0 ? 0 : obj->lo, xe = obj->hi > SCREEN_W ? SCREEN_W : obj->hi; x < xe; x++) {
             if (!obj->source[x]) continue;
             oc[x] = (u16)(obj_color(e, dispcnt, obj, x) | 0x8000);
-            ax[x] |= (u16)((obj->prio[x] & 3) | (obj->kind[x] & 3) << 2 | (obj->alpha[x] & 15) << 4) << 8;
+            ax[x] |= (u16)((obj->prio[x] & 3) | (obj->kind[x] & 3) << 2 | (obj->alpha[x] & 15) << 4) << 8 | 0x80;
             anyObj = 1;
         }
     }

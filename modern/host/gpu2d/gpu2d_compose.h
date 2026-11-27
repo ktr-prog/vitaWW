@@ -16,9 +16,17 @@
 #ifndef GPU2D_COMPOSE_H
 #define GPU2D_COMPOSE_H
 
+// Drawn as one quad per DS line: the line's parameters (decoded on the CPU from the bands' per-line parameter row,
+// vita_gl.c gc_line_attribs) come in as six constant vectors, so the fragment program does not fetch and decode
+// them for every pixel: L0 = BG priorities (4 = off); L1 = first/second target layers, colour effect, EVY; L2 = EVA,
+// EVB, master-brightness mode, factor; L3 = backdrop (6-bit r, g, b), the 3D column offset (BG0 scroll, in canvas
+// columns); L4 = sprites on, 3D on, uni (BG n one opaque colour across the line: carried beside the 2D area), iris on;
+// L5.x = the iris circle's half width on this line (-1: none).
 static const char kGcVertexShader[] =
     "attribute vec2 aPos;\n"
-    "void main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+    "attribute vec4 aL0, aL1, aL2, aL3, aL4, aL5;\n"
+    "varying vec4 vL0, vL1, vL2, vL3, vL4, vL5;\n"
+    "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vL0 = aL0; vL1 = aL1; vL2 = aL2; vL3 = aL3; vL4 = aL4; vL5 = aL5; }\n";
 
 // The fragment program's body, shared by the GLSL (host check) and Cg (Vita) versions below: one entry function
 // compose(fragment position) that returns the colour.
@@ -29,7 +37,6 @@ static const char kGcVertexShader[] =
     "uniform sampler2D uBg3;\n" \
     "uniform sampler2D uObj;\n" \
     "uniform sampler2D uAux;\n" \
-    "uniform sampler2D uPar;\n" \
     "uniform sampler2D u3d;\n" \
     "uniform sampler2D uOvl;\n" \
     "uniform float uHave3d;\n" \
@@ -54,36 +61,34 @@ static const char kGcVertexShader[] =
     "vec3 blend3d(vec3 a, vec3 b, float al) { return floor((a * (al + 1.0) + b * (31.0 - al) + 16.0) / 32.0); }\n" \
     "vec3 brighten(vec3 c, float ev, float bias) { return c + floor(((63.0 - c) * ev + bias) / 16.0); }\n" \
     "vec3 darken(vec3 c, float ev, float bias) { return c - floor((c * ev + bias) / 16.0); }\n" \
-    "vec4 compose(vec2 fc) {\n" \
+    "vec4 compose(vec2 fc, vec4 L0, vec4 L1, vec4 L2, vec4 L3, vec4 L4, vec4 L5) {\n" \
+    "  L0 = floor(L0 + 0.5); L1 = floor(L1 + 0.5); L2 = floor(L2 + 0.5);\n" \
+    "  L3 = floor(L3 + 0.5); L4 = floor(L4 + 0.5); L5 = floor(L5 + 0.5);\n" \
     "  float cx = floor(fc.x), y = floor(fc.y);\n" \
     "  float x = cx - floor((uW - 256.0) / 2.0);\n" \
     "  float in2d = x >= 0.0 && x < 256.0 ? 1.0 : 0.0;\n" \
     "  float x3 = floor((cx + 0.5) * u3dCols / uW);\n" \
     "  vec2 uv = vec2((x + 0.5) / 256.0, (y + 0.5) / 192.0);\n" \
     "  if (uMirror > 0.5) return in2d > 0.5 ? vec4(texture2D(uLogo, uv).rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
-    "  float py = (y + 0.5) / 192.0;\n" \
-    "  vec4 p0 = texture2D(uPar, vec2(0.5 / 8.0, py));\n" \
-    "  vec4 p1 = texture2D(uPar, vec2(1.5 / 8.0, py));\n" \
-    "  vec4 p2 = texture2D(uPar, vec2(2.5 / 8.0, py));\n" \
-    "  vec4 p3 = texture2D(uPar, vec2(3.5 / 8.0, py));\n" \
-    "  vec4 p4 = texture2D(uPar, vec2(4.5 / 8.0, py));\n" \
-    "  float pr0 = by(p0.r), pr1 = by(p0.g), pr2 = by(p0.b), pr3 = by(p0.a);\n" \
-    "  float first = by(p1.r), second = by(p1.g), fl = by(p1.b), evy = by(p1.a);\n" \
-    "  float effect = gmod(fl, 4.0), objOn = bitOf(fl, 4.0), on3d = bitOf(fl, 8.0);\n" \
-    "  float eva = by(p2.r), evb = by(p2.g), mbm = by(p2.b), mbf = by(p2.a);\n" \
-    "  vec3 bd = vec3(by(p3.r), by(p3.g), by(p3.b));\n" \
-    "  float hofs = by(p4.r) + by(p4.g) * 256.0 - 256.0;\n" \
+    "  float pr0 = L0.x, pr1 = L0.y, pr2 = L0.z, pr3 = L0.w;\n" \
+    "  float first = L1.x, second = L1.y, effect = L1.z, evy = L1.w;\n" \
+    "  float eva = L2.x, evb = L2.y, mbm = L2.z, mbf = L2.w;\n" \
+    "  vec3 bd = L3.xyz;\n" \
+    "  float objOn = L4.x, on3d = L4.y, uni = L4.z;\n" \
     "  vec4 ax = texture2D(uAux, uv);\n" \
     "  vec2 euv = vec2(x < 0.0 ? 0.5 / 256.0 : 255.5 / 256.0, uv.y);\n" \
-    "  vec4 p5 = texture2D(uPar, vec2(5.5 / 8.0, py));\n" \
-    "  float uni = by(p5.a);\n" \
     "  float sideM = by(texture2D(uAux, euv).r);\n" \
-    "  if (in2d < 0.5 && by(p5.b) > 0.5) {\n" \
-    "    float ir = by(p5.r) + by(p5.g) * 256.0, dd = floor(abs(2.0 * y + 1.0 - 192.0) / 2.0);\n" \
-    "    float hr = dd <= ir ? floor(sqrt(ir * ir - dd * dd)) : -1.0;\n" \
-    "    if (!(hr >= 0.0 && x >= 128.0 - hr && x < 128.0 + hr)) return vec4(0.0, 0.0, 0.0, 1.0);\n" \
+    "  if (in2d < 0.5 && L4.w > 0.5) {\n" \
+    "    float hr = L5.x;\n" \
+    "    if (!(hr >= 0.0 && x >= 128.0 - hr && x < 128.0 + hr)) {\n" \
+    "      float bk = L2.z > 0.5 && L2.z < 1.5 ? floor(63.0 * L2.w / 16.0) : 0.0;\n" \
+    "      return vec4(vec3(bk * 4.0 + floor(bk / 16.0)) / 255.0, 1.0);\n" \
+    "    }\n" \
     "    sideM = 33.0;\n" \
     "  }\n" \
+    "  float axl = by(ax.r);\n" \
+    "  float covMain = in2d > 0.5 ? (axl > 127.5 ? 1.0 : 0.0) : (gmod(uni, 8.0) > 0.5 ? 1.0 : 0.0);\n" \
+    "  float covBg3 = in2d > 0.5 ? bitOf(axl, 64.0) : bitOf(uni, 8.0);\n" \
     "  vec2 luv = in2d > 0.5 ? uv : euv;\n" \
     "  float use0 = in2d > 0.5 ? 1.0 : bitOf(uni, 1.0), use1 = in2d > 0.5 ? 1.0 : bitOf(uni, 2.0);\n" \
     "  float use2 = in2d > 0.5 ? 1.0 : bitOf(uni, 4.0), use3 = in2d > 0.5 ? 1.0 : bitOf(uni, 8.0);\n" \
@@ -92,35 +97,39 @@ static const char kGcVertexShader[] =
     "    float x3b = x - uBg3Shift;\n" \
     "    use3 = x3b >= 0.0 && x3b < 256.0 ? 1.0 : 0.0;\n" \
     "    uv3 = vec2((x3b + 0.5) / 256.0, uv.y);\n" \
+    "    covBg3 = 1.0;\n" \
     "  }\n" \
-    "  float m = in2d > 0.5 ? by(ax.r) : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
+    "  float m = in2d > 0.5 ? axl : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
-    "  float k; vec3 c;\n" \
+    "  float k; vec3 c; vec4 tv;\n" \
     "  vec2 ouv = uv; float oin = in2d, om = m;\n" \
     "  if (uObjShift > 0.5 && y >= uObjMove.y && y < uObjMove.w) {\n" \
+    "    covMain = 1.0;\n" \
     "    float xs = x - uObjShift;\n" \
     "    if (xs >= uObjMove.x && xs < uObjMove.z) {\n" \
     "      ouv = vec2((xs + 0.5) / 256.0, uv.y); oin = 1.0;\n" \
     "      vec4 axs = texture2D(uAux, ouv); om = by(axs.r); oa = by(axs.a);\n" \
     "    } else if (x >= uObjMove.x && x < uObjMove.z) oin = 0.0;\n" \
     "  }\n" \
-    "  vec4 tv = texture2D(uObj, ouv);\n" \
-    "  if (oin > 0.5 && objOn > 0.5 && by(tv.a) >= 128.0 && bitOf(om, 16.0) > 0.5) {\n" \
-    "    k = gmod(oa, 4.0) * 8.0; c = col15(by(tv.r), by(tv.a));\n" \
-    "    k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 4.0; a1 = 0.0;\n" \
+    "  if (covMain > 0.5) {\n" \
+    "    tv = texture2D(uObj, ouv);\n" \
+    "    if (oin > 0.5 && objOn > 0.5 && by(tv.a) >= 128.0 && bitOf(om, 16.0) > 0.5) {\n" \
+    "      k = gmod(oa, 4.0) * 8.0; c = col15(by(tv.r), by(tv.a));\n" \
+    "      k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 4.0; a1 = 0.0;\n" \
+    "    }\n" \
     "  }\n" \
     "  if (pr0 < 3.5 && bitOf(m, 1.0) > 0.5) {\n" \
     "    float on = 0.0, al = 0.0;\n" \
     "    if (on3d > 0.5) {\n" \
-    "      float sx = x3 + floor(hofs * u3dCols / 256.0);\n" \
+    "      float sx = x3 + L3.w;\n" \
     "      if (uHave3d > 0.5 && sx >= 0.0 && sx < u3dCols) {\n" \
     "        vec4 q = texture2D(u3d, vec2((sx + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
     "        al = floor(by(q.a) / 8.0);\n" \
     "        c = floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0);\n" \
     "        on = al > 0.5 ? 1.0 : 0.0;\n" \
     "      }\n" \
-    "    } else {\n" \
+    "    } else if (covMain > 0.5) {\n" \
     "      tv = texture2D(uBg0, luv); on = use0 > 0.5 && by(tv.a) >= 128.0 ? 1.0 : 0.0; c = col15(by(tv.r), by(tv.a));\n" \
     "    }\n" \
     "    if (on > 0.5) {\n" \
@@ -129,7 +138,7 @@ static const char kGcVertexShader[] =
     "      else if (k < k2) { k2 = k; c2 = c; l2 = 0.0; }\n" \
     "    }\n" \
     "  }\n" \
-    "  if (pr1 < 3.5 && bitOf(m, 2.0) > 0.5 && use1 > 0.5) {\n" \
+    "  if (covMain > 0.5 && pr1 < 3.5 && bitOf(m, 2.0) > 0.5 && use1 > 0.5) {\n" \
     "    tv = texture2D(uBg1, luv);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr1 * 8.0 + 2.0; c = col15(by(tv.r), by(tv.a));\n" \
@@ -137,7 +146,7 @@ static const char kGcVertexShader[] =
     "      else if (k < k2) { k2 = k; c2 = c; l2 = 1.0; }\n" \
     "    }\n" \
     "  }\n" \
-    "  if (pr2 < 3.5 && bitOf(m, 4.0) > 0.5 && use2 > 0.5) {\n" \
+    "  if (covMain > 0.5 && pr2 < 3.5 && bitOf(m, 4.0) > 0.5 && use2 > 0.5) {\n" \
     "    tv = texture2D(uBg2, luv);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr2 * 8.0 + 3.0; c = col15(by(tv.r), by(tv.a));\n" \
@@ -145,7 +154,7 @@ static const char kGcVertexShader[] =
     "      else if (k < k2) { k2 = k; c2 = c; l2 = 2.0; }\n" \
     "    }\n" \
     "  }\n" \
-    "  if (pr3 < 3.5 && bitOf(m, 8.0) > 0.5 && use3 > 0.5) {\n" \
+    "  if (covBg3 > 0.5 && pr3 < 3.5 && bitOf(m, 8.0) > 0.5 && use3 > 0.5) {\n" \
     "    tv = texture2D(uBg3, uv3);\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr3 * 8.0 + 4.0; c = col15(by(tv.r), by(tv.a));\n" \
@@ -154,79 +163,165 @@ static const char kGcVertexShader[] =
     "    }\n" \
     "  }\n" \
     "  vec3 o = c1;\n" \
+    "  float pure = l1 < 0.5 && on3d > 0.5 && L3.w == 0.0 ? 1.0 : 0.0;\n" \
     "  float below2nd = bitOf(second, lay2bit(l2));\n" \
     "  float kind = gmod(floor(oa / 4.0), 4.0), oal = floor(oa / 16.0);\n" \
     "  if (l1 > 3.5 && l1 < 4.5 && kind > 0.5 && below2nd > 0.5) {\n" \
     "    if (kind > 1.5) o = blendc(c1, c2, oal + 1.0, 15.0 - oal); else o = blendc(c1, c2, eva, evb);\n" \
     "  } else if (a1 > 0.5 && below2nd > 0.5) {\n" \
-    "    if (a1 < 30.5) o = blend3d(c1, c2, a1);\n" \
+    "    if (a1 < 30.5) { o = blend3d(c1, c2, a1); pure = 0.0; }\n" \
     "  } else if (bitOf(m, 32.0) > 0.5 && bitOf(first, lay2bit(l1)) > 0.5) {\n" \
-    "    if (effect > 0.5 && effect < 1.5) { if (below2nd > 0.5) o = blendc(c1, c2, eva, evb); }\n" \
-    "    else if (effect > 1.5 && effect < 2.5) o = brighten(c1, evy, 8.0);\n" \
-    "    else if (effect > 2.5) o = darken(c1, evy, 7.0);\n" \
+    "    if (effect > 0.5 && effect < 1.5) { if (below2nd > 0.5) { o = blendc(c1, c2, eva, evb); pure = 0.0; } }\n" \
+    "    else if (effect > 1.5 && effect < 2.5) { o = brighten(c1, evy, 8.0); pure = 0.0; }\n" \
+    "    else if (effect > 2.5) { o = darken(c1, evy, 7.0); pure = 0.0; }\n" \
     "  }\n" \
     "  if (uLogoOn > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
     "    vec2 lu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
     "    vec4 lg = texture2D(uLogo, lu);\n" \
-    "    if (lg.a > 0.5 && lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) o = floor(lg.rgb * 63.0 + 0.5);\n" \
+    "    if (lg.a > 0.5 && lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) { o = floor(lg.rgb * 63.0 + 0.5); pure = 0.0; }\n" \
     "  }\n" \
+    "  if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) o = brighten(o, mbf, 0.0);\n" \
+    "  else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) o = darken(o, mbf, 15.0);\n" \
     "  vec3 o8 = (o * 4.0 + floor(o / 16.0)) / 255.0;\n" \
     "  if (uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) {\n" \
     "    vec4 ov = texture2D(uOvl, vec2(uv.x, (y + 0.5) / 16.0));\n" \
-    "    if (ov.a > 0.5) o8 = ov.rgb;\n" \
+    "    if (ov.a > 0.5) { o8 = ov.rgb; pure = 0.0; }\n" \
     "  }\n" \
-    "  return vec4(o8, 1.0);\n" \
+    "  return vec4(o8, 1.0 - pure);\n" \
     "}\n"
 
 #define GC_GMOD "float gmod(float a, float b) { return a - b * floor(a / b); }\n"
 static const char kGcFragmentShader[] =   // GLSL ES 1.00
-    "precision highp float;\n" GC_GMOD GC_FRAGMENT_BODY
-    "void main() { gl_FragColor = compose(gl_FragCoord.xy); }\n";
+    "precision highp float;\n" GC_GMOD "varying vec4 vL0, vL1, vL2, vL3, vL4, vL5;\n" GC_FRAGMENT_BODY
+    "void main() { gl_FragColor = compose(gl_FragCoord.xy, vL0, vL1, vL2, vL3, vL4, vL5); }\n";
 // Cg for vitaGL (GL_CG_*_SHADER_EXT: compiled by the Cg compiler as is, not through vitaGL's GLSL translator).
 static const char kGcFragmentShaderCg[] =
     "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D tex2D\n" GC_GMOD GC_FRAGMENT_BODY
-    "float4 main(float4 fc : WPOS) : COLOR { return compose(fc.xy); }\n";
+    "float4 main(float4 fc : WPOS, float4 vL0 : TEXCOORD0, float4 vL1 : TEXCOORD1, float4 vL2 : TEXCOORD2,\n"
+    "            float4 vL3 : TEXCOORD3, float4 vL4 : TEXCOORD4, float4 vL5 : TEXCOORD5) : COLOR {\n"
+    "  return compose(fc.xy, vL0, vL1, vL2, vL3, vL4, vL5);\n"
+    "}\n";
 static const char kGcVertexShaderCg[] =
-    "void main(float2 aPos, out float4 oPos : POSITION) { oPos = float4(aPos, 0.0, 1.0); }\n";
+    "void main(float2 aPos, float4 aL0, float4 aL1, float4 aL2, float4 aL3, float4 aL4, float4 aL5,\n"
+    "          out float4 oPos : POSITION, out float4 vL0 : TEXCOORD0, out float4 vL1 : TEXCOORD1,\n"
+    "          out float4 vL2 : TEXCOORD2, out float4 vL3 : TEXCOORD3, out float4 vL4 : TEXCOORD4,\n"
+    "          out float4 vL5 : TEXCOORD5) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vL0 = aL0; vL1 = aL1; vL2 = aL2; vL3 = aL3; vL4 = aL4; vL5 = aL5;\n"
+    "}\n";
 
 // The canvas to the screen, "sharp bilinear": each canvas pixel a crisp block, only the block edges blended (the
 // 192 lines go to 544, a non-integer 2.83x, which plain linear filtering blurs and nearest makes uneven).
-// The 3D at the screen's resolution: where a canvas pixel is exactly the compose's sample of the 3D (u3d, the 960x544
-// colour buffer; the compose read it at the middle of the pixel's block, as below) with nothing over or blended into
-// it, the screen pixel takes the 3D pixel under it instead, in the same DS colour depth. 2D and anything drawn or
-// blended over the 3D keep the composed pixel. The master brightness (the fades) is applied here, after that, to
-// whichever it is - so a fade darkens the full-resolution picture (the compose leaves it out). uP: x = 3D on,
-// y = the canvas columns (GC_W), z = brightness on. uPar: the compose's per-line parameters (texel 2: b = mode, a = factor).
+// The 3D at the screen's resolution: the compose marks (alpha 0) the canvas pixels that are exactly the 3D - nothing
+// drawn over or blended into it - and there the screen shows the 3D colour buffer (u3d, 960x544) pixel under it, in
+// the DS colour depth, with the line's master brightness (the compose applies it to everything else). The mark is
+// filtered like the colour, so the 2D's block edges blend into the full-resolution 3D. Where the 3D has no pixel at
+// the screen's resolution (alpha 0) the canvas shows. Drawn as one quad per DS line: vMb = that line's brightness
+// mode and factor. uP.x: 3D on. Straight-line code: every texture is read for every pixel.
 static const char kBlitVertexShaderCg[] =
-    "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
-    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
+    "void main(float2 aPos, float2 aTex, float2 aT3, float2 aMb, out float4 oPos : POSITION,\n"
+    "          out float2 vTex : TEXCOORD0, out float2 vT3 : TEXCOORD1, out float2 vMb : TEXCOORD2) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; vT3 = aT3; vMb = aMb; }\n";
 static const char kBlitFragmentShaderCg[] =
-    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform sampler2D u3d, uniform float4 uSz,\n"
-    "            uniform sampler2D uPar, uniform float4 uP) : COLOR {\n"
+    "float4 main(float2 vTex : TEXCOORD0, float2 vT3 : TEXCOORD1, float2 vMb : TEXCOORD2, uniform sampler2D uTex,\n"
+    "            uniform sampler2D u3d, uniform float4 uSz, uniform float4 uP) : COLOR {\n"
     "  float2 tx = vTex * uSz.xy;\n"
     "  float2 fl = floor(tx);\n"
     "  float2 d = tx - fl - 0.5;\n"
     "  float2 r = 0.5 - 0.5 / uSz.zw;\n"
-    "  float2 f = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
-    "  float3 o = tex2D(uTex, (fl + f) / uSz.xy).rgb;\n"
-    "  if (uP.x > 0.5) {\n"
-    "    float3 cv = floor(tex2D(uTex, (fl + 0.5) / uSz.xy).rgb * 255.0 + 0.5);\n"
-    "    float4 lo = floor(tex2D(u3d, float2((fl.x + 0.5) / uP.y, (191.0 - fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
-    "    float4 hi = floor(tex2D(u3d, float2(tx.x / uP.y, 1.0 - vTex.y)) * 255.0 + 0.5);\n"
-    "    float3 c6 = floor(lo.rgb / 4.0);\n"
-    "    float3 dd = abs(cv - (c6 * 4.0 + floor(c6 / 16.0)));\n"
-    "    if (lo.a > 247.5 && hi.a > 247.5 && dd.x + dd.y + dd.z < 0.5) {\n"
-    "      float3 h6 = floor(hi.rgb / 4.0);\n"
-    "      o = (h6 * 4.0 + floor(h6 / 16.0)) / 255.0;\n"
-    "    }\n"
-    "  }\n"
-    "  float4 mb = floor(tex2D(uPar, float2(2.5 / 8.0, (fl.y + 0.5) / 192.0)) * 255.0 + 0.5);\n"
-    "  if (uP.z > 0.5 && mb.a > 0.5 && mb.b > 0.5 && mb.b < 2.5) {\n"
-    "    float3 c = floor(floor(o * 255.0 + 0.5) / 4.0);\n"
-    "    c = mb.b < 1.5 ? c + floor(((63.0 - c) * mb.a) / 16.0) : c - floor((c * mb.a + 15.0) / 16.0);\n"
-    "    o = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
-    "  }\n"
-    "  return float4(o, 1.0);\n"
+    "  float2 f2 = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
+    "  float4 cv = tex2D(uTex, (fl + f2) / uSz.xy);\n"
+    "  float4 h = tex2D(u3d, vT3);\n"
+    "  float2 mb = floor(vMb + 0.5);\n"
+    "  float3 c = floor(h.rgb * 63.75 + 0.125);\n"
+    "  float3 cb = mb.x < 1.5 ? c + floor(((63.0 - c) * mb.y) / 16.0) : c - floor((c * mb.y + 15.0) / 16.0);\n"
+    "  c = mb.x > 0.5 && mb.x < 2.5 && mb.y > 0.5 ? cb : c;\n"
+    "  float3 h8 = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
+    "  float f = uP.x > 0.5 && h.a > 0.016 ? cv.a : 1.0;\n"
+    "  return float4(lerp(h8, cv.rgb, f), 1.0);\n"
+    "}\n";
+// The compose's per-line inputs (kGcVertexShader L0..L5: 24 floats) from line y's parameter row p (GPU2D_GC_PAR RGBA
+// texels, gpu2d.c gc_line). u3dCols: the canvas columns the 3D spreads over. The iris half width is worked out in
+// float as the shader did it per pixel.
+#include <math.h>
+static inline void gc_line_params(const unsigned char *p, int y, float u3dCols, float *L) {
+    int hofs = p[16] + p[17] * 256 - 256;
+    float ir = (float)(p[20] + p[21] * 256), dd = floorf(fabsf(2.0f * (float)y + 1.0f - 192.0f) / 2.0f);
+    float hr = dd <= ir ? floorf(sqrtf(ir * ir - dd * dd)) : -1.0f;
+    const float v[24] = {
+        p[0], p[1], p[2], p[3],
+        p[4], p[5], (float)(p[6] & 3), p[7],
+        p[8], p[9], p[10], p[11],
+        p[12], p[13], p[14], floorf((float)hofs * u3dCols / 256.0f),
+        (float)(p[6] >> 2 & 1), (float)(p[6] >> 3 & 1), p[23], p[22] ? 1.0f : 0.0f,
+        hr, 0, 0, 0,
+    };
+    for (int i = 0; i < 24; i++) L[i] = v[i];
+}
+// The compose's vertices: one quad (two triangles) per DS line over the whole canvas: GC_VERTS positions (pos) and
+// the line's parameters as six arrays of 4 floats (lp[k] = attribute aLk; separate arrays, as vitaGL copies each
+// attribute's stream on its own). Line y covers canvas row y (row 0 at NDC -1: the FBO convention the 3D buffer shows
+// too, u3d row 191 - y).
+enum { GC_VERTS = 192 * 6 };
+static inline void gc_line_quads(const unsigned char *par, int parStride, float u3dCols, float (*pos)[2],
+                                 float (*lp)[GC_VERTS][4]) {
+    for (int y = 0; y < 192; y++) {
+        float L[24];
+        gc_line_params(par + y * parStride, y, u3dCols, L);
+        const float y0 = -1.0f + 2.0f * (float)y / 192.0f, y1 = -1.0f + 2.0f * (float)(y + 1) / 192.0f;
+        const float q[6][2] = {{-1, y0}, {1, y0}, {-1, y1}, {-1, y1}, {1, y0}, {1, y1}};
+        for (int k = 0; k < 6; k++) {
+            pos[y * 6 + k][0] = q[k][0]; pos[y * 6 + k][1] = q[k][1];
+            for (int a = 0; a < 6; a++)
+                for (int i = 0; i < 4; i++) lp[a][y * 6 + k][i] = L[a * 4 + i];
+        }
+    }
+}
+// The present's vertices: one quad per DS line over the whole screen (line y = screen rows y * 544 / 192 down), as
+// four arrays of 2 floats (attributes aPos, aTex, aT3, aMb): position, canvas texture coordinate (texW: the canvas
+// texture width, w: the canvas columns), 3D texture coordinate, and the line's master brightness mode and factor
+// (par texel 2: bytes 10, 11).
+static inline void present_line_quads(const unsigned char *par, int parStride, float w, float texW,
+                                      float (*v)[GC_VERTS][2]) {
+    for (int y = 0; y < 192; y++) {
+        const unsigned char *p = par + y * parStride;
+        const float ya = 1.0f - 2.0f * (float)y / 192.0f, yb = 1.0f - 2.0f * (float)(y + 1) / 192.0f;
+        const float va = (float)y / 192.0f, vb = (float)(y + 1) / 192.0f, us = w / texW;
+        const float q[6][3] = {{-1, ya, 0}, {1, ya, 1}, {-1, yb, 0}, {-1, yb, 0}, {1, ya, 1}, {1, yb, 1}};
+        for (int k = 0; k < 6; k++) {
+            const int n = y * 6 + k;
+            const float vv = q[k][1] == ya ? va : vb;
+            v[0][n][0] = q[k][0]; v[0][n][1] = q[k][1];
+            v[1][n][0] = q[k][2] * us; v[1][n][1] = vv;            // canvas
+            v[2][n][0] = q[k][2]; v[2][n][1] = 1.0f - vv;          // 3D colour buffer (DS line 0 at the top row: v 1)
+            v[3][n][0] = p[10]; v[3][n][1] = p[11];                // brightness
+        }
+    }
+}
+// (GLSL ES twins of the present, for the host check)
+static const char kBlitVertexShader[] =
+    "attribute vec2 aPos, aTex, aT3, aMb;\n"
+    "varying vec2 vTex, vT3, vMb;\n"
+    "void main() { gl_Position = vec4(aPos, 0.0, 1.0); vTex = aTex; vT3 = aT3; vMb = aMb; }\n";
+static const char kBlitFragmentShader[] =
+    "precision highp float;\n"
+    "varying vec2 vTex, vT3, vMb;\n"
+    "uniform sampler2D uTex, u3d;\n"
+    "uniform vec4 uSz, uP;\n"
+    "void main() {\n"
+    "  vec2 tx = vTex * uSz.xy;\n"
+    "  vec2 fl = floor(tx);\n"
+    "  vec2 d = tx - fl - 0.5;\n"
+    "  vec2 r = 0.5 - 0.5 / uSz.zw;\n"
+    "  vec2 f2 = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
+    "  vec4 cv = texture2D(uTex, (fl + f2) / uSz.xy);\n"
+    "  vec4 h = texture2D(u3d, vT3);\n"
+    "  vec2 mb = floor(vMb + 0.5);\n"
+    "  vec3 c = floor(h.rgb * 63.75 + 0.125);\n"
+    "  vec3 cb = mb.x < 1.5 ? c + floor(((63.0 - c) * mb.y) / 16.0) : c - floor((c * mb.y + 15.0) / 16.0);\n"
+    "  c = mb.x > 0.5 && mb.x < 2.5 && mb.y > 0.5 ? cb : c;\n"
+    "  vec3 h8 = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
+    "  float f = uP.x > 0.5 && h.a > 0.016 ? cv.a : 1.0;\n"
+    "  gl_FragColor = vec4(mix(h8, cv.rgb, f), 1.0);\n"
     "}\n";
 
 #endif
