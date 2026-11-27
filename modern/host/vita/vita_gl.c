@@ -136,6 +136,8 @@ static GLint sGcTileAttr = -1;
 static float sGcFlip;      // the GPU's pixel rows against the quad's y (measured at start: gc_flip_measure)
 static int sGcTiled = 1, sGcTileFast;
 static uint64_t sGcOneNs, sGcTileNs;
+static int sGcWhy[8];
+void vita_gl_gc_why(int w[8]) { memcpy(w, sGcWhy, sizeof sGcWhy); }
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 static GLuint sGcLp[2];   // the per-line parameters, decoded (gpu2d_compose.h gc_line_texels): one per layer set
 // The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
@@ -662,7 +664,12 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         gc_draw(gc, kQuad, 0);
         glFinish();
         uint64_t tb = host_plat_time_ns();
+        static int why[8];
+        memset(why, 0, sizeof why);
+        gGcTileWhy = why;
         gc_draw(gc, kQuad, 1);
+        gGcTileWhy = NULL;
+        memcpy(sGcWhy, why, sizeof why);
         glFinish();
         uint64_t tc = host_plat_time_ns();
         sGcOneNs = tb - ta; sGcTileNs = tc - tb;

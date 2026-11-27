@@ -445,6 +445,7 @@ static const char kGcTileFragmentShaderCg[] =
 // tile full (no 3D, the logo, the boot screens' mirror ...); ovl: the overlay's rows (0-15) full; objY0..objY1: the
 // lines of the moved HUD clock, full. Returns the number of fast tiles.
 enum { GC_TILE_VERTS = 24 * 18 * 6 };
+static int *gGcTileWhy;   // (optional) per line: whole, not a fast line, iris, overlay/clock rows, all 16 groups, both sides, no 3D, 3D shifted
 static inline int gc_tile_quads(const unsigned char *par, int stride, int W, float u3dCols, int flip, int whole, int ovl,
                                 int objY0, int objY1, float (*fv)[2], int *nf, float (*sv)[2], int *ns) {
     const int left = (W - 256) / 2;
@@ -457,7 +458,13 @@ static inline int gc_tile_quads(const unsigned char *par, int stride, int W, flo
             float L[24];
             gc_line_params(p, y, u3dCols, L);
             int lineSlow = whole || L[21] < 0.5f || p[22] || (ovl && y < 16) || (y >= objY0 && y < objY1);
-            if (lineSlow) { slow = 0x3ffff; break; }
+            if (gGcTileWhy) {   // (Vita log: why tiles get the full compose)
+                gGcTileWhy[0] += whole; gGcTileWhy[1] += L[21] < 0.5f; gGcTileWhy[2] += p[22] != 0;
+                gGcTileWhy[3] += (ovl && y < 16) || (y >= objY0 && y < objY1);
+                gGcTileWhy[4] += (p[24] | p[25] << 8) == 0xffff; gGcTileWhy[5] += (p[26] & 3) == 3;
+                gGcTileWhy[6] += !(p[6] >> 3 & 1); gGcTileWhy[7] += L[15] != 0.0f;
+            }
+            if (lineSlow) { slow = 0x3ffff; continue; }
             slow |= (unsigned)(p[26] & 1) | (unsigned)(p[24] | p[25] << 8) << 1 | (unsigned)(p[26] >> 1 & 1) << 17;
         }
         if (left <= 0) slow |= 1u | 1u << 17;   // (no side bars: those cells are empty either way)

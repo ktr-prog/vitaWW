@@ -999,6 +999,12 @@ static void render_frame_mt(void) {
                     if (one) fprintf(stderr, "gpu compose: one quad %llu us, tiles %llu us (%d of 432 tiles the fast program) - "
                                      "using %s\n", (unsigned long long)(one / 1000), (unsigned long long)(tiles / 1000), ft,
                                      u ? "tiles" : "one quad");
+                    extern void vita_gl_gc_why(int w[8]);
+                    int w[8];
+                    vita_gl_gc_why(w);
+                    if (one) fprintf(stderr, "gpu compose tiles, lines (of 192): whole frame %d, effects %d, iris %d, "
+                                     "overlay/clock %d, 2D across %d, both sides %d, no 3D %d, 3D shifted %d\n",
+                                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
             extern unsigned gVitaRepeats;
             fprintf(stderr, "display: %u refreshes repeated the previous picture (last 60 frames)\n",
