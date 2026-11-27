@@ -1,5 +1,9 @@
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "gpu2d_internal.h"
+unsigned long long gBgKindN[2][5][2];
+uint64_t host_plat_time_ns(void);
 
 enum BgKind { BG_NONE, BG_TEXT, BG_AFFINE, BG_EXTENDED, BG_LARGE };
 
@@ -110,6 +114,28 @@ static void affine_line(Engine *e, int n, int line, u16 *dst) {
     u32 cb = char_base(e, cnt), mb = map_base(e, cnt);
     affine_start(e, n, line, &x0, &y0, &pa, &pc);
     gpu2d_feature(e, F_AFFINE);
+    if (pc == 0) {
+        // Not rotated (the menus, the top screen's zoomed pictures): the whole line reads one source row, so each
+        // tile's map byte and its 8-byte pixel row are looked up once while x stays in that tile, not per pixel.
+        // Same texel coordinates as below, so the same colours.
+        const s32 ty = affine_coord(y0 >> 8, size, wrap);
+        if (ty < 0) { memset(dst, 0, SCREEN_W * sizeof *dst); return; }
+        const u32 rowMap = mb + (u32)(ty / 8 * (size / 8)), ty7 = (u32)(ty & 7) * 8;
+        s32 lastCol = -1;
+        const u8 *row = NULL;
+        for (int x = 0; x < SCREEN_W; x++) {
+            const s32 tx = affine_coord((x0 + pa * x) >> 8, size, wrap);
+            if (tx < 0) { dst[x] = 0; continue; }
+            if (tx >> 3 != lastCol) {
+                lastCol = tx >> 3;
+                const u32 a = (cb + bg8(e, rowMap + (u32)lastCol) * 64u + ty7) & e->bgMask;   // 8-aligned: one granule
+                row = e->bgGran[a >> GRANULE_SHIFT] + (a & (GRANULE - 1));
+            }
+            const u8 idx = row[tx & 7];
+            dst[x] = idx ? (u16)((pal16(e->palette, idx) & 0x7fff) | PIX_OPAQUE) : 0;
+        }
+        return;
+    }
     for (int x = 0; x < SCREEN_W; x++) {
         s32 tx = affine_coord((x0 + pa * x) >> 8, size, wrap), ty = affine_coord((y0 + pc * x) >> 8, size, wrap);
         if (tx < 0 || ty < 0) { dst[x] = 0; continue; }
@@ -179,6 +205,9 @@ void gpu2d_render_bg_line(Engine *e, int n, int line) {
         gpu2d_feature(e, F_BG_MOSAIC);
         line -= line % ((mos >> 4 & 15) + 1);
     }
+    // (the log: engine B's BG lines by kind, and their time - engine B only: it is drawn only for the menus)
+    gBgKindN[e->num][kBgKinds[mode][n]][0]++;
+    const uint64_t tk0 = e->num ? host_plat_time_ns() : 0;
     switch (kBgKinds[mode][n]) {
     case BG_TEXT: e->bgAny[n] = (u8)text_line(e, n, line, dst); break;
     case BG_AFFINE: affine_line(e, n, line, dst); break;
@@ -191,6 +220,7 @@ void gpu2d_render_bg_line(Engine *e, int n, int line) {
     }
     default: memset(dst, 0, sizeof e->bg[n]); e->bgAny[n] = 0; break;
     }
+    if (e->num) gBgKindN[1][kBgKinds[mode][n]][1] += host_plat_time_ns() - tk0;
     int mw = (mos & 15) + 1;
     if (mosaic && mw > 1)
         for (int x = 0; x < SCREEN_W; x++) dst[x] = dst[x - x % mw];

@@ -1283,7 +1283,19 @@ static void *band2d_worker(void *arg) {
     }
     return 0;
 }
+unsigned long long gBProfNs, gBProfLines, gBProfRuns;   // (host profiling: engine B overlay lines)
+static void band2d_run_(Band2d *w);
 static void band2d_run(Band2d *w) {
+    if (w->mirror != 2) { band2d_run_(w); return; }
+    uint64_t t0 = host_plat_time_ns();
+    band2d_run_(w);
+    __atomic_fetch_add(&gBProfNs, host_plat_time_ns() - t0, __ATOMIC_RELAXED);
+    unsigned n = 0;
+    for (int l = w->lo; l < w->hi; l++) n += w->dirty && w->dirty[l];
+    __atomic_fetch_add(&gBProfLines, n, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&gBProfRuns, 1, __ATOMIC_RELAXED);
+}
+static void band2d_run_(Band2d *w) {
     Engine *e = w->be;
     // e already holds a copy of the engine's inputs (regs, VRAM/palette/oam ptrs, objNextLine0 ...), taken on the
     // main thread at the end of the prepass - the live engine may be written by the game while this band runs.
@@ -1932,6 +1944,16 @@ static int render_engine0_mt(const Gpu2dFrameInput *in) {
 }
 
 void gpu2d_render_frame(const Gpu2dFrameInput *in) {
+    {   // (host check) both engines' finished pictures of the previous frame
+        static int on = -1;
+        if (on < 0) on = getenv("ACWW_OUTHASH") ? 1 : 0;
+        if (on) {
+            unsigned long long h = 1469598103934665603ull;
+            for (int n = 0; n < 2; n++)
+                for (int i = 0; i < SCREEN_W * SCREEN_H; i++) { h ^= sEngine[n].out[i]; h *= 1099511628211ull; }
+            fprintf(stderr, "outhash frame %llu = %016llx\n", (unsigned long long)sFrame, h);
+        }
+    }
     sGpu = in->gpu;
     sDefer3d = in->defer3d || sGpu;
     const int off = 0;
@@ -1951,6 +1973,11 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     static int forceMain = -1;
     if (forceMain < 0) forceMain = getenv("ACWW_FORCEMAIN") ? atoi(getenv("ACWW_FORCEMAIN")) : 0;
     const int mainOnly = forceMain;   // host validation of the Vita engine-0 render-thread path
+    {   // (host check/profiling of the Vita's menu overlay: engine B's whole picture over the scene)
+        static int ovl = -1;
+        if (ovl < 0) ovl = getenv("ACWW_OVERLAY") ? atoi(getenv("ACWW_OVERLAY")) : 0;
+        if (ovl) sOverlayOn = (sPowCnt & 0x8000) != 0;
+    }
 #endif
     {
         static int hold, swapped;

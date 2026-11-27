@@ -973,6 +973,17 @@ static void render_frame_mt(void) {
                         gSubDraws, gSubFrames, gSubCheckNs / 1000 / gSubFrames);
             gSubFrames = gSubDraws = 0;
             gSubCheckNs = 0;
+            {   // the menus over the scene: engine B's lines redrawn on the CPU (the bands) and what they cost
+                extern unsigned long long gBProfNs, gBProfLines, gBProfRuns, gBgKindN[2][5][2];
+                if (gBProfLines)
+                    fprintf(stderr, "render: menu layer %llu lines redrawn, %llu us/line (its BG lines: text %llu, %llu us; "
+                            "affine %llu, %llu us; extended %llu, %llu us; bitmap %llu, %llu us)\n",
+                            gBProfLines, gBProfNs / 1000 / gBProfLines, gBgKindN[1][1][0], gBgKindN[1][1][1] / 1000,
+                            gBgKindN[1][2][0], gBgKindN[1][2][1] / 1000, gBgKindN[1][3][0], gBgKindN[1][3][1] / 1000,
+                            gBgKindN[1][4][0], gBgKindN[1][4][1] / 1000);
+                gBProfNs = gBProfLines = gBProfRuns = 0;
+                memset(gBgKindN, 0, sizeof gBgKindN);
+            }
         }
 #if HOST_VITA
         {   // what is seen as stutter: refreshes of the screen that showed the same picture again
