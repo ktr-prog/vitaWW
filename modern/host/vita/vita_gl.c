@@ -325,7 +325,11 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             int first = !sGcLogoTex;
             if (first) glGenTextures(1, &sGcLogoTex);
             glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
+            extern unsigned gpu2d_gc_logo_gen(void);   // (test: uploaded only when written)
+            static unsigned upGen;
+            unsigned gen = gpu2d_gc_logo_gen();
+            if (first || gen != upGen) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
+            upGen = gen;
             if (first) {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
