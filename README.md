@@ -18,3 +18,4 @@ A native PlayStation Vita port of *Animal Crossing: Wild World*, built from the 
 
 ``` 
 Work in progress.
+First start: it will take a few seconds longer while the shaders are built once.
