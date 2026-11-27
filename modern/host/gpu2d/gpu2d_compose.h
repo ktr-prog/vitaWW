@@ -129,6 +129,11 @@ static const char kGcVertexShader[] =
     "    else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) qo = darken(qo, mbf, 15.0);\n" \
     "    res = vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 ? 0.0 : 1.0);\n" \
     "  } else {\n" \
+    /* (GC_FASTONLY: the compose's first pass - only the fast path's pixels, the rest discarded, and the full \
+       compose then drawn only where this pass wrote nothing: the depth test skips the others before shading) */ \
+    "#ifdef GC_FASTONLY\n" \
+    "  discard; res = vec4(0.0);\n" \
+    "#else\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
     "  float k; vec3 c; vec4 tv;\n" \
@@ -217,6 +222,7 @@ static const char kGcVertexShader[] =
     "    if (ov.a > 0.5) { o8 = ov.rgb; pure = 0.0; }\n" \
     "  }\n" \
     "  res = vec4(o8, 1.0 - pure);\n" \
+    "#endif\n" \
     "  }\n" \
     "  return res;\n" \
     "}\n"
@@ -351,10 +357,20 @@ static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
     "precision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
     "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_TEX_FETCH
     "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5); }\n";
+static const char kGcqFastFragmentShader[] =   // (the first pass: GC_FASTONLY)
+    "#define GC_FASTONLY 1\nprecision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
+    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_TEX_FETCH
+    "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5); }\n";
 static const char kGcqVertexShader[] =
     "attribute vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
 static const char kGcqFragmentShaderCg[] =
     "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
+    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
+    "float4 main(float4 fc : WPOS) : COLOR {\n" GC_TEX_FETCH
+    "  return compose(fc.xy, L0, L1, L2, L3, L4, L5);\n"
+    "}\n";
+static const char kGcqFastFragmentShaderCg[] =
+    "#define GC_FASTONLY 1\n#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
     "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
     "float4 main(float4 fc : WPOS) : COLOR {\n" GC_TEX_FETCH
     "  return compose(fc.xy, L0, L1, L2, L3, L4, L5);\n"

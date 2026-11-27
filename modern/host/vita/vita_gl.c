@@ -128,7 +128,12 @@ uint64_t gVitaGpu3dNs, gVitaGpuComposeNs, gVitaGpuPresentNs;
 int gVitaGpuProbe, gVitaGpuProbed;
 unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
-static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
+static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;
+// The compose's first pass (GC_FASTONLY): the fast path's pixels only, written with depth; the full compose then
+// runs under the depth test, so the GPU shades it only where the first pass wrote nothing (the depth test rejects
+// pixels before shading). One shader with an if/else ran the full arithmetic for every pixel on the Vita (13 ms).
+static GLuint sGcFastProg, sGcDepthRb;
+static GLint sGcFastAttr = -1;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 static GLuint sGcLp[2];   // the per-line parameters, decoded (gpu2d_compose.h gc_line_texels): one per layer set
 // The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
@@ -417,6 +422,13 @@ int vita_gl_gc_init(void) {
     sGcAttr = glGetAttribLocation(sGcProg, "aPos");
     fprintf(stderr, "vita_gl: GPU compose: linked (aPos at %d), creating textures\n", (int)sGcAttr);
     if (sGcAttr < 0) return 0;
+    sGcFastProg = cached_program(kGcqVertexShaderCg, kGcqFastFragmentShaderCg, "composef");
+    if (sGcFastProg) {
+        sGcFastAttr = glGetAttribLocation(sGcFastProg, "aPos");
+        if (sGcFastAttr < 0) sGcFastProg = 0;
+        else gc_static_uniforms(sGcFastProg);
+    }
+    fprintf(stderr, "vita_gl: GPU compose: first pass %s\n", sGcFastProg ? "ready" : "unavailable (one pass)");
     sGcHave3d = glGetUniformLocation(sGcProg, "uHave3d");
     sGcOvlOn = glGetUniformLocation(sGcProg, "uOvlOn");
     gc_static_uniforms(sGcProg);
@@ -473,6 +485,12 @@ int vita_gl_gc_init(void) {
     glGenFramebuffers(1, &sGcFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sGcCanvas, 0);
+    if (sGcFastProg) {
+        glGenRenderbuffers(1, &sGcDepthRb);
+        glBindRenderbuffer(GL_RENDERBUFFER, sGcDepthRb);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, GC_TEX_W, 192);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sGcDepthRb);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     sGcState = 1;
     gVitaGc = 1;
@@ -568,12 +586,28 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glViewport(0, 0, GC_W, 192);
+    if (sGcFastProg) {   // the fast pixels first, marking them in the depth buffer
+        glClearDepthf(1.0f);
+        glDepthMask(GL_TRUE);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_ALWAYS);
+        gc_frame_uniforms(sGcFastProg);
+        glUseProgram(sGcFastProg);
+        glEnableVertexAttribArray((GLuint)sGcFastAttr);
+        glVertexAttribPointer((GLuint)sGcFastAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray((GLuint)sGcFastAttr);
+        glDepthFunc(GL_LESS);   // then the full compose only where the first pass wrote nothing
+        glDepthMask(GL_FALSE);
+    }
     gc_frame_uniforms(sGcProg);
     glUseProgram(sGcProg);
     glEnableVertexAttribArray((GLuint)sGcAttr);
     glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sGcAttr);
+    if (sGcFastProg) { glDisable(GL_DEPTH_TEST); glDepthFunc(GL_LESS); }
     if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
         if (!sOvlProg) {
             sOvlProg = cached_program(kMenuVertexShaderCg, kMenuFragmentShaderCg, "menu");
