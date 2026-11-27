@@ -6,9 +6,11 @@
 
 static const struct {
     const char *key, *name;
+    int def;   // on when the file does not say
 } kFeatures[FEAT_COUNT] = {
-    [FEAT_FPS] = {"fps", "FPS COUNTER"},
-    [FEAT_NO_RESETTI] = {"no_resetti", "NEVER GET RESETTI"},
+    [FEAT_FPS] = {"fps", "FPS COUNTER", 0},
+    [FEAT_NO_RESETTI] = {"no_resetti", "NEVER GET RESETTI", 0},
+    [FEAT_SMOOTH] = {"smooth_pixels", "SMOOTH PIXEL EDGES", 1},
 };
 static int sOn[FEAT_COUNT];
 static char sPath[1024];
@@ -26,7 +28,9 @@ static void save(void) {
 
 void features_init(const char *path) {
     snprintf(sPath, sizeof sPath, "%s", path ? path : "");
+    for (int i = 0; i < FEAT_COUNT; i++) sOn[i] = kFeatures[i].def;
     FILE *f = sPath[0] ? fopen(sPath, "r") : NULL;
+    int found[FEAT_COUNT] = {0};
     if (f) {
         char line[256];
         while (fgets(line, sizeof line, f)) {
@@ -36,10 +40,13 @@ void features_init(const char *path) {
             if (!eq) continue;
             *eq = 0;
             for (int i = 0; i < FEAT_COUNT; i++)
-                if (!strcmp(line, kFeatures[i].key)) sOn[i] = atoi(eq + 1) != 0;
+                if (!strcmp(line, kFeatures[i].key)) sOn[i] = atoi(eq + 1) != 0, found[i] = 1;
         }
         fclose(f);
     }
+    int missing = 0;   // a key the file does not have yet: written out with its default, so it can be edited there
+    for (int i = 0; i < FEAT_COUNT; i++) missing |= !found[i];
+    if (missing) save();
     for (int i = 0; i < FEAT_COUNT; i++) fprintf(stderr, "features: %s %s\n", kFeatures[i].key, sOn[i] ? "on" : "off");
 }
 

@@ -103,24 +103,27 @@ static const char kGcVertexShader[] =
     /* Fast path: nothing but the 3D (or, where it has no pixel, the backdrop) can show here - no 2D pixel, the \
        line's colour effects leave the 3D and the backdrop as they are (L5.y, gc_line_params), no logo, overlay or \
        translucent 3D pixel - so the result is that colour with the master brightness: the rest is skipped (a \
-       branch not taken costs nothing on the Vita's GPU; the arithmetic below is what costs). */ \
-    "  if (L5.y > 0.5 && covMain < 0.5 && covBg3 < 0.5 && bitOf(m, 1.0) > 0.5 && uHave3d > 0.5 &&\n" \
-    "      !(uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) && !(uObjShift > 0.5 && y >= uObjMove.y && y < uObjMove.w)) {\n" \
-    "    vec4 q = texture2D(u3d, vec2((x3 + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
-    "    float qa = floor(by(q.a) / 8.0);\n" \
-    "    float lgOn = 0.0;\n" \
-    "    if (uLogoOn > 0.5) {\n" \
-    "      vec2 qlu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
-    "      vec4 qlg = texture2D(uLogo, qlu);\n" \
-    "      lgOn = qlg.a > 0.5 && qlu.x > 0.0 && qlu.x < 1.0 && qlu.y > 0.0 && qlu.y < 1.0 ? 1.0 : 0.0;\n" \
-    "    }\n" \
-    "    if ((qa > 30.5 || qa < 0.5) && lgOn < 0.5) {\n" \
-    "      vec3 qo = qa > 30.5 ? floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0) : bd;\n" \
-    "      if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) qo = brighten(qo, mbf, 0.0);\n" \
-    "      else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) qo = darken(qo, mbf, 15.0);\n" \
-    "      return vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 ? 0.0 : 1.0);\n" \
-    "    }\n" \
+       branch not taken costs nothing on the Vita's GPU; the arithmetic below is what costs). Written as if / else \
+       with one return at the end: an early return made the compiler run the rest for every pixel anyway. Texture \
+       reads in the Cg build are tex2Dlod (no gradients needed), so the branches can really be skipped. */ \
+    "  vec4 q = texture2D(u3d, vec2((x3 + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
+    "  float qa = floor(by(q.a) / 8.0);\n" \
+    "  float lgOn = 0.0;\n" \
+    "  if (uLogoOn > 0.5) {\n" \
+    "    vec2 qlu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
+    "    vec4 qlg = texture2D(uLogo, qlu);\n" \
+    "    lgOn = qlg.a > 0.5 && qlu.x > 0.0 && qlu.x < 1.0 && qlu.y > 0.0 && qlu.y < 1.0 ? 1.0 : 0.0;\n" \
     "  }\n" \
+    "  float fast = L5.y > 0.5 && covMain < 0.5 && covBg3 < 0.5 && bitOf(m, 1.0) > 0.5 && uHave3d > 0.5 &&\n" \
+    "      !(uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) && !(uObjShift > 0.5 && y >= uObjMove.y && y < uObjMove.w) &&\n" \
+    "      (qa > 30.5 || qa < 0.5) && lgOn < 0.5 ? 1.0 : 0.0;\n" \
+    "  vec4 res;\n" \
+    "  if (fast > 0.5) {\n" \
+    "    vec3 qo = qa > 30.5 ? floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0) : bd;\n" \
+    "    if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) qo = brighten(qo, mbf, 0.0);\n" \
+    "    else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) qo = darken(qo, mbf, 15.0);\n" \
+    "    res = vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 ? 0.0 : 1.0);\n" \
+    "  } else {\n" \
     "  float k1 = 100.0, l1 = 5.0, a1 = 0.0; vec3 c1 = bd;\n" \
     "  float k2 = 200.0, l2 = 7.0; vec3 c2 = bd;\n" \
     "  float k; vec3 c; vec4 tv;\n" \
@@ -208,7 +211,9 @@ static const char kGcVertexShader[] =
     "    vec4 ov = texture2D(uOvl, vec2(uv.x, (y + 0.5) / 16.0));\n" \
     "    if (ov.a > 0.5) { o8 = ov.rgb; pure = 0.0; }\n" \
     "  }\n" \
-    "  return vec4(o8, 1.0 - pure);\n" \
+    "  res = vec4(o8, 1.0 - pure);\n" \
+    "  }\n" \
+    "  return res;\n" \
     "}\n"
 
 #define GC_GMOD "float gmod(float a, float b) { return a - b * floor(a / b); }\n"
@@ -217,7 +222,7 @@ static const char kGcFragmentShader[] =   // GLSL ES 1.00
     "void main() { gl_FragColor = compose(gl_FragCoord.xy, vL0, vL1, vL2, vL3, vL4, vL5); }\n";
 // Cg for vitaGL (GL_CG_*_SHADER_EXT: compiled by the Cg compiler as is, not through vitaGL's GLSL translator).
 static const char kGcFragmentShaderCg[] =
-    "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D tex2D\n" GC_GMOD GC_FRAGMENT_BODY
+    "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD GC_FRAGMENT_BODY
     "float4 main(float4 fc : WPOS, float4 vL0 : TEXCOORD0, float4 vL1 : TEXCOORD1, float4 vL2 : TEXCOORD2,\n"
     "            float4 vL3 : TEXCOORD3, float4 vL4 : TEXCOORD4, float4 vL5 : TEXCOORD5) : COLOR {\n"
     "  return compose(fc.xy, vL0, vL1, vL2, vL3, vL4, vL5);\n"
@@ -344,7 +349,7 @@ static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
 static const char kGcqVertexShader[] =
     "attribute vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
 static const char kGcqFragmentShaderCg[] =
-    "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D tex2D\n" GC_GMOD
+    "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
     "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
     "float4 main(float4 fc : WPOS) : COLOR {\n" GC_TEX_FETCH
     "  return compose(fc.xy, L0, L1, L2, L3, L4, L5);\n"

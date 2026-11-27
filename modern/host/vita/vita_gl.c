@@ -21,6 +21,7 @@
 #include "vita.h"
 #include "../gpu2d/gpu2d.h"
 #include "../gpu2d/gpu2d_compose.h"
+#include "../host_features.h"
 
 #define SCREEN_W 960
 #define SCREEN_H 544
@@ -326,10 +327,7 @@ static void copy_quad(GLuint tex, const float *uv) {
 // canvas (row 0 = DS line 0 = the top of the picture) into the 3x picture, nearest (the canvas texture's filter)
 static const float kCanvasUv[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
 static const float kFlatUv[8] = {0, 0, 1, 0, 0, 1, 1, 1};   // the 3D buffer / the 3x picture: row 0 at the bottom
-static void present_pre(void) {
-    glBindFramebuffer(GL_FRAMEBUFFER, sPreFbo);
-    glViewport(0, 0, PRE_W, PRE_H);
-    glDisable(GL_BLEND);
+static void near_quad(void) {   // the canvas over the whole target, each pixel the canvas texel under it
     glUseProgram(sNearProg);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, sGcCanvas);
@@ -340,6 +338,12 @@ static void present_pre(void) {
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sNearPos);
     glDisableVertexAttribArray((GLuint)sNearTex);
+}
+static void present_pre(void) {
+    glBindFramebuffer(GL_FRAMEBUFFER, sPreFbo);
+    glViewport(0, 0, PRE_W, PRE_H);
+    glDisable(GL_BLEND);
+    near_quad();
 }
 static void present_3d(unsigned tex3d) {
     glDisable(GL_BLEND);
@@ -376,25 +380,29 @@ static int present_fades(const Gpu2dGc *gc) {
     glDisable(GL_BLEND);
     return 1;
 }
-static void present_final(int has3d) {
+// smooth: the 3x picture, linear (block edges blended); sharp (the option off): the canvas straight to the screen,
+// each screen pixel the canvas pixel under it (plain enlarged pixels, 2 or 3 screen pixels wide)
+static void present_final(int has3d, int smooth) {
     if (has3d) {
         glEnable(GL_BLEND);
         glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     } else
         glDisable(GL_BLEND);
-    copy_quad(sPreTex, kFlatUv);
+    if (smooth) copy_quad(sPreTex, kFlatUv);
+    else near_quad();
     glDisable(GL_BLEND);
 }
 static void present_draw(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
-    present_pre();   // (first: the offscreen picture, then the screen in one go)
+    const int smooth = feature_on(FEAT_SMOOTH);   // (the options file / settings screen: smooth_pixels)
+    if (smooth) present_pre();   // (first: the offscreen picture, then the screen in one go)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     if (has3d) {
         present_3d(tex3d);
         present_fades(gc);
     }
-    present_final(has3d);
+    present_final(has3d, smooth);
     glUseProgram(0);
 }
 int vita_gl_gc_init(void) {

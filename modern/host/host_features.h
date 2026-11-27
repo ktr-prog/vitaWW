@@ -8,6 +8,7 @@ extern "C" {
 enum {
     FEAT_FPS,
     FEAT_NO_RESETTI,
+    FEAT_SMOOTH,   // smooth pixel edges when the DS picture is enlarged to the screen (off: plain enlarged pixels)
     FEAT_COUNT,
     FEAT_CIRCLE_PAD = FEAT_COUNT
 };
