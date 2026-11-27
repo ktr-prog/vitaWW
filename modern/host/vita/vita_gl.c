@@ -536,10 +536,17 @@ int vita_gl_gc_init(void) {
 }
 
 // The compose's draw into the canvas: one quad, or the tiles (fast ones by the small program, the rest in full).
+static unsigned sGcStatFrames, sGcStatTiled, sGcStatFast;
+void vita_gl_gc_stats(unsigned *frames, unsigned *tiled, unsigned *fast) {
+    *frames = __atomic_exchange_n(&sGcStatFrames, 0, __ATOMIC_RELAXED);
+    *tiled = __atomic_exchange_n(&sGcStatTiled, 0, __ATOMIC_RELAXED);
+    *fast = __atomic_exchange_n(&sGcStatFast, 0, __ATOMIC_RELAXED);
+}
+// tiled: 0 one quad, 1 the tiles, 2 the tiles if enough of them are fast (else one quad)
 static void gc_draw(const Gpu2dGc *gc, const float *quad, int tiled) {
+    static float fv[GC_TILE_VERTS][2], sv[GC_TILE_VERTS][2];
+    int nf = 0, ns = 0;
     if (tiled) {
-        static float fv[GC_TILE_VERTS][2], sv[GC_TILE_VERTS][2];
-        int nf = 0, ns = 0;
         // (the title's logo and moved BG3: their tiles get the full compose, the rest of the picture need not)
         const int whole = sGcU.have3d < 0.5f || sGcU.mirror > 0.5f;
         static unsigned extra[192], logoCells[192];
@@ -563,6 +570,13 @@ static void gc_draw(const Gpu2dGc *gc, const float *quad, int tiled) {
         const int oy0 = sGcU.objShift > 0.5f ? (int)sGcU.mv[1] : 999, oy1 = sGcU.objShift > 0.5f ? (int)sGcU.mv[3] : 999;
         sGcTileFast = gc_tile_quads(gc->par, GPU2D_GC_PAR * 4, GC_W, (float)GC_W, sGcFlip > 0.5f, whole,
                                     sGcU.ovlOn > 0.5f, oy0, oy1, extra, fv, &nf, sv, &ns);
+        // (auto: the tiles only when at least half of them take the small program; else the one quad)
+        if (tiled == 2 && sGcTileFast * 2 < 432) tiled = 0;
+        __atomic_fetch_add(&sGcStatFrames, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&sGcStatFast, (unsigned)sGcTileFast, __ATOMIC_RELAXED);
+    }
+    if (tiled) {
+        __atomic_fetch_add(&sGcStatTiled, 1, __ATOMIC_RELAXED);
         if (nf) {
             gc_frame_uniforms(sGcTileProg);
             glUseProgram(sGcTileProg);
@@ -698,7 +712,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         sGcOneNs = tb - ta; sGcTileNs = tc - tb;
         sGcTiled = sGcTileNs < sGcOneNs;
     } else
-        gc_draw(gc, kQuad, sGcTileProg && sGcTiled);
+        gc_draw(gc, kQuad, sGcTileProg ? 2 : 0);
 
     if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
         if (!sOvlProg) {

@@ -253,7 +253,9 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
         static unsigned n, seen, probes;
         if (++n % 300 == 0) {
             unsigned rep = gVitaRepeatsTotal;
-            if (rep != seen && probes < 5) { glFinish(); gVitaGpuProbe = 1; probes++; }
+            // (off in play: each probe frame is a visible hitch; kGpuProbes > 0 for a diagnostic build)
+            enum { kGpuProbes = 0 };
+            if (rep != seen && probes < kGpuProbes) { glFinish(); gVitaGpuProbe = 1; probes++; }
             seen = rep;
         }
     }

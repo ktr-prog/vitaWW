@@ -1301,7 +1301,7 @@ static u32 *sMtQ;
 // Free-running word positions. The game thread fills up to sMtWLocal and publishes sMtW in batches (MTQ_BATCH
 // words, or at any sync/commit) so the two cores do not trade a cache line on every command; the worker likewise
 // publishes sMtR per batch. Each published index sits on its own cache line.
-enum { MTQ_BATCH = 512 };
+enum { MTQ_BATCH = 2048 };
 static u32 sMtWLocal;
 static u32 sMtWDone;   // end of the last complete command: what gets published (never part of a command)
 static u32 sMtRSeen;   // last worker position this thread read (re-read only when the ring looks full)
@@ -1346,11 +1346,18 @@ static inline void mt_wake(void) {
         pthread_mutex_unlock(&sMtSleepMx);
     }
 }
-static inline void mt_publish_w(u32 w) { __atomic_store_n(&sMtW, w, __ATOMIC_RELEASE); mt_wake(); }
+// New work wakes the worker only when it sleeps waiting for work (sMtSleeping 1): parked on a swap (2) it can do
+// nothing with it until the commit releases the park (which wakes it) - signalling it on every batch while parked
+// cost the game thread a condition signal (and the worker a pointless wake-up) per batch.
+static inline void mt_publish_w(u32 w) {
+    __atomic_store_n(&sMtW, w, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&sMtSleeping, __ATOMIC_SEQ_CST) == 1) mt_wake();
+}
 // Worker: sleep until the published index moves past r (parkWait = 0) or the park is released (parkWait = 1).
 static void mt_sleep(u32 r, int parkWait) {
     pthread_mutex_lock(&sMtSleepMx);
-    __atomic_store_n(&sMtSleeping, 1, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&sMtSleeping, parkWait ? 2 : 1, __ATOMIC_SEQ_CST);
     for (;;) {
         int ready = parkWait ? !__atomic_load_n(&sMtParked, __ATOMIC_SEQ_CST) : __atomic_load_n(&sMtW, __ATOMIC_SEQ_CST) != r;
         if (ready || !__atomic_load_n(&sMtSleeping, __ATOMIC_SEQ_CST)) break;
@@ -1424,16 +1431,21 @@ static void *mt_worker(void *arg) {
     sceKernelChangeThreadCpuAffinityMask(0, 0x60000);
 #endif
     u32 tmp[192];
-    int spins = 0;
     u32 r = 0;
+    uint64_t idleSince = 0;
     for (;;) {
         u32 w = __atomic_load_n(&sMtW, __ATOMIC_ACQUIRE);
         if (r == w) {
-            if (++spins < 32) sched_yield();
-            else { mt_sleep(r, 0); spins = 0; }
+            // While the game thread is sending a frame's geometry the next batch follows within microseconds: stay
+            // awake (yielding) for a short while instead of sleeping at once - waking a sleeping worker costs the
+            // game thread a condition signal per batch, which was a fifth of its time in a busy town.
+            uint64_t now = host_plat_time_ns();
+            if (!idleSince) idleSince = now;
+            if (now - idleSince < 300000u) sched_yield();
+            else { mt_sleep(r, 0); idleSince = 0; }
             continue;
         }
-        spins = 0;
+        idleSince = 0;
         uint64_t t0 = host_plat_time_ns();
         int park = 0;
         while (r != w && !park) {

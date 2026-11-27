@@ -1012,6 +1012,13 @@ static void render_frame_mt(void) {
                                      "overlay/clock %d, 2D across %d, both sides %d, no 3D %d, 3D shifted %d\n",
                                      w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
+            {
+                extern void vita_gl_gc_stats(unsigned *frames, unsigned *tiled, unsigned *fast);
+                unsigned fr, ti, fa;
+                vita_gl_gc_stats(&fr, &ti, &fa);
+                if (fr) fprintf(stderr, "compose: tiles in %u of %u frames (on average %u of 432 tiles the fast program)\n",
+                                ti, fr, fa / fr);
+            }
             extern unsigned gVitaRepeats;
             fprintf(stderr, "display: %u refreshes repeated the previous picture (last 60 frames)\n",
                     __atomic_exchange_n(&gVitaRepeats, 0, __ATOMIC_RELAXED));

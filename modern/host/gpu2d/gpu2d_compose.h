@@ -485,6 +485,7 @@ static inline int gc_tile_quads(const unsigned char *par, int stride, int W, flo
     const int left = (W - 256) / 2;
     int fast = 0;
     *nf = *ns = 0;
+    unsigned rows[24];
     for (int r = 0; r < 24; r++) {
         unsigned slow = 0;   // bit c: cell c of this row (0 left side, 1..16 the 2D columns, 17 right side)
         for (int y = r * 8; y < r * 8 + 8; y++) {
@@ -503,7 +504,14 @@ static inline int gc_tile_quads(const unsigned char *par, int stride, int W, flo
             if (extra) slow |= extra[y];
         }
         if (left <= 0) slow |= 1u | 1u << 17;   // (no side bars: those cells are empty either way)
-        float y0 = r * 8 / 96.0f - 1.0f, y1 = (r * 8 + 8) / 96.0f - 1.0f;
+        rows[r] = slow;
+        for (int c = 0; c < 18; c++) fast += !(slow >> c & 1);
+    }
+    for (int r0 = 0; r0 < 24;) {   // rows with the same cells go into one band (fewer, taller quads)
+        int r1 = r0 + 1;
+        while (r1 < 24 && rows[r1] == rows[r0]) r1++;
+        const unsigned slow = rows[r0];
+        float y0 = r0 * 8 / 96.0f - 1.0f, y1 = r1 * 8 / 96.0f - 1.0f;
         if (flip) { y0 = -y0; y1 = -y1; }
         for (int c = 0; c < 18;) {
             int k = slow >> c & 1, e = c;
@@ -514,10 +522,11 @@ static inline int gc_tile_quads(const unsigned char *par, int stride, int W, flo
                 float (*v)[2] = k ? sv + *ns : fv + *nf;
                 const float q[6][2] = {{a, y0}, {b, y0}, {a, y1}, {b, y0}, {b, y1}, {a, y1}};
                 for (int i = 0; i < 6; i++) { v[i][0] = q[i][0]; v[i][1] = q[i][1]; }
-                if (k) *ns += 6; else { *nf += 6; fast += e - c; }
+                if (k) *ns += 6; else *nf += 6;
             }
             c = e;
         }
+        r0 = r1;
     }
     return fast;
 }
