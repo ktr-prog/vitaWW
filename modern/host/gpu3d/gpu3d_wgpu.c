@@ -92,7 +92,7 @@ static const char kShader[] =
     "      var slot1 = 0x20000u + ((addr & 0x1ffffu) >> 1u); if ((addr >> 17u) == 2u) { slot1 += 0x10000u; }\n"
     "      let info = img16(slot1); let pbb = pb + (info & 0x3fffu) * 4u; let mode = info >> 14u;\n"
     "      if (c == 3u && mode < 2u) { return 0u; }\n"
-    "      if (c < 2u || mode == 2u) { return opaque(pal16(pbb + c * 2u)); }\n"
+    "      if (c < 2u || mode == 2u || (mode == 0u && c == 2u)) { return opaque(pal16(pbb + c * 2u)); }\n"
     "      let c0 = pal16(pbb); let c1 = pal16(pbb + 2u);\n"
     "      let k0 = vec3u(c0 & 31u, (c0 >> 5u) & 31u, (c0 >> 10u) & 31u);\n"
     "      let k1 = vec3u(c1 & 31u, (c1 >> 5u) & 31u, (c1 >> 10u) & 31u);\n"

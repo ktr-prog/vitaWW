@@ -655,6 +655,9 @@ static void decode_texture_slow(uint32_t texparam, uint32_t texpal, uint32_t *ou
     for (int t = 0; t < h; t++)
         for (int s = 0; s < w; s++) out[t * w + s] = texel_rgba(g3_texel(texparam, texpal, s, t));
 }
+void gpu3d_texture_pal_range(uint32_t texparam, uint32_t texpal, uint32_t *lo, uint32_t *n) {
+    g3_pal_range(texparam, texpal, lo, n);
+}
 void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out) {
     if (!sC8[31]) for (u32 c = 0; c < 32; c++) sC8[c] = c * 255 / 31;
     const int fmt = texparam >> 26 & 7;
@@ -706,7 +709,7 @@ void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out) {
                 u32 col[4];
                 for (u32 c = 0; c < 4; c++) {
                     if (c == 3 && mode < 2) { col[c] = 0; continue; }
-                    if (c < 2 || mode == 2) { col[c] = texel_rgba((pal16(pb + c * 2) & 0x7fffu) | 31u << 16); continue; }
+                    if (c < 2 || mode == 2 || (mode == 0 && c == 2)) { col[c] = texel_rgba((pal16(pb + c * 2) & 0x7fffu) | 31u << 16); continue; }
                     u32 r0 = c0 & 31, g0 = c0 >> 5 & 31, b0 = c0 >> 10 & 31, r1 = c1 & 31, g1 = c1 >> 5 & 31, b1 = c1 >> 10 & 31;
                     u32 r, g, b;
                     if (mode == 1) {

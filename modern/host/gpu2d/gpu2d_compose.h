@@ -219,7 +219,8 @@ static const char kMaskFragmentShaderCg[] =
     "  if (md > 0.5) c = md < 1.5 ? c + floor(((63.0 - c) * ev) / 16.0) : c - floor((c * ev + 15.0) / 16.0);\n"
     "  return float4((c * 4.0 + floor(c / 16.0)) / 255.0, code / 255.0);\n"
     "}\n";
-// Present uP: x = the mask's marks used (0: the canvas as it is), y = the canvas columns (GC_W).
+// Present uP: x = the mask's marks used (0: the canvas as it is), y = the canvas columns (GC_W), zw = 1 / the canvas
+// texture size. A marked pixel returns early, without the sharp-bilinear arithmetic (most of the screen is 3D).
 static const char kBlitVertexShaderCg[] =
     "void main(float2 aPos, float2 aTex, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; }\n";
@@ -228,23 +229,26 @@ static const char kBlitFragmentShaderCg[] =
     "            uniform float4 uP) : COLOR {\n"
     "  float2 tx = vTex * uSz.xy;\n"
     "  float2 fl = floor(tx);\n"
+    "  if (uP.x > 0.5) {\n"   // a marked pixel: the 3D under it, nothing else to do
+    "    float code = floor(tex2D(uTex, (fl + 0.5) * uP.zw).a * 255.0 + 0.5);\n"
+    "    if (code > 0.5) {\n"
+    "      float4 hi = tex2D(u3d, float2(tx.x / uP.y, 1.0 - vTex.y));\n"
+    "      if (hi.a > 0.97) {\n"   // (opaque 3D: a8 >= 248)
+    "        float3 c = floor(hi.rgb * 63.75 + 0.125);\n"   // = floor(floor(x * 255 + 0.5) / 4)
+    "        if (code > 1.5) {\n"
+    "          float k = code - 1.0;\n"
+    "          float md = floor(k / 32.0);\n"
+    "          float ev = k - md * 32.0;\n"
+    "          c = md < 1.5 ? c + floor(((63.0 - c) * ev) / 16.0) : c - floor((c * ev + 15.0) / 16.0);\n"
+    "        }\n"
+    "        return float4((c * 4.0 + floor(c / 16.0)) / 255.0, 1.0);\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
     "  float2 d = tx - fl - 0.5;\n"
     "  float2 r = 0.5 - 0.5 / uSz.zw;\n"
     "  float2 f = (d - clamp(d, -r, r)) * uSz.zw + 0.5;\n"
-    "  float3 o = tex2D(uTex, (fl + f) / uSz.xy).rgb;\n"
-    "  float code = uP.x > 0.5 ? floor(tex2D(uTex, (fl + 0.5) / uSz.xy).a * 255.0 + 0.5) : 0.0;\n"
-    "  if (code > 0.5) {\n"
-    "    float4 hi = floor(tex2D(u3d, float2(tx.x / uP.y, 1.0 - vTex.y)) * 255.0 + 0.5);\n"
-    "    if (hi.a > 247.5) {\n"
-    "      float3 c = floor(hi.rgb / 4.0);\n"
-    "      if (code > 1.5) {\n"
-    "        float k = code - 1.0, md = floor(k / 32.0), ev = k - md * 32.0;\n"
-    "        c = md < 1.5 ? c + floor(((63.0 - c) * ev) / 16.0) : c - floor((c * ev + 15.0) / 16.0);\n"
-    "      }\n"
-    "      o = (c * 4.0 + floor(c / 16.0)) / 255.0;\n"
-    "    }\n"
-    "  }\n"
-    "  return float4(o, 1.0);\n"
+    "  return float4(tex2D(uTex, (fl + f) / uSz.xy).rgb, 1.0);\n"
     "}\n";
 
 #endif

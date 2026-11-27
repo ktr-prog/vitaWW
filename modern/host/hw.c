@@ -151,11 +151,18 @@ static void host_pace_frame(void) {
     // (a 60 Hz timer, then the vblank count) fought the queue: each time the GPU finished a frame a bit late the
     // queue filled, the swap blocked a whole refresh and the game lost a frame (logs: 1-5 a second, swap ~20 ms).
     // V-Sync locks the rate to the display's hardware refresh (59.94 Hz): vitaGL flips each picture at a vblank, one
-    // per refresh. When nothing waits on the display (no picture flipped since: the queue cannot push back), the
-    // game waits for the display's next vblank itself, so it never runs ahead of the refresh either.
+    // per refresh. The game may run up to 3 frames ahead of the refreshes counted since it last fell behind - the
+    // depth of the display queue and the render thread, so this never holds back a frame the queue would take (after
+    // a slow frame the game refills the queue at its own speed: that slack is what keeps the next slow frame from
+    // showing). It only holds the game to the refresh when nothing pushes back (no picture being flipped). A floor
+    // per refresh (one frame end per vblank) stopped the queue from ever refilling.
     {
         u64 now = host_plat_time_ns();
         if (sNextFrame == 0) sNextFrame = 1;
+        extern unsigned host_vita_vcount(void);
+        extern void host_vita_wait_vblank(void);
+        static unsigned sVc0, sFrames;
+        static int sVcInit;
         if (sPaceLast) {
             u64 dt = now - sPaceLast;
             if (dt > sWorstFrameNs) {
@@ -164,11 +171,16 @@ static void host_pace_frame(void) {
                 sWorstHoNs = gHoFrameNs;
             }
             if (dt > 25000000ull) sLateFrames++;   // over 1.5 refreshes: a refresh went by without a new frame
-            extern unsigned host_vita_vcount(void);
-            extern void host_vita_wait_vblank(void);
-            static unsigned sVcLast;
-            if (host_vita_vcount() == sVcLast) HOST_PHASE(PH_PACE, host_vita_wait_vblank());   // still the same refresh
-            sVcLast = host_vita_vcount();
+        }
+        unsigned vc = host_vita_vcount();
+        if (!sVcInit) { sVcInit = 1; sVc0 = vc; sFrames = 0; }
+        sFrames++;
+        int ahead = (int)(sFrames - (vc - sVc0));
+        if (ahead < 0) { sVc0 = vc - sFrames; ahead = 0; }   // behind: no debt to run off faster than the refresh
+        while (ahead > 3) {
+            HOST_PHASE(PH_PACE, host_vita_wait_vblank());
+            vc = host_vita_vcount();
+            ahead = (int)(sFrames - (vc - sVc0));
         }
         sPaceLast = host_plat_time_ns();
         return;

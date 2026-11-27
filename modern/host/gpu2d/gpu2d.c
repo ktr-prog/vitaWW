@@ -825,6 +825,8 @@ static int sLogoOn, sLogoReady, sLogoFull, sLogoDx, sLogoDy, sPromptSnap;
 static int sMirrorOn, sMirrorReady;
 static uint32_t sLogo[SCREEN_W * SCREEN_H];
 static int sOverlayOn, sOvlReady;   // (Vita) a menu over the scene: engine B drawn by the bands into sLogo
+static unsigned sLogoGen;   // counts the frames that wrote sLogo (the present uploads it only then)
+unsigned gpu2d_gc_logo_gen(void) { return sLogoGen; }
 int gHostTitlePrompt;   // TitleBlinkText (Vita): the "touch to start" BG3 is shown
 // The logo (NULL when none) and how far to move it to centre it on the screen (dx, dy); prompt: BG3 is the title's
 // "touch to start", to be drawn in the screen's bottom-right corner.
@@ -1730,6 +1732,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         sBValid = 1;
         gSubDraws += bLines != 0;
     }
+    if ((sLogoOn && subDraw) || bLines) sLogoGen++;   // (the title logo's lines above, the bands' dirty lines)
     if (mirrorBand) sMirrorReady = 1;   // (the bands fill sLogo before this frame's present, on the render thread)
     if (!sOverlayOn) sOvlReady = 0;
     if (overlayBand) sOvlReady = 1;

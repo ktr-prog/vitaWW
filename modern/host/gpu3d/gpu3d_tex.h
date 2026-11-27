@@ -189,6 +189,27 @@ static void g3_sync_pal(u32 a, u32 n) {
         sPalBlkKey[b] = key;
     }
 }
+// The palette bytes a texture reads: [*lo, *lo + *n) (wrapping in the 128 KB palette space). A 4x4-compressed
+// texture reads, for each 4x4 block, 4 to 8 bytes at the offset its palette index gives - not its whole 64 KB
+// window, so a palette change elsewhere in that window (an animated palette of another texture) leaves it as it
+// is. (Its index data must be current in sImgFlat.)
+static void g3_pal_range(u32 tp, u32 pp, u32 *lo, u32 *n) {
+    static const u32 palBytes[8] = {0, 64, 8, 32, 512, 0x10000, 16, 0};
+    int fmt = tp >> 26 & 7;
+    if (fmt != 5) { *lo = fmt == 2 ? pp << 3 : pp << 4; *n = palBytes[fmt]; return; }
+    u32 w = 8u << (tp >> 20 & 7), h = 8u << (tp >> 23 & 7);
+    u32 a = ((tp & 0xffff) << 3) & (4 * IMG_SLOT - 1);
+    u32 mn = 0x3fff, mx = 0;
+    for (u32 blk = 0, nb = w * h / 16; blk < nb; blk++) {   // the blocks' index entries, as the decoder reads them
+        u32 addr = a + blk * 4;
+        u32 slot1 = 0x20000 + ((addr & 0x1ffff) >> 1) + ((addr >> 17) == 2 ? 0x10000 : 0);
+        u32 i = (u32)(sImgFlat[slot1 & 0x7ffff] | sImgFlat[(slot1 + 1) & 0x7ffff] << 8) & 0x3fff;
+        if (i < mn) mn = i;
+        if (i > mx) mx = i;
+    }
+    *lo = ((pp & 0x1fff) << 4) + mn * 4;
+    *n = (mx - mn) * 4 + 8;
+}
 // VRAM byte ranges one texture reads: texels, the 4x4-compressed palette indices, and its palette.
 static void g3_tex_sync_for(u32 tp, u32 pp) {
     static const u8 bpp[8] = {0, 8, 2, 4, 8, 2, 8, 16};
@@ -199,7 +220,10 @@ static void g3_tex_sync_for(u32 tp, u32 pp) {
     u32 a = ((tp & 0xffff) << 3) & (4 * IMG_SLOT - 1);
     g3_sync_img(a, w * h * bpp[fmt] / 8);
     if (fmt == 5) g3_sync_img(0x20000 + (a & 0x1ffff) / 2 + (a >= 0x40000 ? 0x10000 : 0), w * h / 8);
-    g3_sync_pal(fmt == 2 ? pp << 3 : pp << 4, palBytes[fmt]);
+    u32 plo, pn;
+    g3_pal_range(tp, pp, &plo, &pn);   // (after the index data is synced)
+    g3_sync_pal(plo, pn);
+    (void)palBytes;
 }
 
 static inline u8 img8(u32 a) { return sImgFlat[a & 0x7ffff]; }
@@ -257,7 +281,7 @@ static inline u32 g3_texel(u32 texparam, u32 texpal, int s, int t) {
         int mode = info >> 14;
         u16 c0 = pal16(pb), c1 = pal16(pb + 2);
         if (c == 3 && mode < 2) return 0;
-        if (c < 2 || mode == 2) return (pal16(pb + c * 2) & 0x7fffu) | 31u << 16;
+        if (c < 2 || mode == 2 || (mode == 0 && c == 2)) return (pal16(pb + c * 2) & 0x7fffu) | 31u << 16;
         u32 r0 = c0 & 31, g0 = c0 >> 5 & 31, b0 = c0 >> 10 & 31, r1 = c1 & 31, g1 = c1 >> 5 & 31, b1 = c1 >> 10 & 31;
         u32 r, g, b;
         if (mode == 1) {
