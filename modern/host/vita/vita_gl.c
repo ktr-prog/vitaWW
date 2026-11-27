@@ -145,8 +145,6 @@ static const char kMenuFragmentShaderCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
     "  float4 c = tex2D(uTex, vTex);\n  if (c.a < 0.25) discard;\n  return float4(c.rgb, 1.0);\n}\n";   // the canvas to the screen, sharp bilinear (gpu2d_compose.h kBlit*)
 static GLint sBlitPos = -1, sBlitTex = -1, sBlitP = -1;
-static GLuint sMaskProg, sGcCanvas2, sGcFbo2;   // the 3D mark + brightness pass (gpu2d_compose.h kMask*)
-static GLint sMaskPos = -1, sMaskP = -1;
 static GLuint sGcLogoTex;
 static int sGcState;   // 0 untried, 1 ready, -1 unavailable
 static GLuint gc_shader(GLenum type, const char *src) {
@@ -283,16 +281,6 @@ int vita_gl_gc_init(void) {
     glGenFramebuffers(1, &sGcFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sGcCanvas, 0);
-    glGenTextures(1, &sGcCanvas2);
-    glBindTexture(GL_TEXTURE_2D, sGcCanvas2);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, GC_TEX_W, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glGenFramebuffers(1, &sGcFbo2);
-    glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo2);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sGcCanvas2, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     sGcState = 1;
     gVitaGc = 1;
@@ -337,13 +325,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             int first = !sGcLogoTex;
             if (first) glGenTextures(1, &sGcLogoTex);
             glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
-            // uploaded only when the picture was written (gpu2d counts those frames): re-specifying a 192 KB
-            // texture every frame cost the render thread about a millisecond on the title and in menus
-            extern unsigned gpu2d_gc_logo_gen(void);
-            static unsigned upGen;
-            unsigned gen = gpu2d_gc_logo_gen();
-            if (first || gen != upGen) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
-            upGen = gen;
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
             if (first) {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -412,38 +394,6 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             glDisableVertexAttribArray((GLuint)sOvlTex);
         }
     }
-    // The 3D marks and the brightness, at the canvas's resolution, into the second canvas the present reads.
-    if (!sMaskProg) {
-        sMaskProg = cached_program(kMaskVertexShaderCg, kMaskFragmentShaderCg, "mask");
-        if (sMaskProg) {
-            sMaskPos = glGetAttribLocation(sMaskProg, "aPos");
-            glUseProgram(sMaskProg);
-            glUniform1i(glGetUniformLocation(sMaskProg, "uTex"), 0);
-            glUniform1i(glGetUniformLocation(sMaskProg, "u3d"), 1);
-            glUniform1i(glGetUniformLocation(sMaskProg, "uPar"), 2);
-            sMaskP = glGetUniformLocation(sMaskProg, "uP");
-            if (sMaskPos < 0) sMaskProg = 0;
-        }
-        fprintf(stderr, "vita_gl: full-resolution 3D %s\n", sMaskProg ? "on" : "unavailable (the mask shader failed)");
-        if (!sMaskProg) sMaskProg = (GLuint)-1;
-    }
-    const int masked = sMaskProg != (GLuint)-1;
-    if (masked) {
-        glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo2);
-        glViewport(0, 0, GC_W, 192);
-        glUseProgram(sMaskProg);
-        glUniform4f(sMaskP, tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, mirrorNow ? 0.0f : 1.0f, (float)GC_TEX_W);
-        glActiveTexture(GL_TEXTURE0 + 1);
-        glBindTexture(GL_TEXTURE_2D, tex3d);
-        glActiveTexture(GL_TEXTURE0 + 2);
-        glBindTexture(GL_TEXTURE_2D, t[6]);   // uPar
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, sGcCanvas);
-        glEnableVertexAttribArray((GLuint)sMaskPos);
-        glVertexAttribPointer((GLuint)sMaskPos, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray((GLuint)sMaskPos);
-    }
     gVitaComposeNs += host_plat_time_ns() - t0;
     glUseProgram(0);
     glDepthMask(GL_TRUE);
@@ -456,6 +406,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             glUseProgram(sBlitProg);
             glUniform1i(glGetUniformLocation(sBlitProg, "uTex"), 0);
             glUniform1i(glGetUniformLocation(sBlitProg, "u3d"), 1);
+            glUniform1i(glGetUniformLocation(sBlitProg, "uPar"), 2);
             sBlitP = glGetUniformLocation(sBlitProg, "uP");
             glUniform4f(glGetUniformLocation(sBlitProg, "uSz"), (float)GC_TEX_W, 192.0f, (float)SCREEN_W / GC_W,
                         (float)SCREEN_H / 192.0f);
@@ -471,11 +422,13 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         static const float kTex[8] = {0, 1, (float)GC_W / GC_TEX_W, 1, 0, 0, (float)GC_W / GC_TEX_W, 0};
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glUseProgram(sBlitProg);
-        glUniform4f(sBlitP, masked && tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, 1.0f / GC_TEX_W, 1.0f / 192.0f);
+        glUniform4f(sBlitP, tex3d && !mirrorNow ? 1.0f : 0.0f, (float)GC_W, mirrorNow ? 0.0f : 1.0f, 0.0f);
         glActiveTexture(GL_TEXTURE0 + 1);
         glBindTexture(GL_TEXTURE_2D, tex3d);
+        glActiveTexture(GL_TEXTURE0 + 2);
+        glBindTexture(GL_TEXTURE_2D, t[6]);   // uPar
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, masked ? sGcCanvas2 : sGcCanvas);
+        glBindTexture(GL_TEXTURE_2D, sGcCanvas);
         glEnableVertexAttribArray((GLuint)sBlitPos);
         glEnableVertexAttribArray((GLuint)sBlitTex);
         glVertexAttribPointer((GLuint)sBlitPos, 2, GL_FLOAT, GL_FALSE, 0, kPos);
@@ -486,7 +439,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glUseProgram(0);
         present_swap();
     } else
-        blit_canvas(masked ? sGcFbo2 : sGcFbo, 0, 0, GC_W, 192);   // (the brightness is in the second canvas)
+        blit_canvas(sGcFbo, 0, 0, GC_W, 192);
     if (first) { first = 0; fprintf(stderr, "vita_gl: GPU compose: first frame presented\n"); }
 }
 

@@ -62,8 +62,8 @@ unsigned long long vita_gl3d_stats(char *buf, int n) {
 // are freed; an entry used in the current frame is never evicted (its GL texture may still be referenced by
 // draws queued this frame).
 enum { TC_SLOTS = 2048, TC_MAX = 1024, TC_BLK = 1024, TC_IMG = 0x80000, TC_PAL = 0x20000 };
-typedef struct { uint32_t tp, pal, lastUsed, palLo, palN; GLuint tex; uint8_t used, stale, minA; } TexEnt;
-// minA: its lowest texel alpha; palLo/palN: the palette bytes it read when decoded (gpu3d_texture_pal_range)
+typedef struct { uint32_t tp, pal, lastUsed, palLo, palN; GLuint tex; uint8_t used, stale; } TexEnt;
+// palLo/palN: the palette bytes it read when decoded (gpu3d_texture_pal_range)
 static TexEnt sTex[TC_SLOTS];
 static int sTexCount;
 static int sLastTexSlot = -1;   // consecutive polygons (sorted by texture) usually hit the same entry
@@ -108,11 +108,6 @@ static void tex_upload(TexEnt *e) {
     if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return;
     gpu3d_decode_texture(e->tp, e->pal, sDecodeBuf);
     gpu3d_texture_pal_range(e->tp, e->pal, &e->palLo, &e->palN);
-    {   // the lowest alpha of its texels: whether the alpha test can drop any of them (g3w_render)
-        uint32_t lo = 0xffffffffu;
-        for (long i = 0, n = (long)w * h; i < n; i++) if (sDecodeBuf[i] < lo) lo = sDecodeBuf[i] | 0x00ffffffu;
-        e->minA = (uint8_t)(lo >> 24);
-    }
     if (!e->tex) glGenTextures(1, &e->tex);
     glBindTexture(GL_TEXTURE_2D, e->tex);
     // vitaGL/GXM can still be sampling this texture from the previous queued frame. Re-specifying the image
@@ -162,14 +157,11 @@ static void tex_frame_begin(const u8 *img, const u8 *pal) {
     }
     if (sTexCount > TC_MAX * 3 / 4) tex_sweep(sTexFrame > 120 ? sTexFrame - 120 : 0);
 }
-static GLuint tex_for(uint32_t texparam, uint32_t texpal, uint8_t *minA) {
-    *minA = 255;
+static GLuint tex_for(uint32_t texparam, uint32_t texpal) {
     if ((texparam >> 26 & 7) == 0) return 0;   // format 0 == no texture
     if (sLastTexSlot >= 0) {
         TexEnt *l = &sTex[sLastTexSlot];
-        if (l->used && !l->stale && l->tp == texparam && l->pal == texpal) {
-            l->lastUsed = sTexFrame; *minA = l->minA; return l->tex;
-        }
+        if (l->used && !l->stale && l->tp == texparam && l->pal == texpal) { l->lastUsed = sTexFrame; return l->tex; }
     }
     int s = tex_slot(texparam, texpal);
     TexEnt *e = &sTex[s];
@@ -181,7 +173,6 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal, uint8_t *minA) {
         else if (e->stale) sStDeferred++;
         e->lastUsed = sTexFrame;
         sLastTexSlot = s;
-        *minA = e->minA;
         return e->tex;
     }
     if (sTexCount >= TC_MAX) {                 // full: drop everything not used this frame, then re-probe
@@ -192,16 +183,14 @@ static GLuint tex_for(uint32_t texparam, uint32_t texpal, uint8_t *minA) {
     }
     e->tp = texparam; e->pal = texpal; e->used = 1; e->stale = 0; e->lastUsed = sTexFrame; e->tex = 0;
     sTexCount++;
-    e->minA = 0;
     tex_upload(e);
     sLastTexSlot = s;
-    *minA = e->minA;
     return e->tex;
 }
 
 static void lazy_init(void) {
     if (sReady) return;
-    extern int vita_shader_compiler_ensure(void);   // (loaded on its own thread from start-up: vita_gl.c)
+    extern int vita_shader_compiler_ensure(void);   // (loaded at start-up: vita_gl.c)
     vita_shader_compiler_ensure();
     // Two FBOs: draws are submitted to one while the previous one is read back. Deferring the readback by a frame
     // lets the GPU finish this frame's draws during the CPU phase, so glReadPixels no longer stalls.
@@ -257,7 +246,6 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     static uint64_t grpKey[MAX_POLYGONS];
     static int grpCount[MAX_POLYGONS], grpPos[MAX_POLYGONS];
     static GLuint grpTex[MAX_POLYGONS];
-    static uint8_t grpMinA[MAX_POLYGONS];
     static int sPolyGrp[MAX_POLYGONS];
     int ngrp = 0;
     sGStamp++;
@@ -353,13 +341,8 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // Discard transparent texels so the background shows through, matching the software rasterizer (which does
     // "if (!al) return"): alpha 0 is dropped always, and with DS alpha-test (dispcnt bit 2) anything <= alphaRef.
     // Without this, transparent parts of textured quads (billboards, foliage) fill with the opaque clear colour.
-    // The test is on only for the draws where it can drop something: an opaque polygon's alpha is its texel's
-    // (vertex alpha 255), so it is needed only when the texture has a texel with alpha <= the reference
-    // (minA * 31 <= alphaRef * 255; untextured: alpha 255). A shader that can discard stops the GPU from skipping
-    // the hidden pixels of the opaque surfaces (its hidden-surface removal), so every covered pixel of every
-    // polygon was shaded - at 960x544 the 3D's biggest GPU cost. Translucent polygons keep it (alpha * texel).
-    const int arefN = (r->dispcnt & 4) ? r->alphaRef : 0;
-    float aref = (float)arefN / 31.0f;
+    float aref = (r->dispcnt & 4) ? (float)r->alphaRef / 31.0f : 0.0f;
+    glEnable(GL_ALPHA_TEST);
     glAlphaFunc(GL_GREATER, aref);
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
@@ -377,7 +360,7 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     static u8 sCol8[64];
     static int col8Init;
     if (!col8Init) { col8Init = 1; for (int c = 0; c < 64; c++) sCol8[c] = (u8)((c * 255 + 31) / 63); }
-    int bn = 0, bi = 0, haveState = 0, curBlend = -1, curTest = -1;
+    int bn = 0, bi = 0, haveState = 0, curBlend = -1;
     GLuint curTex = 0;
 #define GL3D_FLUSH() do { \
         if (bi) { glVertexPointer(4, GL_FLOAT, 0, bPos); glColorPointer(4, GL_UNSIGNED_BYTE, 0, bCol8); \
@@ -410,18 +393,16 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // GL_TEXTURE_2D; doing that inside the draw loop made the batch still pending for the previous texture draw
     // with the newly uploaded one (wrong textures for a frame whenever a texture was uploaded).
     uint64_t tRes = host_plat_time_ns();
-    for (int g = 0; g < ngrp; g++) grpTex[g] = tex_for((uint32_t)(grpKey[g] >> 32), (uint32_t)grpKey[g], &grpMinA[g]);
+    for (int g = 0; g < ngrp; g++) grpTex[g] = tex_for((uint32_t)(grpKey[g] >> 32), (uint32_t)grpKey[g]);
     sStResolveNs += host_plat_time_ns() - tRes;
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];
         const G3Polygon *p = r->poly[k];
         GLuint tex = grpTex[sPolyGrp[k]];
         int blend = p->translucent ? 1 : 0;
-        int atest = blend || (int)grpMinA[sPolyGrp[k]] * 31 <= arefN * 255;
         int full = bn + p->nv > BATCH_V || bi + (p->nv - 2) * 3 > BATCH_V * 3;
-        if (!haveState || tex != curTex || blend != curBlend || atest != curTest || full) {
+        if (!haveState || tex != curTex || blend != curBlend || full) {
             GL3D_FLUSH();
-            if (atest != curTest) { if (atest) glEnable(GL_ALPHA_TEST); else glDisable(GL_ALPHA_TEST); curTest = atest; }
             if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); } else glDisable(GL_TEXTURE_2D);
             if (blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
             else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
