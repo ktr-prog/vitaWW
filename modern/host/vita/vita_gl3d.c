@@ -238,6 +238,7 @@ int g3w_init(void *device, void *queue, int scale) {
 }
 void *g3w_picture(void) { return 0; }
 // The colour texture of the last frame drawn (GPU compose samples it), 0 before the first.
+GLuint vita_gl3d_fbo_of(GLuint tex) { for (int i = 0; i < 2; i++) if (sColorTex[i] == tex) return sFbo[i]; return 0; }   // (test-build diagnostic)
 unsigned vita_gl3d_frame_tex(void) { return sReady && sPrevDraw >= 0 ? sColorTex[sPrevDraw] : 0; }   // readback path only (out buffer), no shared picture
 
 #define BATCH_V 0xC000  // vertices per draw: vitaGL's glDrawArrays index limit (MAX_IDX_NUMBER)
@@ -431,7 +432,14 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
             GL3D_FLUSH();
             if (atest != curTest) { if (atest) glEnable(GL_ALPHA_TEST); else glDisable(GL_ALPHA_TEST); curTest = atest; }
             if (tex) { glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D, tex); } else glDisable(GL_TEXTURE_2D);
-            if (blend) { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); glDepthMask(GL_FALSE); }
+            if (blend) {
+                // colour: the usual mix; alpha: max(polygon, framebuffer), as the DS keeps it (GBATEK) - so an
+                // opaque pixel under a translucent polygon stays opaque (the compose reads this alpha)
+                glEnable(GL_BLEND);
+                glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
+                glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
+                glDepthMask(GL_FALSE);
+            }
             else { glDisable(GL_BLEND); glDepthMask(GL_TRUE); }
             curTex = tex; curBlend = blend; haveState = 1;
         }

@@ -115,6 +115,28 @@ static void bench_present(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
     }
     BENCH_TIME(fin, present_final(has3d));
     BENCH_TIME(all, present_draw(gc, tex3d, has3d));
+    // how much of the picture the compose marked as exactly the 3D (shown at full resolution), and the 3D's alpha
+    static uint8_t px[GC_W * 192 * 4];
+    glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
+    glReadPixels(0, 0, GC_W, 192, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    int marked = 0;
+    for (int i = 0; i < GC_W * 192; i++) marked += px[i * 4 + 3] < 128;
+    int a3[4] = {0, 0, 0, 0};   // the 3D buffer's alpha: 0, 1..247, 248..254, 255
+    if (tex3d) {
+        static uint8_t hp[SCREEN_W * 4];
+        extern GLuint vita_gl3d_fbo_of(GLuint tex);
+        GLuint f3 = vita_gl3d_fbo_of(tex3d);
+        if (f3) {
+            glBindFramebuffer(GL_FRAMEBUFFER, f3);
+            for (int y = 8; y < SCREEN_H; y += 16) {
+                glReadPixels(0, y, SCREEN_W, 1, GL_RGBA, GL_UNSIGNED_BYTE, hp);
+                for (int x = 0; x < SCREEN_W; x++) { int a = hp[x * 4 + 3]; a3[a == 0 ? 0 : a < 248 ? 1 : a < 255 ? 2 : 3]++; }
+            }
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    fprintf(stderr, "bench: full-resolution 3D on %d%% of the picture; 3D alpha (sampled): 0 %d, 1-247 %d, 248-254 %d, "
+            "255 %d\n", marked * 100 / (GC_W * 192), a3[0], a3[1], a3[2], a3[3]);
     glUseProgram(0);
     fprintf(stderr, "bench (GPU, us): compose old %llu, current %llu | diagnostics: 3D read only %llu, + 6 parameter "
             "reads %llu, all the compose's reads %llu, 200 ops in a branch not taken %llu, 200 ops %llu | present: "

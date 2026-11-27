@@ -339,6 +339,7 @@ static int present_fades(const Gpu2dGc *gc) {
     }
     if (!n) return 0;
     glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(sFillProg);
     glEnableVertexAttribArray((GLuint)sFillPos);
@@ -354,7 +355,8 @@ static int present_fades(const Gpu2dGc *gc) {
 static void present_final(int has3d) {
     if (has3d) {
         glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     } else
         glDisable(GL_BLEND);
     copy_quad(sPreTex, kFlatUv);
