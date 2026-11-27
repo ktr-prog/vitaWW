@@ -61,7 +61,8 @@ static const char kGcVertexShader[] =
     "vec3 blend3d(vec3 a, vec3 b, float al) { return floor((a * (al + 1.0) + b * (31.0 - al) + 16.0) / 32.0); }\n" \
     "vec3 brighten(vec3 c, float ev, float bias) { return c + floor(((63.0 - c) * ev + bias) / 16.0); }\n" \
     "vec3 darken(vec3 c, float ev, float bias) { return c - floor((c * ev + bias) / 16.0); }\n" \
-    "vec4 compose(vec2 fc, vec4 L0, vec4 L1, vec4 L2, vec4 L3, vec4 L4, vec4 L5) {\n" \
+    "vec4 compose(vec2 fc, vec4 L0, vec4 L1, vec4 L2, vec4 L3, vec4 L4, vec4 L5, vec4 pAux, vec4 p3d, vec4 pLg, vec4 pObj,\n" \
+    "             vec4 pBg0, vec4 pBg1, vec4 pBg2, vec4 pBg3) {\n" \
     "  L0 = floor(L0 + 0.5); L1 = floor(L1 + 0.5); L2 = floor(L2 + 0.5);\n" \
     "  L3 = floor(L3 + 0.5); L4 = floor(L4 + 0.5); L5 = floor(L5 + 0.5);\n" \
     "  float cx = floor(fc.x), y = floor(fc.y);\n" \
@@ -69,15 +70,15 @@ static const char kGcVertexShader[] =
     "  float in2d = x >= 0.0 && x < 256.0 ? 1.0 : 0.0;\n" \
     "  float x3 = floor((cx + 0.5) * u3dCols / uW);\n" \
     "  vec2 uv = vec2((x + 0.5) / 256.0, (y + 0.5) / 192.0);\n" \
-    "  if (uMirror > 0.5) return in2d > 0.5 ? vec4(texture2D(uLogo, uv).rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
+    "  if (uMirror > 0.5) return in2d > 0.5 ? vec4(pLg.rgb, 1.0) : vec4(0.0, 0.0, 0.0, 1.0);\n" \
     "  float pr0 = L0.x, pr1 = L0.y, pr2 = L0.z, pr3 = L0.w;\n" \
     "  float first = L1.x, second = L1.y, effect = L1.z, evy = L1.w;\n" \
     "  float eva = L2.x, evb = L2.y, mbm = L2.z, mbf = L2.w;\n" \
     "  vec3 bd = L3.xyz;\n" \
     "  float objOn = L4.x, on3d = L4.y, uni = L4.z;\n" \
-    "  vec4 ax = texture2D(uAux, uv);\n" \
+    "  vec4 ax = pAux;\n" \
     "  vec2 euv = vec2(x < 0.0 ? 0.5 / 256.0 : 255.5 / 256.0, uv.y);\n" \
-    "  float sideM = by(texture2D(uAux, euv).r);\n" \
+    "  float sideM = by(pAux.r);\n" \
     "  if (in2d < 0.5 && L4.w > 0.5) {\n" \
     "    float hr = L5.x;\n" \
     "    if (!(hr >= 0.0 && x >= 128.0 - hr && x < 128.0 + hr)) {\n" \
@@ -106,15 +107,15 @@ static const char kGcVertexShader[] =
        branch not taken costs nothing on the Vita's GPU; the arithmetic below is what costs). Written as if / else \
        with one return at the end: an early return made the compiler run the rest for every pixel anyway. Texture \
        reads in the Cg build are tex2Dlod (no gradients needed), so the branches can really be skipped. */ \
-    "  vec4 q = texture2D(u3d, vec2((x3 + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
+    "  vec4 q = p3d;\n" \
     "  float qa = floor(by(q.a) / 8.0);\n" \
     "  float lgOn = 0.0;\n" \
     "  if (uLogoOn > 0.5) {\n" \
     "    vec2 qlu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
-    "    vec4 qlg = texture2D(uLogo, qlu);\n" \
+    "    vec4 qlg = pLg;\n" \
     "    lgOn = qlg.a > 0.5 && qlu.x > 0.0 && qlu.x < 1.0 && qlu.y > 0.0 && qlu.y < 1.0 ? 1.0 : 0.0;\n" \
     "  }\n" \
-    "  float ofh = in2d > 0.5 ? by(texture2D(uObj, uv).a) : 0.0;\n" \
+    "  float ofh = in2d > 0.5 ? by(pObj.a) : 0.0;\n" \
     /* (2D pixels only behind an opaque 3D pixel do not stop the fast path: gc_line's 0x4000 in the obj texture, \
        where no sprite is; BG3 is checked here, by priority, as it may be shifted) */ \
     "  float cov2 = covMain < 0.5 || (ofh < 127.5 && ofh > 63.5 && qa > 30.5) ? 0.0 : 1.0;\n" \
@@ -147,7 +148,8 @@ static const char kGcVertexShader[] =
     "    } else if (x >= uObjMove.x && x < uObjMove.z) oin = 0.0;\n" \
     "  }\n" \
     "  if (covMain > 0.5) {\n" \
-    "    tv = texture2D(uObj, ouv);\n" \
+    "    tv = pObj;\n" \
+    "    if (ouv.x != uv.x) tv = texture2D(uObj, ouv);\n" \
     "    if (oin > 0.5 && objOn > 0.5 && by(tv.a) >= 128.0 && bitOf(om, 16.0) > 0.5) {\n" \
     "      k = gmod(oa, 4.0) * 8.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 4.0; a1 = 0.0;\n" \
@@ -158,13 +160,14 @@ static const char kGcVertexShader[] =
     "    if (on3d > 0.5) {\n" \
     "      float sx = x3 + L3.w;\n" \
     "      if (uHave3d > 0.5 && sx >= 0.0 && sx < u3dCols) {\n" \
-    "        vec4 q = texture2D(u3d, vec2((sx + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
+    "        vec4 q = p3d;\n" \
+    "        if (L3.w != 0.0) q = texture2D(u3d, vec2((sx + 0.5) / u3dTexW, (191.0 - y + 0.5) / 192.0));\n" \
     "        al = floor(by(q.a) / 8.0);\n" \
     "        c = floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0);\n" \
     "        on = al > 0.5 ? 1.0 : 0.0;\n" \
     "      }\n" \
     "    } else if (covMain > 0.5) {\n" \
-    "      tv = texture2D(uBg0, luv); on = use0 > 0.5 && by(tv.a) >= 128.0 ? 1.0 : 0.0; c = col15(by(tv.r), by(tv.a));\n" \
+    "      tv = pBg0; on = use0 > 0.5 && by(tv.a) >= 128.0 ? 1.0 : 0.0; c = col15(by(tv.r), by(tv.a));\n" \
     "    }\n" \
     "    if (on > 0.5) {\n" \
     "      k = pr0 * 8.0 + 1.0;\n" \
@@ -173,7 +176,7 @@ static const char kGcVertexShader[] =
     "    }\n" \
     "  }\n" \
     "  if (covMain > 0.5 && pr1 < 3.5 && bitOf(m, 2.0) > 0.5 && use1 > 0.5) {\n" \
-    "    tv = texture2D(uBg1, luv);\n" \
+    "    tv = pBg1;\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr1 * 8.0 + 2.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 1.0; a1 = 0.0; }\n" \
@@ -181,7 +184,7 @@ static const char kGcVertexShader[] =
     "    }\n" \
     "  }\n" \
     "  if (covMain > 0.5 && pr2 < 3.5 && bitOf(m, 4.0) > 0.5 && use2 > 0.5) {\n" \
-    "    tv = texture2D(uBg2, luv);\n" \
+    "    tv = pBg2;\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr2 * 8.0 + 3.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 2.0; a1 = 0.0; }\n" \
@@ -189,7 +192,7 @@ static const char kGcVertexShader[] =
     "    }\n" \
     "  }\n" \
     "  if (covBg3 > 0.5 && pr3 < 3.5 && bitOf(m, 8.0) > 0.5 && use3 > 0.5) {\n" \
-    "    tv = texture2D(uBg3, uv3);\n" \
+    "    tv = pBg3;\n" \
     "    if (by(tv.a) >= 128.0) {\n" \
     "      k = pr3 * 8.0 + 4.0; c = col15(by(tv.r), by(tv.a));\n" \
     "      if (k < k1) { k2 = k1; c2 = c1; l2 = l1; k1 = k; c1 = c; l1 = 3.0; a1 = 0.0; }\n" \
@@ -211,7 +214,7 @@ static const char kGcVertexShader[] =
     "  }\n" \
     "  if (uLogoOn > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
     "    vec2 lu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
-    "    vec4 lg = texture2D(uLogo, lu);\n" \
+    "    vec4 lg = pLg;\n" \
     "    if (lg.a > 0.5 && lu.x > 0.0 && lu.x < 1.0 && lu.y > 0.0 && lu.y < 1.0) { o = floor(lg.rgb * 63.0 + 0.5); pure = 0.0; }\n" \
     "  }\n" \
     "  if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) o = brighten(o, mbf, 0.0);\n" \
@@ -228,15 +231,26 @@ static const char kGcVertexShader[] =
     "}\n"
 
 #define GC_GMOD "float gmod(float a, float b) { return a - b * floor(a / b); }\n"
+// The layer samples compose() takes, read at coordinates worked out from the pixel position (the line-quad shaders)
+#define GC_DEP_PREFETCH \
+    "  float pcx = floor(fc.x), ppy = floor(fc.y), ppx = pcx - floor((uW - 256.0) / 2.0);\n" \
+    "  vec2 puv = vec2((ppx + 0.5) / 256.0, (ppy + 0.5) / 192.0);\n" \
+    "  vec4 pAux = texture2D(uAux, puv), pObj = texture2D(uObj, puv), pBg0 = texture2D(uBg0, puv);\n" \
+    "  vec4 pBg1 = texture2D(uBg1, puv), pBg2 = texture2D(uBg2, puv);\n" \
+    "  vec4 pBg3 = texture2D(uBg3, vec2((ppx - uBg3Shift + 0.5) / 256.0, puv.y));\n" \
+    "  vec4 pLg = texture2D(uLogo, puv - uLogoOfs / vec2(256.0, 192.0));\n" \
+    "  vec4 p3d = texture2D(u3d, vec2((floor((pcx + 0.5) * u3dCols / uW) + 0.5) / u3dTexW, (191.0 - ppy + 0.5) / 192.0));\n"
+#define GC_PARGS "pAux, p3d, pLg, pObj, pBg0, pBg1, pBg2, pBg3"
 static const char kGcFragmentShader[] =   // GLSL ES 1.00
     "precision highp float;\n" GC_GMOD "varying vec4 vL0, vL1, vL2, vL3, vL4, vL5;\n" GC_FRAGMENT_BODY
-    "void main() { gl_FragColor = compose(gl_FragCoord.xy, vL0, vL1, vL2, vL3, vL4, vL5); }\n";
+    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_DEP_PREFETCH
+    "  gl_FragColor = compose(fc, vL0, vL1, vL2, vL3, vL4, vL5, " GC_PARGS "); }\n";
 // Cg for vitaGL (GL_CG_*_SHADER_EXT: compiled by the Cg compiler as is, not through vitaGL's GLSL translator).
 static const char kGcFragmentShaderCg[] =
     "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD GC_FRAGMENT_BODY
     "float4 main(float4 fc : WPOS, float4 vL0 : TEXCOORD0, float4 vL1 : TEXCOORD1, float4 vL2 : TEXCOORD2,\n"
-    "            float4 vL3 : TEXCOORD3, float4 vL4 : TEXCOORD4, float4 vL5 : TEXCOORD5) : COLOR {\n"
-    "  return compose(fc.xy, vL0, vL1, vL2, vL3, vL4, vL5);\n"
+    "            float4 vL3 : TEXCOORD3, float4 vL4 : TEXCOORD4, float4 vL5 : TEXCOORD5) : COLOR {\n" GC_DEP_PREFETCH
+    "  return compose(fc.xy, vL0, vL1, vL2, vL3, vL4, vL5, " GC_PARGS ");\n"
     "}\n";
 static const char kGcVertexShaderCg[] =
     "void main(float2 aPos, float4 aL0, float4 aL1, float4 aL2, float4 aL3, float4 aL4, float4 aL5,\n"
@@ -342,41 +356,72 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
 // The compose drawn as one quad over the canvas, the per-line parameters read from a small texture the CPU fills
 // once per frame (gc_line_texels: 8 RGBA texels per line, already decoded - no per-pixel decoding). (One quad per
 // line carrying them as vertex attributes measured slower on the Vita: 1-pixel-high triangles.)
-#define GC_TEX_FETCH \
-    "  float lv = (floor(fc.y) + 0.5) / 192.0;\n" \
-    "  vec4 L0 = texture2D(uLp, vec2(0.5 / 8.0, lv)) * 255.0;\n" \
-    "  vec4 L1 = texture2D(uLp, vec2(1.5 / 8.0, lv)) * 255.0;\n" \
-    "  vec4 L2 = texture2D(uLp, vec2(2.5 / 8.0, lv)) * 255.0;\n" \
-    "  vec4 L3 = texture2D(uLp, vec2(3.5 / 8.0, lv)) * 255.0;\n" \
-    "  vec4 L4 = texture2D(uLp, vec2(4.5 / 8.0, lv)) * 255.0;\n" \
-    "  vec4 L5 = texture2D(uLp, vec2(5.5 / 8.0, lv)) * 255.0;\n" \
+// Every texture the compose reads for every pixel is read at a coordinate interpolated from the quad's corners
+// (the vertex shader works them out), used as is: the Vita's GPU fetches those before the fragment program runs.
+// A coordinate the fragment program computes makes it wait for each read in turn - that, not the arithmetic, is
+// what made the compose cost 13 ms. Sides of the 2D area: the layer textures clamp to their edge column, which is
+// the edge sample the compose wants there. uVFlip: the GPU's pixel rows run the other way from the quad's y (the
+// Vita: measured once at start, vita_gl.c), so the interpolated rows match gl_FragCoord's.
+#define GC_VARYINGS_GLSL "varying vec2 vUv, vUv3, v3d, vLg, vP0, vP1, vP2, vP3, vP4, vP5;\n"
+#define GC_VARY_FETCH(TEX) \
+    "  vec4 L0 = " TEX "(uLp, vP0) * 255.0;\n" \
+    "  vec4 L1 = " TEX "(uLp, vP1) * 255.0;\n" \
+    "  vec4 L2 = " TEX "(uLp, vP2) * 255.0;\n" \
+    "  vec4 L3 = " TEX "(uLp, vP3) * 255.0;\n" \
+    "  vec4 L4 = " TEX "(uLp, vP4) * 255.0;\n" \
+    "  vec4 L5 = " TEX "(uLp, vP5) * 255.0;\n" \
+    "  vec4 pAux = " TEX "(uAux, vUv), pObj = " TEX "(uObj, vUv), pBg0 = " TEX "(uBg0, vUv);\n" \
+    "  vec4 pBg1 = " TEX "(uBg1, vUv), pBg2 = " TEX "(uBg2, vUv), pBg3 = " TEX "(uBg3, vUv3);\n" \
+    "  vec4 pLg = " TEX "(uLogo, vLg), p3d = " TEX "(u3d, v3d);\n" \
     "  float lfast = L3.w;\n" \
     "  L3.w = L5.x + L5.y * 256.0 - 1024.0;\n" \
     "  L5 = vec4(L5.z + L5.w * 256.0 - 1024.0, lfast, 0.0, 0.0);\n"
+#define GC_VS_BODY \
+    "  float px = (aPos.x + 1.0) * 0.5 * uVW;\n" \
+    "  float py = uVFlip > 0.5 ? (1.0 - aPos.y) * 96.0 : (aPos.y + 1.0) * 96.0;\n" \
+    "  float xx = px - floor((uVW - 256.0) / 2.0);\n" \
+    "  vUv = vec2(xx / 256.0, py / 192.0);\n" \
+    "  vUv3 = vec2((xx - uVBg3Shift) / 256.0, py / 192.0);\n" \
+    "  v3d = vec2(px * uV3dCols / uVW / uV3dTexW, (192.0 - py) / 192.0);\n" \
+    "  vLg = vUv - uVLogoOfs / vec2(256.0, 192.0);\n" \
+    "  vP0 = vec2(0.5 / 8.0, py / 192.0); vP1 = vec2(1.5 / 8.0, py / 192.0); vP2 = vec2(2.5 / 8.0, py / 192.0);\n" \
+    "  vP3 = vec2(3.5 / 8.0, py / 192.0); vP4 = vec2(4.5 / 8.0, py / 192.0); vP5 = vec2(5.5 / 8.0, py / 192.0);\n"
 static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
-    "precision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
-    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_TEX_FETCH
-    "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5); }\n";
+    "precision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_VARYINGS_GLSL GC_FRAGMENT_BODY
+    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_VARY_FETCH("texture2D")
+    "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5, " GC_PARGS "); }\n";
 static const char kGcqFastFragmentShader[] =   // (the first pass: GC_FASTONLY)
-    "#define GC_FASTONLY 1\nprecision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
-    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_TEX_FETCH
-    "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5); }\n";
+    "#define GC_FASTONLY 1\nprecision highp float;\n" GC_GMOD "uniform sampler2D uLp;\n" GC_VARYINGS_GLSL GC_FRAGMENT_BODY
+    "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_VARY_FETCH("texture2D")
+    "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5, " GC_PARGS "); }\n";
 static const char kGcqVertexShader[] =
-    "attribute vec2 aPos;\nvoid main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+    "attribute vec2 aPos;\nuniform float uVW, uV3dCols, uV3dTexW, uVBg3Shift, uVFlip;\nuniform vec2 uVLogoOfs;\n"
+    GC_VARYINGS_GLSL "void main() { gl_Position = vec4(aPos, 0.0, 1.0);\n" GC_VS_BODY "}\n";
+#define GC_CG_FS_MAIN \
+    "float4 main(float4 fc : WPOS, float2 vUv : TEXCOORD0, float2 vUv3 : TEXCOORD1, float2 v3d : TEXCOORD2,\n" \
+    "            float2 vLg : TEXCOORD3, float2 vP0 : TEXCOORD4, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6,\n" \
+    "            float2 vP3 : TEXCOORD7, float2 vP4 : TEXCOORD8, float2 vP5 : TEXCOORD9) : COLOR {\n" GC_VARY_FETCH("tex2D") \
+    "  return compose(fc.xy, L0, L1, L2, L3, L4, L5, " GC_PARGS ");\n" \
+    "}\n"
 static const char kGcqFragmentShaderCg[] =
     "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
-    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
-    "float4 main(float4 fc : WPOS) : COLOR {\n" GC_TEX_FETCH
-    "  return compose(fc.xy, L0, L1, L2, L3, L4, L5);\n"
-    "}\n";
+    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY GC_CG_FS_MAIN;
 static const char kGcqFastFragmentShaderCg[] =
     "#define GC_FASTONLY 1\n#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
-    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
-    "float4 main(float4 fc : WPOS) : COLOR {\n" GC_TEX_FETCH
-    "  return compose(fc.xy, L0, L1, L2, L3, L4, L5);\n"
-    "}\n";
+    "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY GC_CG_FS_MAIN;
 static const char kGcqVertexShaderCg[] =
-    "void main(float2 aPos, out float4 oPos : POSITION) { oPos = float4(aPos, 0.0, 1.0); }\n";
+    "#define vec2 float2\n"
+    "void main(float2 aPos, uniform float uVW, uniform float uV3dCols, uniform float uV3dTexW, uniform float uVBg3Shift,\n"
+    "          uniform float uVFlip, uniform float2 uVLogoOfs, out float4 oPos : POSITION, out float2 vUv : TEXCOORD0,\n"
+    "          out float2 vUv3 : TEXCOORD1, out float2 v3d : TEXCOORD2, out float2 vLg : TEXCOORD3, out float2 vP0 : TEXCOORD4,\n"
+    "          out float2 vP1 : TEXCOORD5, out float2 vP2 : TEXCOORD6, out float2 vP3 : TEXCOORD7, out float2 vP4 : TEXCOORD8,\n"
+    "          out float2 vP5 : TEXCOORD9) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0);\n" GC_VS_BODY "}\n";
+// (Vita, once at start) which way the GPU's pixel rows run against the quad's y: red 1 where they agree
+static const char kFlipCalFragmentCg[] =
+    "float4 main(float4 fc : WPOS, float2 vUv : TEXCOORD0) : COLOR {\n"
+    "  return float4(abs(floor(vUv.y * 192.0) - floor(fc.y)) < 0.5 ? 1.0 : 0.0, 0.0, 0.0, 1.0);\n"
+    "}\n";
 // That texture's contents: per line 8 RGBA8 texels = aL0..aL5's values (gc_line_params), with L3.w and L5.x (signed,
 // beyond a byte) as value + 1024 in texel 5's bytes (lo, hi).
 static inline void gc_line_texels(const unsigned char *par, int parStride, float u3dCols, unsigned char (*o)[8][4]) {

@@ -989,10 +989,17 @@ static void render_frame_mt(void) {
         {   // what is seen as stutter: refreshes of the screen that showed the same picture again
             extern int gVitaGpuProbed;
             extern uint64_t gVitaGpu3dNs, gVitaGpuComposeNs, gVitaGpuPresentNs;
-            if (__atomic_exchange_n(&gVitaGpuProbed, 0, __ATOMIC_ACQUIRE))
+            if (__atomic_exchange_n(&gVitaGpuProbed, 0, __ATOMIC_ACQUIRE)) {
                 fprintf(stderr, "gpu (one frame, the GPU waited for after each pass): 3d %llu us, compose %llu us, "
                         "present %llu us\n", (unsigned long long)(gVitaGpu3dNs / 1000),
                         (unsigned long long)(gVitaGpuComposeNs / 1000), (unsigned long long)(gVitaGpuPresentNs / 1000));
+                    extern void vita_gl_gc_times(uint64_t *one, uint64_t *two, uint64_t *first, int *usingTwo);
+                    uint64_t one, two, firstp; int u;
+                    vita_gl_gc_times(&one, &two, &firstp, &u);
+                    if (one) fprintf(stderr, "gpu compose: one pass %llu us, two passes %llu us (first pass %llu us) - "
+                                     "using %s\n", (unsigned long long)(one / 1000), (unsigned long long)(two / 1000),
+                                     (unsigned long long)(firstp / 1000), u ? "two" : "one");
+            }
             extern unsigned gVitaRepeats;
             fprintf(stderr, "display: %u refreshes repeated the previous picture (last 60 frames)\n",
                     __atomic_exchange_n(&gVitaRepeats, 0, __ATOMIC_RELAXED));

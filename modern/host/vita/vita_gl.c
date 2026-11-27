@@ -133,7 +133,10 @@ static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;
 // runs under the depth test, so the GPU shades it only where the first pass wrote nothing (the depth test rejects
 // pixels before shading). One shader with an if/else ran the full arithmetic for every pixel on the Vita (13 ms).
 static GLuint sGcFastProg, sGcDepthRb;
-static GLint sGcFastAttr = -1;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
+static GLint sGcFastAttr = -1;
+static float sGcFlip;      // the GPU's pixel rows against the quad's y (measured at start: gc_flip_measure)
+static int sGcTwoPass;     // the two-pass compose is the faster one (measured on the probe frames)
+static uint64_t sGcOneNs, sGcTwoNs, sGcFirstNs;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
 static GLint sGcAttr = -1, sGcHave3d = -1, sGcOvlOn = -1;
 static GLuint sGcLp[2];   // the per-line parameters, decoded (gpu2d_compose.h gc_line_texels): one per layer set
 // The composed canvas is the Vita screen's 30:17 at the DS's 192 lines (339 / 192 = 1.7656, 960 / 544 = 1.7647: the
@@ -235,6 +238,10 @@ static void gc_static_uniforms(GLuint prog) {
     glUniform1f(glGetUniformLocation(prog, "u3dTexW"), (float)GC_W);
     static const char *const kNames[11] = {"uBg0", "uBg1", "uBg2", "uBg3", "uObj", "uAux", "uPar", "uOvl", "u3d", "uLogo", "uLp"};
     for (int i = 0; i < 11; i++) glUniform1i(glGetUniformLocation(prog, kNames[i]), i);
+    // (the vertex shader's copies: it works out the coordinates the fragment program reads at)
+    glUniform1f(glGetUniformLocation(prog, "uVW"), (float)GC_W);
+    glUniform1f(glGetUniformLocation(prog, "uV3dCols"), (float)GC_W);
+    glUniform1f(glGetUniformLocation(prog, "uV3dTexW"), (float)GC_W);
     glUseProgram(0);
 }
 // This frame's compose uniforms (vita_gl_present_gc), set on whichever compose program draws.
@@ -248,6 +255,9 @@ static void gc_frame_uniforms(GLuint prog) {
     glUniform2f(glGetUniformLocation(prog, "uLogoOfs"), sGcU.ofs[0], sGcU.ofs[1]);
     glUniform1f(glGetUniformLocation(prog, "uBg3Shift"), sGcU.bg3);
     glUniform4f(glGetUniformLocation(prog, "uObjMove"), sGcU.mv[0], sGcU.mv[1], sGcU.mv[2], sGcU.mv[3]);
+    glUniform2f(glGetUniformLocation(prog, "uVLogoOfs"), sGcU.ofs[0], sGcU.ofs[1]);
+    glUniform1f(glGetUniformLocation(prog, "uVBg3Shift"), sGcU.bg3);
+    glUniform1f(glGetUniformLocation(prog, "uVFlip"), sGcFlip);
     glUniform1f(glGetUniformLocation(prog, "uObjShift"), sGcU.objShift);
 }
 // The present, built from plain texture copies and the GPU's blending (per-pixel arithmetic at the screen's
@@ -410,6 +420,35 @@ static void present_draw(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
     present_final(has3d, smooth);
     glUseProgram(0);
 }
+// Which way the GPU numbers the pixel rows of the canvas against the quad's y: draw the measuring program into the
+// canvas and read a pixel back (red: they agree). The compose's interpolated coordinates follow it.
+static void gc_flip_measure(void) {
+    GLuint p = cached_program(kGcqVertexShaderCg, kFlipCalFragmentCg, "flipcal");
+    if (!p) { fprintf(stderr, "vita_gl: GPU compose: no row-direction check (assuming the GL direction)\n"); return; }
+    GLint a = glGetAttribLocation(p, "aPos");
+    if (a < 0) return;
+    gc_static_uniforms(p);
+    glUseProgram(p);
+    glUniform1f(glGetUniformLocation(p, "uVFlip"), 0.0f);
+    glUniform2f(glGetUniformLocation(p, "uVLogoOfs"), 0.0f, 0.0f);
+    glUniform1f(glGetUniformLocation(p, "uVBg3Shift"), 0.0f);
+    static const float kQ[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
+    glViewport(0, 0, GC_W, 192);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDisable(GL_SCISSOR_TEST); glDisable(GL_CULL_FACE);
+    glEnableVertexAttribArray((GLuint)a);
+    glVertexAttribPointer((GLuint)a, 2, GL_FLOAT, GL_FALSE, 0, kQ);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)a);
+    unsigned char px[2][4] = {{0}};
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px[0]);
+    glReadPixels(GC_W / 2, 100, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px[1]);
+    glUseProgram(0);
+    sGcFlip = px[0][0] < 128 ? 1.0f : 0.0f;
+    fprintf(stderr, "vita_gl: GPU compose: pixel rows %s the quad's y (check %u %u)\n",
+            sGcFlip > 0.5f ? "run against" : "follow", px[0][0], px[1][0]);
+}
 int vita_gl_gc_init(void) {
     if (sGcState) return sGcState > 0;
     sGcState = -1;
@@ -492,12 +531,45 @@ int vita_gl_gc_init(void) {
         glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sGcDepthRb);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    gc_flip_measure();
     sGcState = 1;
     gVitaGc = 1;
     fprintf(stderr, "vita_gl: GPU compose on (2D layers + 3D blended on the GPU)\n");
     return 1;
 }
 
+// The compose's draw into the canvas: one pass, or (two) the fast pixels first, marking them in the depth buffer,
+// then the full compose only where the first pass wrote nothing. timed: wait for the GPU after each pass.
+static void gc_draw(const float *quad, int two, int timed) {
+    if (two) {
+        uint64_t t = host_plat_time_ns();
+        glClearDepthf(1.0f);
+        glDepthMask(GL_TRUE);
+        glClear(GL_DEPTH_BUFFER_BIT);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_ALWAYS);
+        gc_frame_uniforms(sGcFastProg);
+        glUseProgram(sGcFastProg);
+        glEnableVertexAttribArray((GLuint)sGcFastAttr);
+        glVertexAttribPointer((GLuint)sGcFastAttr, 2, GL_FLOAT, GL_FALSE, 0, quad);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glDisableVertexAttribArray((GLuint)sGcFastAttr);
+        if (timed) { glFinish(); sGcFirstNs = host_plat_time_ns() - t; }
+        glDepthFunc(GL_LESS);
+        glDepthMask(GL_FALSE);
+    }
+    gc_frame_uniforms(sGcProg);
+    glUseProgram(sGcProg);
+    glEnableVertexAttribArray((GLuint)sGcAttr);
+    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, quad);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)sGcAttr);
+    if (timed) glFinish();
+    if (two) { glDisable(GL_DEPTH_TEST); glDepthFunc(GL_LESS); }
+}
+void vita_gl_gc_times(uint64_t *one, uint64_t *two, uint64_t *first, int *usingTwo) {
+    *one = sGcOneNs; *two = sGcTwoNs; *first = sGcFirstNs; *usingTwo = sGcTwoPass;
+}
 // Compose gc + the 3D colour buffer tex3d (0: none yet) into the canvas texture and present it. ovl: the FPS
 // overlay rows (256x16, alpha byte 0 = overlay pixel) or NULL.
 void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) {
@@ -586,28 +658,18 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, sGcFbo);
     glViewport(0, 0, GC_W, 192);
-    if (sGcFastProg) {   // the fast pixels first, marking them in the depth buffer
-        glClearDepthf(1.0f);
-        glDepthMask(GL_TRUE);
-        glClear(GL_DEPTH_BUFFER_BIT);
-        glEnable(GL_DEPTH_TEST);
-        glDepthFunc(GL_ALWAYS);
-        gc_frame_uniforms(sGcFastProg);
-        glUseProgram(sGcFastProg);
-        glEnableVertexAttribArray((GLuint)sGcFastAttr);
-        glVertexAttribPointer((GLuint)sGcFastAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        glDisableVertexAttribArray((GLuint)sGcFastAttr);
-        glDepthFunc(GL_LESS);   // then the full compose only where the first pass wrote nothing
-        glDepthMask(GL_FALSE);
-    }
-    gc_frame_uniforms(sGcProg);
-    glUseProgram(sGcProg);
-    glEnableVertexAttribArray((GLuint)sGcAttr);
-    glVertexAttribPointer((GLuint)sGcAttr, 2, GL_FLOAT, GL_FALSE, 0, kQuad);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableVertexAttribArray((GLuint)sGcAttr);
-    if (sGcFastProg) { glDisable(GL_DEPTH_TEST); glDepthFunc(GL_LESS); }
+    if (probe && sGcFastProg) {   // both ways, each waited for: keep the faster for the frames that follow
+        uint64_t ta = host_plat_time_ns();
+        gc_draw(kQuad, 0, 0);
+        glFinish();
+        uint64_t tb = host_plat_time_ns();
+        gc_draw(kQuad, 1, 1);
+        uint64_t tc = host_plat_time_ns();
+        sGcOneNs = tb - ta; sGcTwoNs = tc - tb;
+        sGcTwoPass = sGcTwoNs < sGcOneNs;
+    } else
+        gc_draw(kQuad, sGcFastProg && sGcTwoPass, 0);
+
     if (sOvlNow) {   // the menu over the scene, in the DS columns of the canvas (row 0 = DS line 0, as the compose)
         if (!sOvlProg) {
             sOvlProg = cached_program(kMenuVertexShaderCg, kMenuFragmentShaderCg, "menu");
