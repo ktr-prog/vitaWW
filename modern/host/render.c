@@ -1,4 +1,5 @@
 
+#include "host_features.h"
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -709,8 +710,10 @@ static void render_worker_phase(void) {
         if (gc) {   // composed on the GPU: the 2D layers + this frame's 3D colour buffer
             static uint32_t ovl[256 * 16];
             for (int i = 0; i < 256 * 16; i++) ovl[i] = 0x01000000u;   // (alpha byte 0 = an overlay pixel)
-            overlay_fps(ovl);
-            vita_gl_present_gc(gc, vita_gl3d_frame_tex(), ovl);
+            // the FPS counter only when the options ask for it (its rows otherwise cost the compose for nothing)
+            const int fpsOn = feature_on(FEAT_FPS);
+            if (fpsOn) overlay_fps(ovl);
+            vita_gl_present_gc(gc, vita_gl3d_frame_tex(), fpsOn ? ovl : NULL);
         } else {
             int rows = 0;
             const uint32_t *c = gpu2d_canvas(&rows);
@@ -999,9 +1002,12 @@ static void render_frame_mt(void) {
                     if (one) fprintf(stderr, "gpu compose: one quad %llu us, tiles %llu us (%d of 432 tiles the fast program) - "
                                      "using %s\n", (unsigned long long)(one / 1000), (unsigned long long)(tiles / 1000), ft,
                                      u ? "tiles" : "one quad");
-                    extern void vita_gl_gc_why(int w[8]);
+                    extern void vita_gl_gc_why(int w[8], float f[4]);
                     int w[8];
-                    vita_gl_gc_why(w);
+                    float f[4];
+                    vita_gl_gc_why(w, f);
+                    if (one) fprintf(stderr, "gpu compose frame: 3D %.0f, logo %.0f, boot mirror %.0f, prompt shift %.0f\n",
+                                     f[0], f[1], f[2], f[3]);
                     if (one) fprintf(stderr, "gpu compose tiles, lines (of 192): whole frame %d, effects %d, iris %d, "
                                      "overlay/clock %d, 2D across %d, both sides %d, no 3D %d, 3D shifted %d\n",
                                      w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
