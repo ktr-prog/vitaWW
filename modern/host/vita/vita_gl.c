@@ -121,6 +121,10 @@ static void present_swap(void);
 // straight into the canvas texture (gpu2d_compose.h): no 3D readback, no CPU compose, no canvas upload.
 extern uint64_t host_plat_time_ns(void);
 unsigned gVitaRepeats;   // display refreshes that repeated a picture (render.c reports it)
+unsigned gVitaRepeatsTotal;   // (never reset: vita_gl3d.c's GPU probe)
+// GPU time probe (vita_gl3d.c starts it): a frame drawn with the GPU waited for after each pass, logged.
+uint64_t gVitaGpu3dNs, gVitaGpuComposeNs, gVitaGpuPresentNs;
+int gVitaGpuProbe, gVitaGpuProbed;
 unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents, gVitaFrameSwapNs;   // present split (reported with the 3D stats)
 int gVitaGc;   // GPU compose active (also tells the 3D renderer to skip its readback)
 static GLuint sGcProg, sGcTex[2][8], sGcCanvas, sGcFbo;   // two layer sets (alternating per frame: one may still be read by the GPU) + the RGBA canvas
@@ -294,6 +298,9 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
     if (!sReady || sGcState <= 0) return;
     static int first = 1;
     if (first) fprintf(stderr, "vita_gl: GPU compose: first frame\n");
+    const int probe = gVitaGpuProbe;   // (vita_gl3d.c waited for the GPU before this frame's 3D)
+    uint64_t tp = 0;
+    if (probe) { tp = host_plat_time_ns(); glFinish(); gVitaGpu3dNs = host_plat_time_ns() - tp; }
     uint64_t t0 = host_plat_time_ns();
     GLuint *t = sGcTex[gc->set & 1];   // the bands wrote this set's texture memory directly
     for (int i = 0; i < 7; i++) {
@@ -398,6 +405,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             glDisableVertexAttribArray((GLuint)sOvlTex);
         }
     }
+    if (probe) { tp = host_plat_time_ns(); glFinish(); gVitaGpuComposeNs = host_plat_time_ns() - tp; }
     gVitaComposeNs += host_plat_time_ns() - t0;
     glUseProgram(0);
     glDepthMask(GL_TRUE);
@@ -441,6 +449,11 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         glDisableVertexAttribArray((GLuint)sBlitPos);
         glDisableVertexAttribArray((GLuint)sBlitTex);
         glUseProgram(0);
+        if (probe) {
+            tp = host_plat_time_ns(); glFinish(); gVitaGpuPresentNs = host_plat_time_ns() - tp;
+            gVitaGpuProbe = 0;
+            __atomic_store_n(&gVitaGpuProbed, 1, __ATOMIC_RELEASE);
+        }
         present_swap();
     } else
         blit_canvas(sGcFbo, 0, 0, GC_W, 192);
@@ -499,7 +512,7 @@ static void do_swap(void) {
         extern unsigned host_vita_vcount(void);
         static unsigned last;
         unsigned vc = host_vita_vcount();
-        if (last && vc - last > 1) gVitaRepeats += vc - last - 1;
+        if (last && vc - last > 1) { gVitaRepeats += vc - last - 1; gVitaRepeatsTotal += vc - last - 1; }
         last = vc;
     }
 }

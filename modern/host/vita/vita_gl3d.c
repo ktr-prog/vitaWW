@@ -245,6 +245,18 @@ unsigned vita_gl3d_frame_tex(void) { return sReady && sPrevDraw >= 0 ? sColorTex
 void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) {
     if (!sEnabled || !out) return;
     lazy_init();
+    {   // the GPU time probe (vita_gl.c): when the display repeated pictures in the last 300 3D frames, one frame
+        // starts its 3D with the GPU idle and waits for the GPU after each pass, so the log says which pass the GPU
+        // time goes to. (That frame is late itself; five at most.)
+        extern int gVitaGpuProbe;
+        extern unsigned gVitaRepeatsTotal;
+        static unsigned n, seen, probes;
+        if (++n % 300 == 0) {
+            unsigned rep = gVitaRepeatsTotal;
+            if (rep != seen && probes < 5) { glFinish(); gVitaGpuProbe = 1; probes++; }
+            seen = rep;
+        }
+    }
     uint64_t tSync = host_plat_time_ns();
     gG3FrameTexNs = gG3FrameUploads = 0;
     // Group the polygons by texture once (a hash of texparam/texpal, O(n)): each distinct texture is synced,
