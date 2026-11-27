@@ -178,6 +178,20 @@ int FSi_StrNICmp(const char *a, const char *b, u32 n) {
 void FSi_ReadTable(FSStream *s, void *dst, u32 len) {
     FSArc *arc = s->arc;
     int r;
+#ifdef HOST
+    {   // (host) the ROM archive's file tables are in memory: read them directly. A path lookup reads the name table
+        // a few bytes at a time, and going through the card task thread for each piece made a scene load's file
+        // lookups take hundreds of milliseconds on slow hosts.
+        extern int FSi_ReadRomCallback(FSArc *, void *, u32, u32);
+        extern u32 data_021ff220;
+        extern void host_card_read(u32 addr, void *dst, u32 n);
+        if (arc->read == FSi_ReadRomCallback) {
+            host_card_read(s->pos + data_021ff220, dst, len);
+            s->pos += len;
+            return;
+        }
+    }
+#endif
     arc->flag |= 0x200;
     r = arc->read(arc, dst, s->pos, len);
     switch (r) {

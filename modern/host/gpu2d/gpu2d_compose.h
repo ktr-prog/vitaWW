@@ -114,7 +114,12 @@ static const char kGcVertexShader[] =
     "    vec4 qlg = texture2D(uLogo, qlu);\n" \
     "    lgOn = qlg.a > 0.5 && qlu.x > 0.0 && qlu.x < 1.0 && qlu.y > 0.0 && qlu.y < 1.0 ? 1.0 : 0.0;\n" \
     "  }\n" \
-    "  float fast = L5.y > 0.5 && covMain < 0.5 && covBg3 < 0.5 && bitOf(m, 1.0) > 0.5 && uHave3d > 0.5 &&\n" \
+    "  float ofh = in2d > 0.5 ? by(texture2D(uObj, uv).a) : 0.0;\n" \
+    /* (2D pixels only behind an opaque 3D pixel do not stop the fast path: gc_line's 0x4000 in the obj texture, \
+       where no sprite is; BG3 is checked here, by priority, as it may be shifted) */ \
+    "  float cov2 = covMain < 0.5 || (ofh < 127.5 && ofh > 63.5 && qa > 30.5) ? 0.0 : 1.0;\n" \
+    "  float cov3 = covBg3 < 0.5 || (pr3 > pr0 - 0.5 && qa > 30.5) ? 0.0 : 1.0;\n" \
+    "  float fast = L5.y > 0.5 && cov2 < 0.5 && cov3 < 0.5 && bitOf(m, 1.0) > 0.5 && uHave3d > 0.5 &&\n" \
     "      !(uOvlOn > 0.5 && y < 16.0 && in2d > 0.5) && !(uObjShift > 0.5 && y >= uObjMove.y && y < uObjMove.w) &&\n" \
     "      (qa > 30.5 || qa < 0.5) && lgOn < 0.5 ? 1.0 : 0.0;\n" \
     "  vec4 res;\n" \

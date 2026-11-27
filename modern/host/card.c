@@ -50,7 +50,10 @@ void card_control_written(u32 ctrl) {
 }
 
 void host_card_read(u32 addr, void *dst, u32 n) {
-    for (u32 i = 0; i < n; i++) ((u8 *)dst)[i] = addr + i < sRomSize ? sRom[addr + i] : 0xff;
+    u32 have = addr < sRomSize ? sRomSize - addr : 0;
+    if (have > n) have = n;
+    memcpy(dst, sRom + addr, have);
+    memset((u8 *)dst + have, 0xff, n - have);
 }
 
 u32 card_read_data(void) {

@@ -127,7 +127,82 @@ static u64 sWorstFrameNs, sPaceLast;   // longest frame-to-frame time (since the
 unsigned long long gHoFrameWaitNs, gHoFrameNs;   // render.c: the last frame's hand-off (of which waiting for the render thread)
 static u64 sWorstWaitNs, sWorstHoNs;   // the longest frame's hand-off (of which waiting for the render thread)
 static int sPaused;
+#if !HOST_VITA && defined(__linux__)
+// (host profiling) ACWW_PROF_FRAME=N: samples the game thread's program counter during frame N (100 us SIGPROF) and
+// prints the busiest functions.
+#include <signal.h>
+#include <sys/time.h>
+#include <ucontext.h>
+#include <dlfcn.h>
+#include <pthread.h>
+static uintptr_t sProfPc[200000];
+static volatile int sProfN;
+static pthread_t sProfThread;
+static timer_t sProfTimer;
+#include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <execinfo.h>
+static void *sProfBt[20000][8];
+static int sProfBtN[20000];
+static void prof_sig(int sig, siginfo_t *si, void *uc) {
+    (void)sig; (void)si;
+    if (!pthread_equal(pthread_self(), sProfThread) || sProfN >= 20000) return;
+    sProfBtN[sProfN] = getenv("ACWW_PROF_BT") ? backtrace(sProfBt[sProfN], 8) : 0;
+    sProfPc[sProfN++] = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+}
+static int prof_cmp(const void *a, const void *b) { uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b; return x < y ? -1 : x > y; }
+static void prof_dump(u64 ms) {
+    static uintptr_t fn[200000];
+    int n = sProfN;
+    for (int i = 0; i < n; i++) { Dl_info d; fn[i] = dladdr((void *)sProfPc[i], &d) && d.dli_saddr ? (uintptr_t)d.dli_saddr : sProfPc[i] & ~(uintptr_t)63; }
+    qsort(fn, (size_t)n, sizeof *fn, prof_cmp);
+    fprintf(stderr, "prof: frame %llu took %llu ms, %d samples\n", (unsigned long long)host_frame(), (unsigned long long)ms, n);
+    struct { uintptr_t f; int c; } top[25] = {{0}};
+    for (int i = 0; i < n;) {
+        int j = i; while (j < n && fn[j] == fn[i]) j++;
+        int c = j - i;
+        for (int k = 0; k < 25; k++) if (c > top[k].c) { memmove(&top[k + 1], &top[k], (size_t)(24 - k) * sizeof top[0]); top[k].f = fn[i]; top[k].c = c; break; }
+        i = j;
+    }
+    Dl_info d0; dladdr((void *)prof_dump, &d0);
+    for (int k = 0; k < 25 && top[k].c; k++) { Dl_info d; const char *nm = dladdr((void *)top[k].f, &d) && d.dli_sname ? d.dli_sname : "?"; fprintf(stderr, "prof: %5d %s (+%#lx)\n", top[k].c, nm, (unsigned long)(top[k].f - (uintptr_t)d0.dli_fbase)); }
+    if (getenv("ACWW_PROF_BT")) for (int i = 0; i < n; i++) {
+        fprintf(stderr, "bt:");
+        for (int j = 2; j < sProfBtN[i]; j++) { Dl_info d; fprintf(stderr, " %s", dladdr(sProfBt[i][j], &d) && d.dli_sname ? d.dli_sname : "?"); }
+        fprintf(stderr, "\n");
+    }
+}
+// ACWW_PROF_SLOW_MS=N: sample the game thread all the time; a frame longer than N ms prints its busiest functions.
+static void prof_frame(void) {
+    static long ms = -2;
+    static u64 t0;
+    if (ms == -2) ms = getenv("ACWW_PROF_SLOW_MS") ? atol(getenv("ACWW_PROF_SLOW_MS")) : -1;
+    if (ms < 0) return;
+    static int started;
+    if (!started) {
+        started = 1;
+        sProfThread = pthread_self();
+        struct sigaction sa = {0};
+        sa.sa_sigaction = prof_sig; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigaction(SIGPROF, &sa, NULL);
+        struct sigevent se = {0};
+        se.sigev_notify = 4 /* SIGEV_THREAD_ID */; se.sigev_signo = SIGPROF;
+        se._sigev_un._tid = (int)syscall(186 /* gettid */);
+        timer_create(CLOCK_MONOTONIC, &se, &sProfTimer);
+        struct itimerspec its = {{0, 100000}, {0, 100000}};
+        timer_settime(sProfTimer, 0, &its, NULL);
+    }
+    u64 t = host_plat_time_ns();
+    if (t0 && t - t0 > (u64)ms * 1000000u) prof_dump((t - t0) / 1000000u);
+    sProfN = 0;
+    t0 = host_plat_time_ns();
+}
+#else
+static void prof_frame(void) {}
+#endif
 static void host_pace_frame(void) {
+    prof_frame();
     {
         static u64 last, limit;
         static int reports, maxReports;

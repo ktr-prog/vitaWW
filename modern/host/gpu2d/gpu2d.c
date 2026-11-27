@@ -1239,14 +1239,26 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     for (int n = 0; n < 3; n++)
         if (p[n] != 4 && !(n == 0 && (dispcnt & 8))) cb[ncb++] = e->bg[n];
     const int cov3 = p[3] != 4;
+    // BG1/BG2 that, when opaque, are in front of the 3D (a lower priority number; at equal priority BG0 wins)
+    const u16 *fr[2];
+    int nfr = 0;
+    if (dispcnt & 8)
+        for (int n = 1; n < 3; n++)
+            if (p[n] != 4 && p[n] < p[0]) fr[nfr++] = e->bg[n];
+    u8 behind[SCREEN_W];
     for (int x = 0; x < SCREEN_W; x++) {
         u16 a = mask[x];
         for (int i = 0; i < ncb; i++)
             if (cb[i][x] & PIX_OPAQUE) { a |= 0x80; break; }
         if (cov3 && (e->bg[3][x] & PIX_OPAQUE)) a |= 0x40;
         ax[x] = a;
+        int front = 0;
+        for (int i = 0; i < nfr; i++) front |= fr[i][x] & PIX_OPAQUE;
+        behind[x] = (dispcnt & 8) && (a & 0x80) && !front;
     }
-    memset(oc, 0, SCREEN_W * sizeof *oc);
+    // A pixel whose only 2D pixels (of BG 0-2) are behind an opaque 3D pixel: the obj texture's 0x4000 where there is
+    // no sprite (a sprite's own entry has 0x8000) - the compose's fast path may take it when the 3D there is opaque.
+    for (int x = 0; x < SCREEN_W; x++) oc[x] = behind[x] ? 0x4000 : 0;
     if (dispcnt & 0x1000) {
         for (int x = obj->lo < 0 ? 0 : obj->lo, xe = obj->hi > SCREEN_W ? SCREEN_W : obj->hi; x < xe; x++) {
             if (!obj->source[x]) continue;

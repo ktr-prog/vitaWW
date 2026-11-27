@@ -87,6 +87,12 @@ extern "C" void ScreenFade_VBlank() {
 extern "C" void IrisWipe_HBlank() {
     volatile u16 *r = (volatile u16 *)0x4000000;
     u32 line = IO_R(&r[3]);
+#ifdef HOST
+    // (host) the hblank after line L sets the window for line L + 1: take that line's row of the table, so the
+    // window's circle sits on the same lines as the one drawn beside the 2D on a wide screen (line 0's row is set
+    // at vblank). The DS's table is one row behind, which the side circle showed as a line out of step.
+    line++;
+#endif
     if ((s32)line < 0xc0) {
 #ifdef HOST
         u16 top = sIrisWipeActiveTable[line], bottom = sIrisWipeActiveTable[0xc0 + line];
@@ -251,6 +257,9 @@ extern "C" void IrisWipe_SwapTables() {
     }
 #ifdef HOST
     gHostIrisRadius = sIrisTableRadius[sIrisWipeActiveTable == sIrisWipeTableA ? 0 : 1];
+    // (host) line 0's window: the vblank IRQ set it from the table shown before this swap, so the frame's first
+    // line showed last frame's circle - one line out of step with the rest of the picture. Set it from the new one.
+    if (sIrisWipeFlags & 1) IrisWipe_VBlankRegs();
 #endif
 }
 
