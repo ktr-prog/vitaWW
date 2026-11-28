@@ -250,18 +250,31 @@ static void gc_static_uniforms(GLuint prog) {
 // This frame's compose uniforms (vita_gl_present_gc), set on whichever compose program draws.
 static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift; } sGcU;
 static void gc_frame_uniforms(GLuint prog) {
+    // (the locations looked up once per program: vitaGL finds a uniform by comparing names)
+    static GLuint progs[4];
+    static GLint loc[4][11];
+    int k = 0;
+    while (k < 4 && progs[k] && progs[k] != prog) k++;
+    if (k == 4) k = 0;
+    if (progs[k] != prog) {
+        static const char *const kN[11] = {"uHave3d", "uOvlOn", "uLogoOn", "uMirror", "uLogoOfs", "uBg3Shift",
+                                           "uObjMove", "uVLogoOfs", "uVBg3Shift", "uVFlip", "uObjShift"};
+        progs[k] = prog;
+        for (int i = 0; i < 11; i++) loc[k][i] = glGetUniformLocation(prog, kN[i]);
+    }
+    const GLint *l = loc[k];
     glUseProgram(prog);
-    glUniform1f(glGetUniformLocation(prog, "uHave3d"), sGcU.have3d);
-    glUniform1f(glGetUniformLocation(prog, "uOvlOn"), sGcU.ovlOn);
-    glUniform1f(glGetUniformLocation(prog, "uLogoOn"), sGcU.logoOn);
-    glUniform1f(glGetUniformLocation(prog, "uMirror"), sGcU.mirror);
-    glUniform2f(glGetUniformLocation(prog, "uLogoOfs"), sGcU.ofs[0], sGcU.ofs[1]);
-    glUniform1f(glGetUniformLocation(prog, "uBg3Shift"), sGcU.bg3);
-    glUniform4f(glGetUniformLocation(prog, "uObjMove"), sGcU.mv[0], sGcU.mv[1], sGcU.mv[2], sGcU.mv[3]);
-    glUniform2f(glGetUniformLocation(prog, "uVLogoOfs"), sGcU.ofs[0], sGcU.ofs[1]);
-    glUniform1f(glGetUniformLocation(prog, "uVBg3Shift"), sGcU.bg3);
-    glUniform1f(glGetUniformLocation(prog, "uVFlip"), sGcFlip);
-    glUniform1f(glGetUniformLocation(prog, "uObjShift"), sGcU.objShift);
+    glUniform1f(l[0], sGcU.have3d);
+    glUniform1f(l[1], sGcU.ovlOn);
+    glUniform1f(l[2], sGcU.logoOn);
+    glUniform1f(l[3], sGcU.mirror);
+    glUniform2f(l[4], sGcU.ofs[0], sGcU.ofs[1]);
+    glUniform1f(l[5], sGcU.bg3);
+    glUniform4f(l[6], sGcU.mv[0], sGcU.mv[1], sGcU.mv[2], sGcU.mv[3]);
+    glUniform2f(l[7], sGcU.ofs[0], sGcU.ofs[1]);
+    glUniform1f(l[8], sGcU.bg3);
+    glUniform1f(l[9], sGcFlip);
+    glUniform1f(l[10], sGcU.objShift);
 }
 // The present, built from plain texture copies and the GPU's blending (per-pixel arithmetic at the screen's
 // 960x544 is what costs on the Vita: a shader of a few dozen operations took 10 ms, a copy 1.2 ms):
@@ -641,21 +654,45 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         int dx, dy, prompt, mirror;
         int on = gpu2d_gc_logo(&lp, &dx, &dy, &prompt, &mirror);
         if (on) {
+            // Two textures, used in turn: the rows written since a texture was last brought up to date are copied
+            // into it (glTexSubImage2D, row runs) - not the whole picture re-created each frame (glTexImage2D
+            // allocates new texture memory every call, and a menu changes its rows every frame).
+            static GLuint logoTex[2];
+            static unsigned char pend[2][192];
+            static int cur;
             glActiveTexture(GL_TEXTURE0 + 9);
-            int first = !sGcLogoTex;
-            if (first) glGenTextures(1, &sGcLogoTex);
-            glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
-            extern unsigned gpu2d_gc_logo_gen(void);   // (test: uploaded only when written)
-            static unsigned upGen;
-            unsigned gen = gpu2d_gc_logo_gen();
-            if (first || gen != upGen) glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
-            upGen = gen;
+            const int first = !logoTex[0];
             if (first) {
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glGenTextures(2, logoTex);
+                for (int i = 0; i < 2; i++) {
+                    glBindTexture(GL_TEXTURE_2D, logoTex[i]);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, lp);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                }
             }
+            extern void gpu2d_gc_logo_take_rows(unsigned char *rows);
+            unsigned char rows[192];
+            gpu2d_gc_logo_take_rows(rows);
+            int any = 0;
+            for (int y = 0; y < 192; y++) { pend[0][y] |= rows[y]; pend[1][y] |= rows[y]; any |= rows[y]; }
+            if (first) memset(pend, 0, sizeof pend);
+            else if (any) {
+                cur ^= 1;   // (the other one: the GPU may still be reading the one shown last)
+                glBindTexture(GL_TEXTURE_2D, logoTex[cur]);
+                for (int y = 0; y < 192;) {
+                    if (!pend[cur][y]) { y++; continue; }
+                    int e = y;
+                    while (e < 192 && pend[cur][e]) e++;
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, y, 256, e - y, GL_RGBA, GL_UNSIGNED_BYTE, lp + y * 256);
+                    y = e;
+                }
+                memset(pend[cur], 0, sizeof pend[cur]);
+            }
+            sGcLogoTex = logoTex[cur];
+            glBindTexture(GL_TEXTURE_2D, sGcLogoTex);
         }
         sGcU.logoOn = on && !mirror ? 1.0f : 0.0f;
         sGcLogoPx = on && !mirror ? (const unsigned *)lp : NULL;

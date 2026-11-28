@@ -827,6 +827,12 @@ static uint32_t sLogo[SCREEN_W * SCREEN_H];
 static int sOverlayOn, sOvlReady;   // (Vita) a menu over the scene: engine B drawn by the bands into sLogo
 static unsigned sLogoGen;   // counts the frames that wrote sLogo (the present uploads it only then)
 unsigned gpu2d_gc_logo_gen(void) { return sLogoGen; }
+// The rows of sLogo written since the present last took them (it uploads only those): set by whoever writes a row
+// (the bands, the title prepass), taken and cleared by the present.
+static u8 sLogoRows[SCREEN_H];
+void gpu2d_gc_logo_take_rows(unsigned char *rows) {
+    for (int y = 0; y < SCREEN_H; y++) rows[y] = __atomic_exchange_n(&sLogoRows[y], 0, __ATOMIC_ACQ_REL);
+}
 int gHostTitlePrompt;   // TitleBlinkText (Vita): the "touch to start" BG3 is shown
 // The logo (NULL when none) and how far to move it to centre it on the screen (dx, dy); prompt: BG3 is the title's
 // "touch to start", to be drawn in the screen's bottom-right corner.
@@ -1140,6 +1146,7 @@ typedef struct {
     int mirror;                                                     // engine B into sLogo: 1 whole, 2 menu overlay
     const u8 *dirty;                                                // (mirror) lines to draw; the others keep theirs
     const u8 (*regSnap)[REG_SIZE], (*palSnap)[0x400];               // other per-line snapshots (engine B's), or NULL
+    int part, nparts;   // (menu overlay) every band walks all lines and draws every nparts-th changed one from part
 } Band2d;
 static u8 s2dRegSnapB[SCREEN_H][REG_SIZE];   // (Vita) engine B's per-line registers and palettes, for the menu overlay
 static u8 s2dPalSnapB[SCREEN_H][0x400];
@@ -1316,8 +1323,9 @@ static void band2d_run(Band2d *w) {
     uint64_t t0 = host_plat_time_ns();
     band2d_run_(w);
     __atomic_fetch_add(&gBProfNs, host_plat_time_ns() - t0, __ATOMIC_RELAXED);
-    unsigned n = 0;
-    for (int l = w->lo; l < w->hi; l++) n += w->dirty && w->dirty[l];
+    unsigned n = 0, k = 0;
+    for (int l = w->lo; l < w->hi; l++)
+        if (w->dirty && w->dirty[l] && (w->nparts <= 1 || k++ % (unsigned)w->nparts == (unsigned)w->part)) n++;
     __atomic_fetch_add(&gBProfLines, n, __ATOMIC_RELAXED);
     __atomic_fetch_add(&gBProfRuns, 1, __ATOMIC_RELAXED);
 }
@@ -1349,11 +1357,14 @@ static void band2d_run_(Band2d *w) {
         e->objCand[e->objCandN++] = (u8)i;
     }
     e->objCandOn = 1;
+    unsigned dirtyK = 0;
     for (int line = w->lo; line < w->hi; line++) {
         memcpy(e->regs, w->regSnap ? w->regSnap[line] : s2dRegSnap[line], REG_SIZE);   // per-line registers
         e->palette = w->palSnap ? w->palSnap[line] : s2dPalLine[line];                  // per-line palette
         window_vertical(e, line);
-        if (w->mirror && w->dirty && !w->dirty[line]) {   // this line of engine B's picture did not change
+        int mine = 1;   // (menu overlay: the changed lines are dealt out to the bands in turn, wherever they are)
+        if (w->mirror && w->dirty && w->dirty[line] && w->nparts > 1) mine = dirtyK++ % (unsigned)w->nparts == (unsigned)w->part;
+        if (w->mirror && w->dirty && (!w->dirty[line] || !mine)) {   // this line of engine B's picture did not change
             obj_mosaic_y(e, line);
             ref_advance(e, line);
             if (line + 1 == w->hi) e->objCandOn = 0;
@@ -1374,6 +1385,7 @@ static void band2d_run_(Band2d *w) {
                 u32 a = w->mirror == 1 ? 0xffu : bb[x] ? 0u : bk[x] ? 0xffu : 0x80u;
                 d[x] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | a << 24;
             }
+            __atomic_store_n(&sLogoRows[line], 1, __ATOMIC_RELEASE);
             continue;
         }
         if (sGcFrame) {
@@ -1763,6 +1775,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
                 if (opaque == SCREEN_W) sLogoFull = 1;
             } else
                 memset(lp, 0, SCREEN_W * sizeof *lp);
+            __atomic_store_n(&sLogoRows[line], 1, __ATOMIC_RELEASE);   // (after the row's pixels: the present may take it now)
         }
         if (in->hblank) in->hblank(line, in->hblankContext);
         for (int n = 0; n < 2; n++) ref_advance(&sEngine[n], line);
@@ -1808,7 +1821,11 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         sMtW[b].regSnap = NULL, sMtW[b].palSnap = NULL;
         memcpy(&s2dBandEng[b], se, offsetof(Engine, out));   // inputs only, not the big output arrays
         sMtWB[b].in = in; sMtWB[b].src = &sEngine[1]; sMtWB[b].be = &s2dBandEngB[b];
-        sMtWB[b].lo = sMtBnd[b]; sMtWB[b].hi = overlayBand && bLines ? sMtBnd[b + 1] : sMtBnd[b];
+        // (every band walks all of engine B's lines from line 0 and draws its share of the changed ones: a menu's
+        // changed lines are often all in one half of the screen, which left one band with all the work)
+        sMtWB[b].lo = 0; sMtWB[b].hi = overlayBand && bLines ? SCREEN_H : 0;
+        sMtWB[b].part = b; sMtWB[b].nparts = s2dNB;
+        if (b) sMtWB[b].snap = sMtWB[0].snap;
         sMtWB[b].canvas = NULL; sMtWB[b].mirror = 2; sMtWB[b].dirty = sBDirty;
         sMtWB[b].regSnap = s2dRegSnapB, sMtWB[b].palSnap = s2dPalSnapB;
         if (overlayBand && bLines) memcpy(&s2dBandEngB[b], &sEngine[1], offsetof(Engine, out));
@@ -1863,6 +1880,11 @@ static void render_engine0_mt_bands(u32 *canvas) {
     pthread_mutex_lock(&s2dMu);
     while (s2dPending) pthread_cond_wait(&s2dDoneCv, &s2dMu);
     pthread_mutex_unlock(&s2dMu);
+    if (getenv("ACWW_LOGOHASH")) {   // TEMPHASH
+        u32 h = 2166136261u;
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) h = (h ^ sLogo[i]) * 16777619u;
+        fprintf(stderr, "logohash %llu %08x\n", (unsigned long long)host_frame(), h);
+    }
     for (int b = 0; b < nb && !canvas && !sGcFrame; b++) {
         int lo = sMtBnd[b], n = sMtBnd[b + 1] - lo;
         memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
@@ -2002,7 +2024,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     {   // (host check/profiling of the Vita's menu overlay: engine B's whole picture over the scene)
         static int ovl = -1;
         if (ovl < 0) ovl = getenv("ACWW_OVERLAY") ? atoi(getenv("ACWW_OVERLAY")) : 0;
-        if (ovl) sOverlayOn = (sPowCnt & 0x8000) != 0;
+        if (ovl) sOverlayOn = ovl == 2 || (sPowCnt & 0x8000) != 0;   // (2: always - a test of the overlay path)
     }
 #endif
     {
