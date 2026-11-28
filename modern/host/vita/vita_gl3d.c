@@ -39,40 +39,123 @@ static int sPrevDraw = -1;   // FBO index drawn into last call, read back (non-s
 // Timing split of g3w_render, reported on the "render thread split" line.
 extern uint64_t host_plat_time_ns(void);
 unsigned long long gG3FrameTexNs, gG3FrameUploads, gG3FrameSyncNs;
-enum { TEX_REFRESH_BUDGET_NS = 2500000 };
-static unsigned long long sStRefreshes, sStDeferred;   // the last frame's (render.c: longest frame)
+#ifndef G3_TEX_REFRESH_BUDGET_NS
+#define G3_TEX_REFRESH_BUDGET_NS 2500000
+#endif
+#ifndef G3_IC_BUDGET
+#define G3_IC_BUDGET (8 << 20)
+#endif
+enum { TEX_REFRESH_BUDGET_NS = G3_TEX_REFRESH_BUDGET_NS };
+static unsigned long long sStRefreshes, sStDeferred, sStSame, sStReused, sStEvicted;
+static int sImgCount;
+static uint32_t sImgBytes;
 static unsigned long long sStReadNs, sStSubmitNs, sStTexNs, sStTexUploads, sStCalls, sStDraws, sStGlNs, sStResolveNs, sStSyncNs;
 unsigned long long vita_gl3d_stats(char *buf, int n) {
     unsigned long long c = sStCalls ? sStCalls : 1;
     extern unsigned long long gVitaComposeNs, gVitaSwapNs, gVitaPresents;
     unsigned long long pc = gVitaPresents ? gVitaPresents : 1;
-    snprintf(buf, (size_t)n, "; 3d: texture sync %llu us, draw submit %llu us (of which textures %llu us [decode+upload %llu us, %llu uploads/frame, %llu of them refreshes, %llu refreshes deferred in 60 frames], glDrawElements %llu us, %llu draws/frame); "
-             "present: compose %llu us, swap %llu us",
-             sStSyncNs / c / 1000, sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads / c, sStRefreshes / c, sStDeferred, sStGlNs / c / 1000, sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
-    sStDraws = sStGlNs = sStResolveNs = sStSyncNs = sStRefreshes = sStDeferred = 0;
+    snprintf(buf, (size_t)n, "; 3d: texture sync %llu us, draw submit %llu us (of which textures %llu us [decode+upload+hash %llu us; "
+             "in 60 frames %llu decoded (%llu of them changed textures), %llu unchanged after a VRAM write, %llu reused "
+             "from the %d cached pictures (%u KB), %llu refreshes deferred, %llu pictures freed], glDrawElements %llu us, "
+             "%llu draws/frame); present: compose %llu us, swap %llu us",
+             sStSyncNs / c / 1000, sStSubmitNs / c / 1000, sStResolveNs / c / 1000, sStTexNs / c / 1000, sStTexUploads,
+             sStRefreshes, sStSame, sStReused, sImgCount, sImgBytes >> 10, sStDeferred, sStEvicted, sStGlNs / c / 1000,
+             sStDraws / c, gVitaComposeNs / pc / 1000, gVitaSwapNs / pc / 1000);
+    sStDraws = sStGlNs = sStResolveNs = sStSyncNs = sStRefreshes = sStDeferred = sStSame = sStReused = sStEvicted = 0;
     gVitaComposeNs = gVitaSwapNs = gVitaPresents = 0;
     sStReadNs = sStSubmitNs = sStTexNs = sStTexUploads = sStCalls = 0;
     return c;
 } 
 // --- texture cache --------------------------------------------------------------------------------------------
-// Each DS texture (texparam/texpal) is decoded to an RGBA GL texture once and reused while its VRAM is unchanged.
-// DS games rewrite texture VRAM in place (animated textures every few frames, new data on scene loads), so every
-// frame the flat texture/palette VRAM is compared with last frame's in 1 KB blocks, and entries whose texel,
-// 4x4-index or palette bytes touch a changed block are re-decoded on their next use. Entries unused for a while
-// are freed; an entry used in the current frame is never evicted (its GL texture may still be referenced by
-// draws queued this frame).
+// Two levels. The image cache holds decoded GL textures by content: a 64-bit hash of every VRAM byte the decoder
+// reads plus the format bits (gpu3d_texture_hash), so equal hashes are the same picture. Its GL textures are never
+// changed once uploaded. The texture table maps each DS texture (texparam/texpal) to the image it showed last.
+// DS games rewrite texture VRAM in place (animated textures cycle through a few pictures, scenes load new data), so
+// every frame the flat texture/palette VRAM drawn is compared with last frame's in 1 KB blocks (g3_tex_sync_for),
+// and entries whose texel, 4x4-index or palette bytes touch a changed block are hashed again on their next use:
+// - same hash: nothing to do (the change was a neighbour sharing the 1 KB block - most of the marks in town);
+// - a hash the image cache holds: switch to that image (an animation frame or a scene seen before);
+// - else decode and upload it as a new image.
+// An image used this frame is never freed (queued draws may still read it); unused ones go when the cache is over
+// its size budget, oldest first.
 enum { TC_SLOTS = 2048, TC_MAX = 1024, TC_BLK = 1024, TC_IMG = 0x80000, TC_PAL = 0x20000 };
-typedef struct { uint32_t tp, pal, lastUsed, palLo, palN; GLuint tex; uint8_t used, stale, minA; } TexEnt;   // minA: lowest texel alpha
-// palLo/palN: the palette bytes it read when decoded (gpu3d_texture_pal_range)
+typedef struct { uint32_t tp, pal, lastUsed, palLo, palN; uint64_t h; uint8_t used, stale; } TexEnt;
+// palLo/palN: the palette bytes it read when last hashed (gpu3d_texture_pal_range); h: its image's hash
 static TexEnt sTex[TC_SLOTS];
 static int sTexCount;
-static int sLastTexSlot = -1;   // consecutive polygons (sorted by texture) usually hit the same entry
 static uint32_t sTexFrame = 1;
 static u8 sDirtyImg[TC_IMG / TC_BLK], sDirtyPal[TC_PAL / TC_BLK];
 static uint32_t sDecodeBuf[1024 * 1024];   // max DS texture 1024x1024
 
+enum { IC_SLOTS = 4096, IC_MAX = 2048, IC_BUDGET = G3_IC_BUDGET };   // budget: bytes of RGBA texels
+typedef struct { uint64_t h; GLuint tex; uint32_t lastUsed, bytes; uint8_t used, minA; } ImgEnt;   // minA: lowest texel alpha
+static ImgEnt sImg[IC_SLOTS];
+
 static GLint ds_wrap(int repeat, int flip) {
     return flip ? GL_MIRRORED_REPEAT : (repeat ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+}
+static int img_slot(uint64_t h) {
+    int i = (int)((uint32_t)(h ^ h >> 32) * 0x9e3779b1u >> 20) & (IC_SLOTS - 1);
+    while (sImg[i].used && sImg[i].h != h) i = (i + 1) & (IC_SLOTS - 1);
+    return i;
+}
+static ImgEnt *img_get(uint64_t h) {
+    ImgEnt *m = &sImg[img_slot(h)];
+    return m->used ? m : 0;
+}
+// Free images not used since frame keepFrom (never this frame's) and rebuild the probe table without them.
+static void img_sweep(uint32_t keepFrom) {
+    static ImgEnt keep[IC_SLOTS];
+    int n = 0;
+    if (keepFrom > sTexFrame) keepFrom = sTexFrame;
+    sImgBytes = 0;
+    for (int i = 0; i < IC_SLOTS; i++) {
+        if (!sImg[i].used) continue;
+        if (sImg[i].lastUsed >= keepFrom) { keep[n++] = sImg[i]; sImgBytes += sImg[i].bytes; }
+        else { glDeleteTextures(1, &sImg[i].tex); sStEvicted++; }
+    }
+    memset(sImg, 0, sizeof sImg);
+    for (int i = 0; i < n; i++) sImg[img_slot(keep[i].h)] = keep[i];
+    sImgCount = n;
+}
+// Over budget: drop the images unused longest, in steps (10 s, 2 s, 0.5 s, then anything not drawn this frame).
+static void img_trim(void) {
+    static const uint32_t kAge[] = {600, 120, 30, 1};
+    for (int k = 0; k < 4 && (sImgBytes > IC_BUDGET || sImgCount > IC_MAX * 3 / 4); k++)
+        img_sweep(sTexFrame > kAge[k] ? sTexFrame - kAge[k] : 0);
+}
+static ImgEnt *img_upload(uint32_t tp, uint32_t pp, uint64_t h) {
+    uint64_t t0 = host_plat_time_ns();
+    int w, hh;
+    gpu3d_texture_size(tp, &w, &hh);
+    if (w <= 0 || hh <= 0 || (long)w * hh > (long)(sizeof sDecodeBuf / 4)) return 0;
+    if (sImgCount >= IC_MAX) img_sweep(sTexFrame);
+    if (sImgCount >= IC_MAX) return 0;
+    sStTexUploads++;
+    gG3FrameUploads++;
+    gpu3d_decode_texture(tp, pp, sDecodeBuf);
+    ImgEnt *m = &sImg[img_slot(h)];
+    m->h = h; m->used = 1; m->lastUsed = sTexFrame; m->bytes = (uint32_t)((w + 7) & ~7) * (uint32_t)hh * 4;
+    {   // the lowest alpha of its texels: whether the alpha test can drop any of them (g3w_render)
+        uint32_t lo = 0xffffffffu;
+        for (long i = 0, n = (long)w * hh; i < n; i++) if (sDecodeBuf[i] < lo) lo = sDecodeBuf[i] | 0x00ffffffu;
+        m->minA = (uint8_t)(lo >> 24);
+    }
+    // A new GL texture every time: an image is never re-specified, so no draw still queued from an earlier frame
+    // can see its texels change (glTexSubImage2D on reused storage showed alternating stale/new texels on hardware).
+    glGenTextures(1, &m->tex);
+    glBindTexture(GL_TEXTURE_2D, m->tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, hh, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(tp >> 16 & 1, tp >> 18 & 1));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(tp >> 17 & 1, tp >> 19 & 1));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    sImgCount++;
+    sImgBytes += m->bytes;
+    uint64_t dt = host_plat_time_ns() - t0;
+    sStTexNs += dt;
+    gG3FrameTexNs += dt;
+    return m;
 }
 
 static int range_dirty(const u8 *dirty, u32 nblk, u32 base, u32 size) {
@@ -87,7 +170,6 @@ static int range_dirty(const u8 *dirty, u32 nblk, u32 base, u32 size) {
 static int tex_touches_dirty(const TexEnt *e) {
     uint32_t tp = e->tp;
     static const u8 bpp[8] = {0, 8, 2, 4, 8, 2, 8, 16};
-    static const u32 palBytes[8] = {0, 64, 8, 32, 512, 0x10000, 16, 0};
     int fmt = tp >> 26 & 7;
     u32 w = 8u << (tp >> 20 & 7), h = 8u << (tp >> 23 & 7);
     u32 a = ((tp & 0xffff) << 3) & (TC_IMG - 1);
@@ -96,57 +178,26 @@ static int tex_touches_dirty(const TexEnt *e) {
         u32 x = (0x20000 + (a & 0x1ffff) / 2 + (a >= 0x40000 ? 0x10000 : 0)) & (TC_IMG - 1);
         if (range_dirty(sDirtyImg, TC_IMG / TC_BLK, x, w * h / 8)) return 1;
     }
-    (void)palBytes;
     return range_dirty(sDirtyPal, TC_PAL / TC_BLK, e->palLo & (TC_PAL - 1), e->palN);
-}
-static void tex_upload(TexEnt *e) {
-    uint64_t t0 = host_plat_time_ns();
-    sStTexUploads++;
-    gG3FrameUploads++;
-    int w, h;
-    gpu3d_texture_size(e->tp, &w, &h);
-    if (w <= 0 || h <= 0 || (long)w * h > (long)(sizeof sDecodeBuf / 4)) return;
-    gpu3d_decode_texture(e->tp, e->pal, sDecodeBuf);
-    gpu3d_texture_pal_range(e->tp, e->pal, &e->palLo, &e->palN);
-    {   // the lowest alpha of its texels: whether the alpha test can drop any of them (g3w_render)
-        uint32_t lo = 0xffffffffu;
-        for (long i = 0, n = (long)w * h; i < n; i++) if (sDecodeBuf[i] < lo) lo = sDecodeBuf[i] | 0x00ffffffu;
-        e->minA = (uint8_t)(lo >> 24);
-    }
-    if (!e->tex) glGenTextures(1, &e->tex);
-    glBindTexture(GL_TEXTURE_2D, e->tex);
-    // vitaGL/GXM can still be sampling this texture from the previous queued frame. Re-specifying the image
-    // gives the driver a fresh backing store; glTexSubImage2D on the reused storage caused alternating
-    // stale/new texture contents on hardware.
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, sDecodeBuf);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ds_wrap(e->tp >> 16 & 1, e->tp >> 18 & 1));
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, ds_wrap(e->tp >> 17 & 1, e->tp >> 19 & 1));
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    sStTexNs += host_plat_time_ns() - t0;
-    gG3FrameTexNs += host_plat_time_ns() - t0;
 }
 static int tex_slot(uint32_t tp, uint32_t pp) {
     int h = (int)((tp * 2654435761u ^ pp * 40503u) & (TC_SLOTS - 1));
     while (sTex[h].used && !(sTex[h].tp == tp && sTex[h].pal == pp)) h = (h + 1) & (TC_SLOTS - 1);
     return h;
 }
-// Free entries not used since frame `keepFrom` and rebuild the probe table without them.
+// Forget entries not used since frame `keepFrom` and rebuild the probe table without them (their images stay in
+// the image cache).
 static void tex_sweep(uint32_t keepFrom) {
     static TexEnt keep[TC_SLOTS];
     int n = 0;
-    for (int i = 0; i < TC_SLOTS; i++) {
-        if (!sTex[i].used) continue;
-        if (sTex[i].lastUsed >= keepFrom) keep[n++] = sTex[i];
-        else if (sTex[i].tex) glDeleteTextures(1, &sTex[i].tex);
-    }
+    for (int i = 0; i < TC_SLOTS; i++)
+        if (sTex[i].used && sTex[i].lastUsed >= keepFrom) keep[n++] = sTex[i];
     memset(sTex, 0, sizeof sTex);
     for (int i = 0; i < n; i++) sTex[tex_slot(keep[i].tp, keep[i].pal)] = keep[i];
     sTexCount = n;
-    sLastTexSlot = -1;
 }
-// Once per frame, before any draw: mark entries whose VRAM changed (g3_tex_setup flags the changed 1 KB blocks
-// while it updates the flat texture/palette image) and sweep old entries.
+// Once per frame, before any draw: mark entries whose VRAM changed (g3_tex_sync_for flags the changed 1 KB blocks
+// while it brings the flat texture/palette image up to date) and sweep old entries.
 extern u8 gG3TexDirtyImg[TC_IMG / TC_BLK], gG3TexDirtyPal[TC_PAL / TC_BLK];
 static void tex_frame_begin(const u8 *img, const u8 *pal) {
     (void)img; (void)pal;
@@ -161,42 +212,84 @@ static void tex_frame_begin(const u8 *img, const u8 *pal) {
             if (sTex[i].used && !sTex[i].stale && tex_touches_dirty(&sTex[i])) sTex[i].stale = 1;
     }
     if (sTexCount > TC_MAX * 3 / 4) tex_sweep(sTexFrame > 120 ? sTexFrame - 120 : 0);
+    img_trim();
 }
+#ifdef G3_TEXCC_VERIFY   // host test build (vita_gl3d_mock.c): every texture drawn must match a fresh decode
+extern int mock_tex_check(GLuint tex, const uint32_t *px, int w, int h);
+static unsigned long long sVerOk, sVerBad, sVerSkip;
+static void tex_verify(uint32_t tp, uint32_t pp, GLuint tex) {
+    const TexEnt *e = &sTex[tex_slot(tp, pp)];
+    if (!tex || !e->used || e->stale) { sVerSkip++; return; }   // (a deferred refresh draws the old picture)
+    static uint32_t ref[1024 * 1024];
+    int w, h;
+    gpu3d_texture_size(tp, &w, &h);
+    gpu3d_decode_texture(tp, pp, ref);
+    if (mock_tex_check(tex, ref, w, h)) sVerOk++;
+    else { sVerBad++; fprintf(stderr, "texcc: MISMATCH tp %08x pp %08x tex %u\n", tp, pp, tex); }
+    if ((sVerOk + sVerBad) % 20000 == 0)
+        fprintf(stderr, "texcc: verified %llu ok, %llu bad, %llu skipped; images %d (%u KB); decoded %llu (refreshes %llu), "
+                "unchanged %llu, reused %llu, deferred %llu, freed %llu\n", sVerOk, sVerBad, sVerSkip, sImgCount,
+                sImgBytes >> 10, sStTexUploads, sStRefreshes, sStSame, sStReused, sStDeferred, sStEvicted);
+}
+#endif
 static GLuint tex_for(uint32_t texparam, uint32_t texpal, uint8_t *minA) {
     *minA = 255;
     if ((texparam >> 26 & 7) == 0) return 0;   // format 0 == no texture
-    if (sLastTexSlot >= 0) {
-        TexEnt *l = &sTex[sLastTexSlot];
-        if (l->used && !l->stale && l->tp == texparam && l->pal == texpal) {
-            l->lastUsed = sTexFrame; *minA = l->minA; return l->tex;
-        }
-    }
     int s = tex_slot(texparam, texpal);
     TexEnt *e = &sTex[s];
+    ImgEnt *m = 0;
     if (e->used) {
-        // A texture whose VRAM changed is decoded again - unless this frame already spent its upload budget: then
-        // it is drawn as it was and refreshed on a following frame (a burst of changed textures no longer stalls
-        // one frame; textures never seen before are always uploaded).
-        if (e->stale && (gG3FrameTexNs < TEX_REFRESH_BUDGET_NS || !e->tex)) { tex_upload(e); e->stale = 0; sStRefreshes++; }
-        else if (e->stale) sStDeferred++;
-        e->lastUsed = sTexFrame;
-        sLastTexSlot = s;
-        *minA = e->minA;
-        return e->tex;
+        m = img_get(e->h);
+        if (e->stale || !m) {
+            uint64_t t0 = host_plat_time_ns();
+            uint64_t h = gpu3d_texture_hash(texparam, texpal);
+            ImgEnt *n = img_get(h);
+            uint64_t dt = host_plat_time_ns() - t0;
+            sStTexNs += dt; gG3FrameTexNs += dt;
+            if (n) {   // unchanged, or a picture it (or another texture) showed before
+                if (n == m) sStSame++; else sStReused++;
+                m = n;
+            } else if (gG3FrameTexNs < TEX_REFRESH_BUDGET_NS || !m) {
+                // A changed texture is decoded again - unless this frame already spent its upload budget: then it
+                // is drawn as it was and refreshed on a following frame (a burst of changed textures no longer
+                // stalls one frame; textures never seen before are always uploaded).
+                n = img_upload(texparam, texpal, h);
+                if (!n) return 0;
+                if (m) sStRefreshes++;
+                m = n;
+            } else {
+                sStDeferred++;
+                m->lastUsed = sTexFrame;
+                e->lastUsed = sTexFrame;
+                *minA = m->minA;
+                return m->tex;   // (still stale: looked at again next frame)
+            }
+            e->h = h;
+            e->stale = 0;
+            gpu3d_texture_pal_range(texparam, texpal, &e->palLo, &e->palN);
+        }
+    } else {
+        if (sTexCount >= TC_MAX) {                 // full: drop everything not used this frame, then re-probe
+            tex_sweep(sTexFrame);
+            if (sTexCount >= TC_MAX) return 0;
+            s = tex_slot(texparam, texpal);
+            e = &sTex[s];
+        }
+        uint64_t t0 = host_plat_time_ns();
+        uint64_t h = gpu3d_texture_hash(texparam, texpal);
+        uint64_t dt = host_plat_time_ns() - t0;
+        sStTexNs += dt; gG3FrameTexNs += dt;
+        m = img_get(h);
+        if (m) sStReused++;
+        else if (!(m = img_upload(texparam, texpal, h))) return 0;
+        e->tp = texparam; e->pal = texpal; e->used = 1; e->stale = 0; e->h = h;
+        gpu3d_texture_pal_range(texparam, texpal, &e->palLo, &e->palN);
+        sTexCount++;
     }
-    if (sTexCount >= TC_MAX) {                 // full: drop everything not used this frame, then re-probe
-        tex_sweep(sTexFrame);
-        if (sTexCount >= TC_MAX) return 0;
-        s = tex_slot(texparam, texpal);
-        e = &sTex[s];
-    }
-    e->tp = texparam; e->pal = texpal; e->used = 1; e->stale = 0; e->lastUsed = sTexFrame; e->tex = 0;
-    sTexCount++;
-    e->minA = 0;
-    tex_upload(e);
-    sLastTexSlot = s;
-    *minA = e->minA;
-    return e->tex;
+    e->lastUsed = sTexFrame;
+    m->lastUsed = sTexFrame;
+    *minA = m->minA;
+    return m->tex;
 }
 
 static void lazy_init(void) {
@@ -421,6 +514,10 @@ void g3w_render(const G3RenderState *r, const u8 *img, const u8 *pal, u32 *out) 
     // with the newly uploaded one (wrong textures for a frame whenever a texture was uploaded).
     uint64_t tRes = host_plat_time_ns();
     for (int g = 0; g < ngrp; g++) grpTex[g] = tex_for((uint32_t)(grpKey[g] >> 32), (uint32_t)grpKey[g], &grpMinA[g]);
+#ifdef G3_TEXCC_VERIFY
+    for (int g = 0; g < ngrp; g++)
+        if (grpKey[g]) tex_verify((uint32_t)(grpKey[g] >> 32), (uint32_t)grpKey[g], grpTex[g]);
+#endif
     sStResolveNs += host_plat_time_ns() - tRes;
     for (int oi = 0; oi < nOrd; oi++) {
         int k = sOrder[oi];

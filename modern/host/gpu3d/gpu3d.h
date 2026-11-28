@@ -52,6 +52,7 @@ typedef struct Gpu3dVertexOut {
 } Gpu3dVertexOut;
 void gpu3d_texture_size(uint32_t texparam, int *w, int *h);
 void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out);
+uint64_t gpu3d_texture_hash(uint32_t texparam, uint32_t texpal);   // of the bytes gpu3d_decode_texture reads
 // The palette bytes the texture reads: [*lo, *lo + *n), wrapping in the 128 KB palette space (4x4-compressed: only
 // the entries its blocks use).
 void gpu3d_texture_pal_range(uint32_t texparam, uint32_t texpal, uint32_t *lo, uint32_t *n);

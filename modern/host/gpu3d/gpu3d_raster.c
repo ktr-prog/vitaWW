@@ -658,6 +658,60 @@ static void decode_texture_slow(uint32_t texparam, uint32_t texpal, uint32_t *ou
 void gpu3d_texture_pal_range(uint32_t texparam, uint32_t texpal, uint32_t *lo, uint32_t *n) {
     g3_pal_range(texparam, texpal, lo, n);
 }
+// A 64-bit hash of everything gpu3d_decode_texture reads for this texture (its texels, 4x4 palette indices and
+// palette bytes - the same addresses, the same wrap-around) plus the texparam bits other than the address
+// (format, size, wrap/flip, colour-0 transparency). Equal hashes mean an identical decoded image, so the GL texture
+// cache can keep or reuse a texture instead of decoding it again (vita_gl3d.c). Two murmur3-style lanes.
+static inline void th_mix(u32 *h1, u32 *h2, u32 w) {
+    u32 k = w * 0xcc9e2d51u;
+    k = (k << 15 | k >> 17) * 0x1b873593u;
+    *h1 ^= k;
+    *h1 = (*h1 << 13 | *h1 >> 19) * 5 + 0xe6546b64u;
+    u32 j = w * 0x85ebca6bu;
+    j = (j << 16 | j >> 16) * 0xc2b2ae35u;
+    *h2 ^= j;
+    *h2 = (*h2 << 17 | *h2 >> 15) * 9 + 0x38b34ae5u;
+}
+static inline u32 th_fmix(u32 h) {
+    h ^= h >> 16; h *= 0x85ebca6bu; h ^= h >> 13; h *= 0xc2b2ae35u; h ^= h >> 16;
+    return h;
+}
+static void th_range(u32 *h1, u32 *h2, const u8 *buf, u32 mask, u32 a, u32 n) {   // buf[(a + i) & mask], i < n
+    a &= mask;
+    if (!((a | n) & 3)) {
+        const u32 *w = (const u32 *)buf;
+        const u32 wm = mask >> 2;
+        for (u32 i = 0, b = a >> 2; i < n >> 2; i++) th_mix(h1, h2, w[(b + i) & wm]);
+    } else
+        for (u32 i = 0; i < n; i++) th_mix(h1, h2, buf[(a + i) & mask]);
+    th_mix(h1, h2, n);
+}
+uint64_t gpu3d_texture_hash(uint32_t texparam, uint32_t texpal) {
+    static const u8 bpp[8] = {0, 8, 2, 4, 8, 2, 8, 16};
+    static const u32 palBytes[8] = {0, 64, 8, 32, 512, 0, 16, 0};
+    const int fmt = texparam >> 26 & 7;
+    const u32 w = 8u << (texparam >> 20 & 7), h = 8u << (texparam >> 23 & 7);
+    const u32 base = (texparam & 0xffff) << 3, palbase = (texpal & 0x1fff) << 4;
+    u32 h1 = 0x9747b28cu, h2 = 0x5bd1e995u;
+    th_mix(&h1, &h2, texparam >> 16);
+    th_range(&h1, &h2, sImgFlat, 0x7ffff, base, w * h * bpp[fmt] / 8);
+    if (fmt == 5) {   // each block's palette index (as the decoder reads it), then the palette entries they reach
+        u32 mn = 0x3fff, mx = 0;
+        for (u32 blk = 0, nb = w * h / 16; blk < nb; blk++) {
+            u32 addr = base + blk * 4;
+            u32 slot1 = 0x20000 + ((addr & 0x1ffff) >> 1) + ((addr >> 17) == 2 ? 0x10000 : 0);
+            u32 i = img16(slot1) & 0x3fffu;
+            th_mix(&h1, &h2, img16(slot1));
+            if (i < mn) mn = i;
+            if (i > mx) mx = i;
+        }
+        th_range(&h1, &h2, sPalFlat, 0x1ffff, palbase + mn * 4, (mx - mn) * 4 + 8);
+    } else if (fmt == 2)
+        th_range(&h1, &h2, sPalFlat, 0x1ffff, (texpal & 0x1fff) << 3, 8);
+    else if (palBytes[fmt])
+        th_range(&h1, &h2, sPalFlat, 0x1ffff, palbase, palBytes[fmt]);
+    return (uint64_t)th_fmix(h1 ^ 0x2545f491u) << 32 | th_fmix(h2 ^ h1);
+}
 void gpu3d_decode_texture(uint32_t texparam, uint32_t texpal, uint32_t *out) {
     if (!sC8[31]) for (u32 c = 0; c < 32; c++) sC8[c] = c * 255 / 31;
     const int fmt = texparam >> 26 & 7;

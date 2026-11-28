@@ -81,6 +81,13 @@ static u64 tm_next_overflow(Timer *t) {
 volatile unsigned char gHostPhase;
 _Static_assert(PH_AUDIO == 4 && PH_WAIT == 6, "spu.c / gpu3d_geom.c / render.c use these numbers");
 static unsigned long long sPhaseCount[HOST_PHASES];
+static unsigned sPhaseFrame[HOST_PHASES], sWorstPhase[HOST_PHASES];   // this frame's samples; the longest frame's
+// At each frame end: take this frame's samples, and keep them when it is the longest frame of the report so far.
+static void phase_frame_end(int worst) {
+    unsigned c[HOST_PHASES];
+    for (int i = 0; i < HOST_PHASES; i++) c[i] = __atomic_exchange_n(&sPhaseFrame[i], 0, __ATOMIC_RELAXED);
+    if (worst) memcpy(sWorstPhase, c, sizeof c);
+}
 static void *phase_sampler(void *arg) {
     (void)arg;
 #if HOST_VITA
@@ -93,7 +100,11 @@ static void *phase_sampler(void *arg) {
     sceKernelChangeThreadPriority(sceKernelGetThreadId(), 96);
 #endif
     for (;;) {
-        __atomic_fetch_add(&sPhaseCount[gHostPhase % HOST_PHASES], 1, __ATOMIC_RELAXED);
+        {
+            unsigned ph = gHostPhase % HOST_PHASES;
+            __atomic_fetch_add(&sPhaseCount[ph], 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&sPhaseFrame[ph], 1, __ATOMIC_RELAXED);
+        }
         usleep(1000);   // ~1 ms ticks: enough samples per report, little disturbance to the game thread
     }
     return 0;
@@ -240,6 +251,7 @@ static void host_pace_frame(void) {
         static int sVcInit;
         if (sPaceLast) {
             u64 dt = now - sPaceLast;
+            phase_frame_end(dt > sWorstFrameNs);
             if (dt > sWorstFrameNs) {
                 sWorstFrameNs = dt;
                 sWorstWaitNs = gHoFrameWaitNs;
@@ -267,6 +279,7 @@ static void host_pace_frame(void) {
     u64 now = host_plat_time_ns();
     if (sNextFrame == 0) sNextFrame = now;
     sNextFrame += 16666666 + (++sub % 3 == 0 ? 2 : 0);
+    if (sPaceLast) phase_frame_end(now - sPaceLast > sWorstFrameNs);
     if (sPaceLast && now - sPaceLast > sWorstFrameNs) {
         sWorstFrameNs = now - sPaceLast;
         sWorstWaitNs = gHoFrameWaitNs;
@@ -449,9 +462,27 @@ static void run_events_body(void) {
                     gpu3d_wait_stats(wb, sizeof wb, 60);
                     fprintf(stderr, "%s\n", wb);
                 }
-                fprintf(stderr, "frame pacing (last 60 frames): %u late, longest frame %llu us (its hand-off %llu us, of which "
-                        "waiting for the render thread %llu us)\n", sLateFrames, (unsigned long long)(sWorstFrameNs / 1000),
-                        (unsigned long long)(sWorstHoNs / 1000), (unsigned long long)(sWorstWaitNs / 1000));
+                {
+                    // the longest frame's game-thread samples (~1 ms each), largest first
+                    static const char *const kName[HOST_PHASES] = {"game code", "GX writes", "other I/O", "VRAM remap",
+                        "audio", "render hand-off", "waiting", "pacing sleep", "frontend", "IRQ handlers", "events", "DMA"};
+                    char ph[256];
+                    int o = 0;
+                    unsigned c[HOST_PHASES];
+                    memcpy(c, sWorstPhase, sizeof c);
+                    for (int k = 0; k < 4; k++) {
+                        int best = -1;
+                        for (int i = 0; i < HOST_PHASES; i++) if (c[i] && (best < 0 || c[i] > c[best])) best = i;
+                        if (best < 0) break;
+                        o += snprintf(ph + o, sizeof ph - (size_t)o, "%s%s %u", k ? ", " : "", kName[best] ? kName[best] : "?", c[best]);
+                        c[best] = 0;
+                    }
+                    ph[o] = 0;
+                    fprintf(stderr, "frame pacing (last 60 frames): %u late, longest frame %llu us (its hand-off %llu us, of which "
+                            "waiting for the render thread %llu us; game thread samples: %s)\n", sLateFrames,
+                            (unsigned long long)(sWorstFrameNs / 1000), (unsigned long long)(sWorstHoNs / 1000),
+                            (unsigned long long)(sWorstWaitNs / 1000), o ? ph : "none");
+                }
                 sLateFrames = 0; sWorstFrameNs = 0;
                 sCpuNs = sRenderNs = sPresentNs = 0; sBreakN = 0;
             }
