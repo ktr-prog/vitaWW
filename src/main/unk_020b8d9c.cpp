@@ -6322,7 +6322,8 @@ extern "C" void Sky_HBlankMain()
 #ifdef HOST
 // (Vita) The sky is on the sub screen (engine B, the top screen) - outdoors, no menu moved it: the Vita shows that
 // sky in place of the main screen's flat backdrop band (gpu2d.c sSkyOn).
-extern "C" int Sky_HostOnSub(void) { return sSkyOutdoors != 0 && gWeatherManager.engine == 0; }
+static int sSkyAlive;   // (the sky task exists: SkyProc onCreate .. onDelete)
+extern "C" int Sky_HostOnSub(void) { return sSkyAlive && sSkyOutdoors != 0 && gWeatherManager.engine == 0; }
 extern "C" int Sky_HostExtLine(int line, s32 *out)
 {
     if (sSkyOutdoors == 0) return 0;
@@ -6430,6 +6431,9 @@ BOOL SkyProc::onCreate() {
     if (r4 != 0) {
         RainSe_Init(&envSndChannel);
     }
+#ifdef HOST
+    sSkyAlive = r4 != 0;
+#endif
     return r4;
 }
 
@@ -6457,6 +6461,9 @@ BOOL SkyProc::onDraw() {
 }
 
 BOOL SkyProc::onDelete() {
+#ifdef HOST
+    sSkyAlive = 0;
+#endif
     BOOL saved = HBlank_Remove(&sSkyHBlankTask);
     s32 i, j, k;
     GX_LoadBGPltt(sSkyBlackBackdrop, 0, 2);

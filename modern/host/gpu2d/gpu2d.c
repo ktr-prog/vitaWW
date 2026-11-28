@@ -2095,19 +2095,20 @@ static int sky_shown(void) {
     extern int Scene_HostIsOutdoor(void);
     const u32 d = reg32(&sEngine[1], REG_DISPCNT);
     gSkyStat[1] += !Sky_HostOnSub();
-    gSkyStat[2] += !Scene_HostIsOutdoor();
     gSkyStat[3] += !(sPowCnt & 0x200);
     gSkyStat[4] += (sPowCnt & 0x8000) != 0;
     gSkyStat[5] += (d & 0x80) || (d >> 16 & 3) != 1;
     // (not POWCNT1's screen swap: the game leaves it set in town after some scene changes, with no menu open; a menu
     // that takes the top screen moves the sky off it first - Sky_SetEngine(1) - so Sky_HostOnSub says it)
-    return Sky_HostOnSub() && Scene_HostIsOutdoor() && (sPowCnt & 0x200) && !(d & 0x80) && (d >> 16 & 3) == 1;
+    // (the game's sky task, not the scene number: on the Vita Scene_GetCurrent stays at the title's 0x2c in town after
+    // a game is continued from the title, and Scene_HostIsOutdoor with it)
+    return Sky_HostOnSub() && (sPowCnt & 0x200) && !(d & 0x80) && (d >> 16 & 3) == 1;
 }
 // (render.c, before the frame's VRAM snapshot) the sky will be drawn this frame: keep engine B's banks
 int gpu2d_sky_wanted(void) {
     extern unsigned Scene_GetCurrent(void);
     const unsigned sc = Scene_GetCurrent();
-    return sc != 0x2c && sc != 0x3f && sky_shown();
+    return !(sc == 0x2c && (reg32(&sEngine[1], REG_DISPCNT) & 0x400)) && sky_shown();
 }
 void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     {   // (host check) both engines' finished pictures of the previous frame
@@ -2128,12 +2129,17 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     {   // ... except its logo on the title screen (render_engine0_mt_prepass)
         extern unsigned Scene_GetCurrent(void);
         unsigned sc = Scene_GetCurrent();
-        sLogoOn = sc == 0x2c;
+        // (the town's sky task up: not the title or the boot screens, whatever the scene number - it can stay at the
+        // title's after a game is continued)
+        // The title: its logo is the top screen's BG2 (the town's sky never shows BG2: stars BG1, clouds BG3).
+        const int bg2 = (reg32(&sEngine[1], REG_DISPCNT) & 0x400) != 0;
+        sLogoOn = sc == 0x2c && bg2;
+        const int sky = !sLogoOn && sky_shown();
         // The boot screens: their Nintendo logo is on the top screen; the Vita shows engine B's whole picture.
-        sMirrorOn = sc == 0x3f;
+        sMirrorOn = sc == 0x3f && !sky;
         // The menus (the game puts engine A on the top screen, POWCNT1 bit 15, and draws the menu with engine B):
         // one screen, as the iPhone build - the scene keeps being drawn and the menu goes over it (sOverlayOn).
-        sSkyOn = sky_shown() && !sLogoOn && !sMirrorOn;
+        sSkyOn = sky;
         sOverlayOn = !sMirrorOn && !sSkyOn && (sPowCnt & 0x8000);
         gSkyStat[0] += sSkyOn;
         gSkyStat[6] += sLogoOn || sMirrorOn || sOverlayOn;
@@ -2149,7 +2155,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         if (ovl) sOverlayOn = ovl == 2 || (sPowCnt & 0x8000) != 0;   // (2: always - a test of the overlay path)
         static int sky = -1;   // (host check of the Vita's sky, with ACWW_FORCEMAIN)
         if (sky < 0) sky = getenv("ACWW_SKY") ? atoi(getenv("ACWW_SKY")) : 0;
-        sSkyOn = sky && forceMain && !sOverlayOn && sky_shown();
+        sSkyOn = sky && forceMain && !sOverlayOn && gpu2d_sky_wanted();
     }
 #endif
     {

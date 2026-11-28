@@ -1006,8 +1006,8 @@ static void render_frame_mt(void) {
 #endif
                 if (gSkyStat[7])
                     fprintf(stderr, "render: sky shown in %u of %u frames, drawn by the compose in %d (not shown: sky not on the top "
-                            "screen %u, indoors %u, top screen off %u, screens swapped %u, top screen blank %u, title/boot/menu %u)\n",
-                            gSkyStat[0], gSkyStat[7], vita_gl_sky_frames(), gSkyStat[1], gSkyStat[2], gSkyStat[3],
+                            "screen %u, top screen off %u, screens swapped %u, top screen blank %u, title/boot/menu %u)\n",
+                            gSkyStat[0], gSkyStat[7], vita_gl_sky_frames(), gSkyStat[1], gSkyStat[3],
                             gSkyStat[4], gSkyStat[5], gSkyStat[6]);
                 memset(gSkyStat, 0, sizeof gSkyStat);
             }
