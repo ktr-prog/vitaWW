@@ -876,8 +876,15 @@ static void render_frame_mt(void) {
             extern int gHostSnapSub;
             unsigned sc = Scene_GetCurrent();
             extern int gpu2d_sub_shown(void);
-            gHostSnapSub = sc == 0x2c || sc == 0x3f || gpu2d_sub_shown();   // the title's logo; the boot screens'
-                                                                            // Nintendo logo; the menus (engine B)
+            extern int gpu2d_sky_wanted(void);
+            gHostSnapSub = sc == 0x2c || sc == 0x3f || gpu2d_sub_shown() ||   // the title's logo; the boot screens'
+                           gpu2d_sky_wanted();                                // Nintendo logo; the menus (engine B);
+        }                                                                    // the sky (engine B, gpu2d sSkyOn)
+#else
+        {   // (host check of the Vita's sky: ACWW_FORCEMAIN + ACWW_SKY)
+            extern int gHostSnapSub;
+            extern int gpu2d_sky_wanted(void);
+            gHostSnapSub = mainOnly && getenv("ACWW_SKY") && gpu2d_sky_wanted();
         }
 #endif
         if (mainOnly) host_vram_snapshot_banks(sSnapBank, slot, gpu2d_main_vram_display());
@@ -993,7 +1000,7 @@ static void render_frame_mt(void) {
             {   // the menus over the scene: engine B's lines redrawn on the CPU (the bands) and what they cost
                 extern unsigned long long gBProfNs, gBProfLines, gBProfRuns, gBgKindN[2][5][2];
                 if (gBProfLines)
-                    fprintf(stderr, "render: menu layer %llu lines redrawn, %llu us/line (its BG lines: text %llu, %llu us; "
+                    fprintf(stderr, "render: menu / sky layer %llu lines redrawn, %llu us/line (its BG lines: text %llu, %llu us; "
                             "affine %llu, %llu us; extended %llu, %llu us; bitmap %llu, %llu us)\n",
                             gBProfLines, gBProfNs / 1000 / gBProfLines, gBgKindN[1][1][0], gBgKindN[1][1][1] / 1000,
                             gBgKindN[1][2][0], gBgKindN[1][2][1] / 1000, gBgKindN[1][3][0], gBgKindN[1][3][1] / 1000,

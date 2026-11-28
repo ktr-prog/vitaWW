@@ -825,6 +825,15 @@ static int sLogoOn, sLogoReady, sLogoFull, sLogoDx, sLogoDy, sPromptSnap;
 static int sMirrorOn, sMirrorReady;
 static uint32_t sLogo[SCREEN_W * SCREEN_H];
 static int sOverlayOn, sOvlReady;   // (Vita) a menu over the scene: engine B drawn by the bands into sLogo
+// (Vita) The sky: outdoors with no menu the top screen (engine B) shows the sky - its gradient, clouds, stars, sun,
+// moon - and the main screen only a flat backdrop colour above the town's horizon. The Vita shows that sky there
+// instead: the bands draw engine B's lines 0..SKY_ROWS-1 into sLogo (only the changed ones, without engine B's own
+// master brightness), and the GPU compose uses its pixel wherever the main screen's backdrop colour would be
+// (so the 3D's translucent edges, the colour effects and the fades work on it as on the backdrop), 1:1 - the place
+// the game itself draws the sky on the town's screen (Sky_HBlankMain with no scroll). The horizon is at most
+// ~40 lines down; below SKY_ROWS the main screen's own backdrop stays.
+enum { SKY_ROWS = 56 };
+static int sSkyOn, sSkyReady;
 static unsigned sLogoGen;   // counts the frames that wrote sLogo (the present uploads it only then)
 unsigned gpu2d_gc_logo_gen(void) { return sLogoGen; }
 // The rows of sLogo written since the present last took them (it uploads only those): set by whoever writes a row
@@ -852,7 +861,7 @@ int gpu2d_sub_shown(void) { return (sPowCnt & 0x8000) != 0; }   // (Vita) engine
 int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirror) {
     // mirror: 1 engine B's picture instead (boot screens), 2 the menu over the scene (alpha: 0 none, 128 over the
     // 3D or the backdrop, 255 always - single_compose's rule)
-    *mirror = sMirrorReady ? 1 : sOvlReady ? 2 : 0;
+    *mirror = sMirrorReady ? 1 : sOvlReady ? 2 : sSkyReady ? 3 : 0;
     if (*mirror) { *px = sLogo; *dx = *dy = *prompt = 0; return 1; }
     *prompt = sLogoOn && sPromptSnap;
     *dx = sLogoDx;
@@ -1227,6 +1236,8 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     p[10] = (u8)(mb >> 14);
     p[11] = (u8)(mbf > 16 ? 16 : mbf);
     u32 bd = rgb6(pal16(e->palette, 0));
+    // (the sky: beside the 2D area, where there is no sky picture, the sky's own colour on this line)
+    if (sSkyOn && line < SKY_ROWS) bd = rgb6(pal16(s2dPalSnapB[line], 0));
     p[12] = (u8)(bd & 0x3f); p[13] = (u8)(bd >> 8 & 0x3f); p[14] = (u8)(bd >> 16 & 0x3f); p[15] = 0;
     s32 hofs3d = reg16(e, REG_BGHOFS) & 0x1ff;
     if (hofs3d & 0x100) hofs3d -= 0x200;
@@ -1382,7 +1393,7 @@ static void band2d_run_(Band2d *w) {
             const u8 *bb = sBBack + line * SCREEN_W, *bk = sBKeep + line * SCREEN_W;
             for (int x = 0; x < SCREEN_W; x++) {
                 u32 c = argb(o[x]);
-                u32 a = w->mirror == 1 ? 0xffu : bb[x] ? 0u : bk[x] ? 0xffu : 0x80u;
+                u32 a = w->mirror != 2 ? 0xffu : bb[x] ? 0u : bk[x] ? 0xffu : 0x80u;   // (1 the boot screens, 3 the sky: all)
                 d[x] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | a << 24;
             }
             __atomic_store_n(&sLogoRows[line], 1, __ATOMIC_RELEASE);
@@ -1500,12 +1511,12 @@ static u32 sub_state_hash(const Engine *e1, int mirror) {
 // palette changed, the lines a changed OAM entry covers (before or after), or all of them when its VRAM changed.
 // The menus animate a cursor and scroll their background every frame; drawing all of engine B each frame cost the
 // menus ~18 ms per band (30 fps).
-static u32 bline_sig(const u8 *regs, u32 palh) {   // a line's registers, without the scroll of BGs not shown
-    u8 t[REG_SIZE];
+static u32 bline_sig(const u8 *regs, u32 palh, u32 ignore) {   // a line's registers, without the scroll of BGs not
+    u8 t[REG_SIZE];                                                // shown (or in ignore: BGs with nothing to show)
     memcpy(t, regs, REG_SIZE);
     u32 dc = (u32)(t[0] | t[1] << 8 | t[2] << 16 | (u32)t[3] << 24), g;
     for (int n = 0; n < 4; n++)
-        if (!(dc >> (8 + n) & 1)) {
+        if (!(dc >> (8 + n) & 1) || (ignore >> n & 1)) {
             memset(t + 0x10 + 4 * n, 0, 4);
             if (n >= 2) memset(t + 0x20 + 0x10 * (n - 2), 0, 0x10);
         }
@@ -1556,6 +1567,38 @@ static int range_changed(const Engine *e1, int k, u32 a, u32 b) {
     return d;
 }
 static void oam_mark(u8 *dirty, const u8 *ent);
+// (the sky) Whether engine B's BG3 - the clouds, an affine BG - has no pixel to show at all: every tile its map uses
+// is all colour 0. Then its scroll (it drifts every frame) does not redraw the sky's lines (bline_sig). Worked out
+// again when its VRAM changed (vram_mark: any change in what an affine BG reads) or its mode / BG3CNT did.
+static int sSkyBg3Empty;
+static void sky_bg3_check(const Engine *e1, int changed) {
+    static u32 key = ~0u;
+    const u32 dc = reg32(e1, REG_DISPCNT), mode = dc & 7, cnt = reg16(e1, REG_BGCNT + 6);
+    const u32 k = mode | cnt << 8;
+    if (!changed && k == key) return;
+    key = k;
+    sSkyBg3Empty = 0;
+    // affine (modes 1, 2) or extended with a 16-bit map (modes 3-5, BG3CNT bit 7 clear); else (text, bitmap) unknown
+    const int ext = mode >= 3 && mode <= 5;
+    if (!(mode == 1 || mode == 2 || (ext && !(cnt & 0x80)))) return;
+    const u32 side = 128u << (cnt >> 14), n = (side / 8) * (side / 8);
+    const u32 cb = (cnt >> 2 & 15) * 0x4000, sb = (cnt >> 8 & 31) * 0x800;
+    static u8 seen[1024];
+    memset(seen, 0, sizeof seen);
+    for (u32 i = 0; i < n; i++) {
+        const u8 *mp = vram_ptr(e1, 0, sb + (ext ? i * 2 : i));
+        if (!mp) return;
+        u32 t = ext ? (u32)(mp[0] | mp[1] << 8) & 0x3ff : mp[0];
+        if (seen[t]) continue;
+        seen[t] = 1;
+        for (u32 b = 0; b < 64; b += 32) {   // (vram_ptr's granules are 16 KB: 32 bytes never cross one)
+            const u8 *tp = vram_ptr(e1, 0, cb + t * 64 + b);
+            if (!tp) return;
+            for (u32 j = 0; j < 32; j++) if (tp[j]) return;
+        }
+    }
+    sSkyBg3Empty = 1;
+}
 // Marks the lines drawn from changed VRAM; returns 1 when that cannot be narrowed (all lines then).
 static int vram_mark(const Engine *e1, const u8 (*regs)[REG_SIZE], u8 *dirty) {
     if (++sChkFrame == 0) { memset(sChkStamp, 0, sizeof sChkStamp); sChkFrame = 1; }
@@ -1667,15 +1710,15 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     // the sub screen's picture: redrawn only when its inputs changed (above)
     int subDraw = 0;
     u32 subLines = 2166136261u;
-    const int whole = sMirrorOn || sOverlayOn;   // engine B's whole picture is drawn (boot screens, menus)
+    const int whole = sMirrorOn || sOverlayOn || sSkyOn;   // engine B's picture is drawn (boot screens, menus, the sky)
     int bAll = 0;   // (whole) every line of engine B is redrawn
     if (whole) {
         uint64_t t0 = host_plat_time_ns();
         const Engine *e1 = &sEngine[1];
-        int mode = sMirrorOn ? 1 : 2;
+        int mode = sMirrorOn ? 1 : sOverlayOn ? 2 : 3;
         u32 vs = ext_pal_hash(e1);   // (the VRAM itself: vram_diff after the lines)
         bAll = !sBValid || mode != sBMode || vs != sBVramSig || (sMirrorOn && !sMirrorReady) ||
-               (sOverlayOn && !sOvlReady);
+               (sOverlayOn && !sOvlReady) || (sSkyOn && !sSkyReady);
         sBVramSig = vs;
         sBMode = mode;
         memset(sBDirty, 0, sizeof sBDirty);
@@ -1706,6 +1749,8 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     // not seen). The menus: engine A as always, then engine B's changed lines (sMtWB) to go over it.
     const int mirrorBand = sMirrorOn;
     const int overlayBand = sOverlayOn;
+    const int skyBand = sSkyOn;
+    const int bSnap = overlayBand || skyBand;   // engine B's per-line snapshots are taken (its own bands draw it)
     Engine *se = mirrorBand ? &sEngine[1] : e;   // the engine the bands draw
     sIrisSnap = gHostIrisRadius;
     for (int b = 0; b <= s2dNB; b++) sMtBnd[b] = b * SCREEN_H / s2dNB;
@@ -1717,7 +1762,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
             s->refLine = se->refLine; s->refWritten[0] = se->refWritten[0]; s->refWritten[1] = se->refWritten[1];
             s->winActive[0] = se->winActive[0]; s->winActive[1] = se->winActive[1];
             s->objMosaicLine = se->objMosaicLine; s->objMosaicCount = se->objMosaicCount;
-            if (overlayBand) {
+            if (bSnap) {
                 const Engine *b1 = &sEngine[1];
                 Snap2d *t = &sMtWB[bi].snap;
                 t->refX[0] = b1->refX[0]; t->refX[1] = b1->refX[1]; t->refY[0] = b1->refY[0]; t->refY[1] = b1->refY[1];
@@ -1733,24 +1778,25 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         window_vertical(e, line);
         if (line == 0) { e->objMosaicLine = 0; e->objMosaicCount = 0; }  // matches obj-render's line-0 reset
         obj_mosaic_y(e, line);
-        if (overlayBand) {
+        if (overlayBand || (skyBand && line < SKY_ROWS)) {
             memcpy(s2dRegSnapB[line], sEngine[1].regs, REG_SIZE);
             memcpy(s2dPalSnapB[line], sEngine[1].palette, 0x400);
+            if (skyBand) s2dRegSnapB[line][REG_MASTER_BRIGHT] = s2dRegSnapB[line][REG_MASTER_BRIGHT + 1] = 0;
         }
-        if (whole) {   // this line's inputs against last frame's: redraw it when they differ
+        if (whole && (!skyBand || line < SKY_ROWS)) {   // this line's inputs against last frame's: redraw it when they differ
             static u32 palh;
-            const u8 *pl = overlayBand ? s2dPalSnapB[line] : s2dPalSnap[line];
-            const u8 *pp = line ? (overlayBand ? s2dPalSnapB[line - 1] : s2dPalSnap[line - 1]) : NULL;
+            const u8 *pl = bSnap ? s2dPalSnapB[line] : s2dPalSnap[line];
+            const u8 *pp = line ? (bSnap ? s2dPalSnapB[line - 1] : s2dPalSnap[line - 1]) : NULL;
             if (!pp || memcmp(pl, pp, 0x400)) {
                 u32 g;
                 palh = hash_words(0x27d4eb2du, 0, pl, 0x400, &g);
                 palh = mix32(palh, g);
             }
-            u32 ls = bline_sig(sEngine[1].regs, palh);
+            u32 ls = bline_sig(sEngine[1].regs, palh, skyBand && sSkyBg3Empty ? 8u : 0u);
             if (bAll || ls != sBLineSig[line]) sBDirty[line] = 1;
             sBLineSig[line] = ls;
         }
-        if (mirrorBand || overlayBand) {   // engine B's own per-line state, for the band snapshots above
+        if (mirrorBand || bSnap) {   // engine B's own per-line state, for the band snapshots above
             Engine *e1 = &sEngine[1];
             window_vertical(e1, line);
             if (line == 0) { e1->objMosaicLine = 0; e1->objMosaicCount = 0; }
@@ -1788,10 +1834,19 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     int bLines = 0;
     if (whole) {
         uint64_t t0 = host_plat_time_ns();
-        if (vram_mark(&sEngine[1], overlayBand ? (const u8 (*)[REG_SIZE])s2dRegSnapB : (const u8 (*)[REG_SIZE])s2dRegSnap,
-                      sBDirty))
+        int vm = vram_mark(&sEngine[1], bSnap ? (const u8 (*)[REG_SIZE])s2dRegSnapB : (const u8 (*)[REG_SIZE])s2dRegSnap,
+                           sBDirty);
+        if (vm)
             memset(sBDirty, 1, sizeof sBDirty);
+        if (skyBand) sky_bg3_check(&sEngine[1], bAll || vm);
         if (bAll) memset(sBDirty, 1, sizeof sBDirty);
+        if (skyBand) {   // (the sky: only its rows; below them no sky picture - the main screen's backdrop)
+            memset(sBDirty + SKY_ROWS, 0, SCREEN_H - SKY_ROWS);
+            if (bAll) {
+                memset(sLogo + SKY_ROWS * SCREEN_W, 0, (SCREEN_H - SKY_ROWS) * SCREEN_W * sizeof *sLogo);
+                for (int y = SKY_ROWS; y < SCREEN_H; y++) __atomic_store_n(&sLogoRows[y], 1, __ATOMIC_RELEASE);
+            }
+        }
         gSubCheckNs += host_plat_time_ns() - t0;
         for (int i = 0; i < SCREEN_H; i++) bLines += sBDirty[i];
         sBValid = 1;
@@ -1801,6 +1856,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     if (mirrorBand) sMirrorReady = 1;   // (the bands fill sLogo before this frame's present, on the render thread)
     if (!sOverlayOn) sOvlReady = 0;
     if (overlayBand) sOvlReady = 1;
+    sSkyReady = skyBand;
     sLogoReady = sLogoOn && !sLogoFull;
     sPromptSnap = gHostTitlePrompt;
     sClockSnap = gHostClockDrawn;
@@ -1823,12 +1879,12 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         sMtWB[b].in = in; sMtWB[b].src = &sEngine[1]; sMtWB[b].be = &s2dBandEngB[b];
         // (every band walks all of engine B's lines from line 0 and draws its share of the changed ones: a menu's
         // changed lines are often all in one half of the screen, which left one band with all the work)
-        sMtWB[b].lo = 0; sMtWB[b].hi = overlayBand && bLines ? SCREEN_H : 0;
+        sMtWB[b].lo = 0; sMtWB[b].hi = !bLines ? 0 : overlayBand ? SCREEN_H : skyBand ? SKY_ROWS : 0;
         sMtWB[b].part = b; sMtWB[b].nparts = s2dNB;
         if (b) sMtWB[b].snap = sMtWB[0].snap;
-        sMtWB[b].canvas = NULL; sMtWB[b].mirror = 2; sMtWB[b].dirty = sBDirty;
+        sMtWB[b].canvas = NULL; sMtWB[b].mirror = skyBand ? 3 : 2; sMtWB[b].dirty = sBDirty;
         sMtWB[b].regSnap = s2dRegSnapB, sMtWB[b].palSnap = s2dPalSnapB;
-        if (overlayBand && bLines) memcpy(&s2dBandEngB[b], &sEngine[1], offsetof(Engine, out));
+        if (bSnap && bLines) memcpy(&s2dBandEngB[b], &sEngine[1], offsetof(Engine, out));
     }
 }
 
@@ -1986,6 +2042,20 @@ static int render_engine0_mt(const Gpu2dFrameInput *in) {
     return 1;
 }
 
+// The top screen shows the town's sky (the game's sky on engine B, displayed normally, the screens not swapped).
+static int sky_shown(void) {
+    extern int Sky_HostOnSub(void);
+    extern int Scene_HostIsOutdoor(void);
+    const u32 d = reg32(&sEngine[1], REG_DISPCNT);
+    return Sky_HostOnSub() && Scene_HostIsOutdoor() && (sPowCnt & 0x200) && !(sPowCnt & 0x8000) && !(d & 0x80) &&
+           (d >> 16 & 3) == 1;
+}
+// (render.c, before the frame's VRAM snapshot) the sky will be drawn this frame: keep engine B's banks
+int gpu2d_sky_wanted(void) {
+    extern unsigned Scene_GetCurrent(void);
+    const unsigned sc = Scene_GetCurrent();
+    return sc != 0x2c && sc != 0x3f && !(sPowCnt & 0x8000) && sky_shown();
+}
 void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     {   // (host check) both engines' finished pictures of the previous frame
         static int on = -1;
@@ -2011,6 +2081,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         // The menus (the game puts engine A on the top screen, POWCNT1 bit 15, and draws the menu with engine B):
         // one screen, as the iPhone build - the scene keeps being drawn and the menu goes over it (sOverlayOn).
         sOverlayOn = !sMirrorOn && (sPowCnt & 0x8000);
+        sSkyOn = !sLogoOn && !sMirrorOn && !sOverlayOn && sky_shown();
     }
 #else
     static int forceMain = -1;
@@ -2020,6 +2091,9 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         static int ovl = -1;
         if (ovl < 0) ovl = getenv("ACWW_OVERLAY") ? atoi(getenv("ACWW_OVERLAY")) : 0;
         if (ovl) sOverlayOn = ovl == 2 || (sPowCnt & 0x8000) != 0;   // (2: always - a test of the overlay path)
+        static int sky = -1;   // (host check of the Vita's sky, with ACWW_FORCEMAIN)
+        if (sky < 0) sky = getenv("ACWW_SKY") ? atoi(getenv("ACWW_SKY")) : 0;
+        sSkyOn = sky && forceMain && !sOverlayOn && sky_shown();
     }
 #endif
     {
@@ -2062,7 +2136,7 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     }
     sExtRows = 0;
     if (sSingle && !sSingleBlank && !sGpu && !sDefer3d) render_ext_sky(in);
-    for (int n = 0; n < (mainOnly && !sMirrorOn && !sOverlayOn ? 1 : 2); n++) {
+    for (int n = 0; n < (mainOnly && !sMirrorOn && !sOverlayOn && !sSkyOn ? 1 : 2); n++) {
         Engine *e = &sEngine[n];
         for (int line = SCREEN_H + 1; line < FRAME_LINES; line++) window_vertical(e, line);
         gpu2d_render_obj_line(e, 0, &e->objNextLine0);

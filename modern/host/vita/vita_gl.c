@@ -248,19 +248,19 @@ static void gc_static_uniforms(GLuint prog) {
     glUseProgram(0);
 }
 // This frame's compose uniforms (vita_gl_present_gc), set on whichever compose program draws.
-static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift; } sGcU;
+static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift, sky; } sGcU;
 static void gc_frame_uniforms(GLuint prog) {
     // (the locations looked up once per program: vitaGL finds a uniform by comparing names)
     static GLuint progs[4];
-    static GLint loc[4][11];
+    static GLint loc[4][12];
     int k = 0;
     while (k < 4 && progs[k] && progs[k] != prog) k++;
     if (k == 4) k = 0;
     if (progs[k] != prog) {
-        static const char *const kN[11] = {"uHave3d", "uOvlOn", "uLogoOn", "uMirror", "uLogoOfs", "uBg3Shift",
-                                           "uObjMove", "uVLogoOfs", "uVBg3Shift", "uVFlip", "uObjShift"};
+        static const char *const kN[12] = {"uHave3d", "uOvlOn", "uLogoOn", "uMirror", "uLogoOfs", "uBg3Shift",
+                                           "uObjMove", "uVLogoOfs", "uVBg3Shift", "uVFlip", "uObjShift", "uSkyOn"};
         progs[k] = prog;
-        for (int i = 0; i < 11; i++) loc[k][i] = glGetUniformLocation(prog, kN[i]);
+        for (int i = 0; i < 12; i++) loc[k][i] = glGetUniformLocation(prog, kN[i]);
     }
     const GLint *l = loc[k];
     glUseProgram(prog);
@@ -275,6 +275,7 @@ static void gc_frame_uniforms(GLuint prog) {
     glUniform1f(l[8], sGcU.bg3);
     glUniform1f(l[9], sGcFlip);
     glUniform1f(l[10], sGcU.objShift);
+    glUniform1f(l[11], sGcU.sky);
 }
 // The present, built from plain texture copies and the GPU's blending (per-pixel arithmetic at the screen's
 // 960x544 is what costs on the Vita: a shader of a few dozen operations took 10 ms, a copy 1.2 ms):
@@ -698,6 +699,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         sGcLogoPx = on && !mirror ? (const unsigned *)lp : NULL;
         sGcU.mirror = mirror == 1 ? 1.0f : 0.0f;   // the boot screens: the top screen's picture instead
         sOvlNow = mirror == 2 && on;
+        sGcU.sky = on && mirror == 3 ? 1.0f : 0.0f;   // the top screen's sky where the backdrop would be (gpu2d sSkyOn)
         mirrorNow = on && mirror == 1;   // a menu: drawn over the composed picture below (its own small pass)
         sGcU.ofs[0] = (float)dx; sGcU.ofs[1] = (float)dy;
         sGcU.bg3 = prompt ? (float)GC_R : 0.0f;   // (to the screen's right edge)

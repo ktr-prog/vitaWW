@@ -6,6 +6,7 @@
 #include <time.h>
 #ifndef _WIN32
 #include <dirent.h>
+#include <pthread.h>
 #include <strings.h>
 #endif
 
@@ -391,12 +392,17 @@ static void save_adopt(void) {
 #endif
 }
 
+static void save_drain(void);
+static pthread_mutex_t sSaveMx = PTHREAD_MUTEX_INITIALIZER;   // sSave/sSaveSize against the save writer (below)
 static void save_load(u32 size) {
     save_keep();
     if (sSave && size <= sSaveSize) return;
+    save_drain();   // (a larger size after saving began: the writer is idle before the file is read again below)
+    pthread_mutex_lock(&sSaveMx);   // (the save writer copies from sSave)
     sSave = realloc(sSave, size);
     memset(sSave + sSaveSize, 0xff, size - sSaveSize);
     sSaveSize = size;
+    pthread_mutex_unlock(&sSaveMx);
     if (!sSavePath) return;
     if (!sSaveFile) {
         FILE *probe = fopen(sSavePath, "rb");
@@ -432,21 +438,104 @@ static void save_load(u32 size) {
         }
     }
 }
+// Save writes go to the file on a background thread. The game saves in 256-byte pages, up to ten in one frame, and
+// a write + flush per page on the game thread cost ~10 ms each on the Vita's memory card (frames of 60-126 ms while
+// saving). sSave is still updated at once (the game reads it back straight away); the writer copies the pages
+// marked since its last pass and writes each run of them, so a page written again before then is written once.
+enum { SAVE_PAGE = 256 };
+static pthread_cond_t sSaveWake = PTHREAD_COND_INITIALIZER, sSaveIdle = PTHREAD_COND_INITIALIZER;
+static u8 *sSaveDirty, *sSaveCopy;   // per page: marked since the writer's last pass; the writer's copy of the image
+static u32 sSaveDirtyPages;          // pages in sSaveDirty (sSaveSize / SAVE_PAGE, rounded up)
+static int sSaveAny, sSaveBusy, sSaveWriter, sSaveFull;   // sSaveFull: the file is known to be sSaveSize long
+static void save_write_runs(const u8 *dirty, u32 pages, u32 size) {   // writer thread, without the lock
+    if (!sSaveFile) {
+        sSaveFile = fopen(sSavePath, "r+b");
+        if (!sSaveFile) sSaveFile = fopen(sSavePath, "w+b");
+        if (!sSaveFile) { perror(sSavePath); return; }
+    }
+    for (u32 p = 0; p < pages;) {
+        if (!dirty[p]) { p++; continue; }
+        u32 q = p;
+        while (q < pages && dirty[q]) q++;
+        u32 at = p * SAVE_PAGE, end = q * SAVE_PAGE < size ? q * SAVE_PAGE : size;
+        fseek(sSaveFile, (long)at, SEEK_SET);
+        fwrite(sSaveCopy + at, 1, end - at, sSaveFile);
+        p = q;
+    }
+    fflush(sSaveFile);
+}
+static void *save_writer(void *arg) {
+    (void)arg;
+    static u8 *mine;
+    static u32 mineN;
+    pthread_mutex_lock(&sSaveMx);
+    for (;;) {
+        while (!sSaveAny) pthread_cond_wait(&sSaveWake, &sSaveMx);
+        u32 pages = sSaveDirtyPages, size = sSaveSize;
+        if (mineN < pages) { mine = realloc(mine, pages); mineN = pages; }
+        sSaveCopy = realloc(sSaveCopy, size);
+        if (!sSaveFull) {   // first pass: the whole image, so the file is the full size from then on
+            memset(sSaveDirty, 1, pages);
+            sSaveFull = 1;
+        }
+        for (u32 p = 0; p < pages; p++) {
+            mine[p] = sSaveDirty[p];
+            if (mine[p]) {
+                u32 at = p * SAVE_PAGE, n = at + SAVE_PAGE <= size ? SAVE_PAGE : size - at;
+                memcpy(sSaveCopy + at, sSave + at, n);
+            }
+        }
+        memset(sSaveDirty, 0, pages);
+        sSaveAny = 0;
+        sSaveBusy = 1;
+        pthread_mutex_unlock(&sSaveMx);
+        save_write_runs(mine, pages, size);
+        pthread_mutex_lock(&sSaveMx);
+        sSaveBusy = 0;
+        pthread_cond_broadcast(&sSaveIdle);
+    }
+    return 0;
+}
+static void save_drain(void) {   // at exit: wait until every marked page is in the file
+    pthread_mutex_lock(&sSaveMx);
+    while (sSaveWriter && (sSaveAny || sSaveBusy)) pthread_cond_wait(&sSaveIdle, &sSaveMx);
+    pthread_mutex_unlock(&sSaveMx);
+}
 static void save_store(u32 at, u32 len) {
     save_keep();
     if (!sSavePath || at >= sSaveSize) return;
-    if (!sSaveFile) {
-        sSaveFile = fopen(sSavePath, "w+b");
-        if (!sSaveFile) { perror(sSavePath); sSavePath = 0; return; }
-    }
-    fseek(sSaveFile, 0, SEEK_END);
-    long have = ftell(sSaveFile);
-    if (have >= 0 && have < (long)sSaveSize)
-        fwrite(sSave + have, 1, sSaveSize - (u32)have, sSaveFile);
     if (len > sSaveSize - at) len = sSaveSize - at;
-    fseek(sSaveFile, (long)at, SEEK_SET);
-    fwrite(sSave + at, 1, len, sSaveFile);
-    fflush(sSaveFile);
+    pthread_mutex_lock(&sSaveMx);
+    u32 pages = (sSaveSize + SAVE_PAGE - 1) / SAVE_PAGE;
+    if (pages != sSaveDirtyPages) {
+        sSaveDirty = realloc(sSaveDirty, pages);
+        if (pages > sSaveDirtyPages) memset(sSaveDirty + sSaveDirtyPages, 0, pages - sSaveDirtyPages);
+        sSaveDirtyPages = pages;
+        sSaveFull = 0;   // (the file may be shorter than the new size)
+    }
+    for (u32 p = at / SAVE_PAGE; p <= (at + len - 1) / SAVE_PAGE && p < pages; p++) sSaveDirty[p] = 1;
+    sSaveAny = 1;
+    if (!sSaveWriter) {
+        pthread_t t;
+        if (pthread_create(&t, 0, save_writer, 0) == 0) {
+            pthread_detach(t);
+            sSaveWriter = 1;
+            atexit(save_drain);
+        }
+    }
+    pthread_cond_signal(&sSaveWake);
+    int threaded = sSaveWriter;
+    pthread_mutex_unlock(&sSaveMx);
+    if (!threaded) {   // (no thread: write here, as before)
+        u8 *one = calloc(pages, 1);
+        if (!one) return;
+        for (u32 p = at / SAVE_PAGE; p <= (at + len - 1) / SAVE_PAGE && p < pages; p++) one[p] = 1;
+        if (!sSaveFull) { memset(one, 1, pages); sSaveFull = 1; }
+        sSaveCopy = realloc(sSaveCopy, sSaveSize);
+        memcpy(sSaveCopy, sSave, sSaveSize);
+        save_write_runs(one, pages, sSaveSize);
+        free(one);
+    }
 }
 
 static void card_request(u32 data) {

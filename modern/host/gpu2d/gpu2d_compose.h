@@ -51,6 +51,7 @@ static const char kGcVertexShader[] =
     "uniform float uBg3Shift;\n" \
     "uniform vec4 uObjMove;\n" \
     "uniform float uObjShift;\n" \
+    "uniform float uSkyOn;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
     "float bitOf(float v, float p) { return gmod(floor(v / p), 2.0); }\n"   \
     "vec3 col15(float lo, float hi) {\n" \
@@ -75,6 +76,8 @@ static const char kGcVertexShader[] =
     "  float first = L1.x, second = L1.y, effect = L1.z, evy = L1.w;\n" \
     "  float eva = L2.x, evb = L2.y, mbm = L2.z, mbf = L2.w;\n" \
     "  vec3 bd = L3.xyz;\n" \
+    /* the sky (gpu2d.c sSkyOn): the top screen's sky picture in uLogo, 1:1, where the backdrop colour would be */ \
+    "  if (uSkyOn > 0.5 && in2d > 0.5 && pLg.a > 0.5) bd = floor(pLg.rgb * 63.0 + 0.5);\n" \
     "  float objOn = L4.x, on3d = L4.y, uni = L4.z;\n" \
     "  vec4 ax = pAux;\n" \
     "  vec2 euv = vec2(x < 0.0 ? 0.5 / 256.0 : 255.5 / 256.0, uv.y);\n" \
@@ -427,6 +430,8 @@ static const char kGcqVertexShaderCg[] =
     "  vec4 L3 = floor(" TEX "(uLp, vP3) * 255.0 + 0.5), q = " TEX "(u3d, v3d);\n" \
     "  float qa = floor(by(q.a) / 8.0), b2 = bitOf(L1.y, 32.0);\n" \
     "  vec3 c = floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0), bd = L3.xyz;\n" \
+    "  vec4 sk = " TEX "(uLogo, vLg);\n" \
+    "  if (uSkyOn > 0.5 && sk.a > 0.5 && vLg.x > 0.0 && vLg.x < 1.0) bd = floor(sk.rgb * 63.0 + 0.5);\n" \
     "  vec3 o = qa > 30.5 ? c : (qa < 0.5 ? bd : (b2 > 0.5 ? blend3d(c, bd, qa) : c));\n" \
     "  float al = qa < 0.5 || (qa < 30.5 && b2 > 0.5) ? 1.0 : 0.0;\n" \
     "  if (L2.z > 0.5 && L2.z < 1.5 && L2.w > 0.5) o = brighten(o, L2.w, 0.0);\n" \
@@ -438,7 +443,8 @@ static const char kGcTileFragmentShader[] =   // GLSL ES 1.00 (host check)
 static const char kGcTileFragmentShaderCg[] =
     "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
     "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
-    "float4 main(float2 v3d : TEXCOORD2, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6, float2 vP3 : TEXCOORD7) : COLOR {\n"
+    "float4 main(float2 v3d : TEXCOORD2, float2 vLg : TEXCOORD3, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6,\n"
+    "            float2 vP3 : TEXCOORD7) : COLOR {\n"
     GC_TILE_FAST_MAIN("tex2D") "  return res;\n}\n";
 // The tiles as two lists of triangles (x, y in clip space; 6 vertices a tile run): fast (the program above) and full.
 // W: canvas columns (the 2D area from column (W - 256) / 2); flip: the GPU's rows against y (vita_gl.c); whole: every
