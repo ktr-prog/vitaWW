@@ -356,10 +356,13 @@ extern "C" s32 gVBlanksPerFrame;
 //   (the town's own camera stays this game's - preset 0's tilt, distance, look-at point and 30 deg field of view;
 //   only City Folk's look-up and its angles are taken: updateModeDefault)
 //   transition 6 (to looking up): 150 frames, easing in 30, out 120; transition 7 (back): 30 frames, 5, 20 (60 Hz)
+//   (going up is quicker and smoother here: kCfToLookUp)
 // Looking up (execFollow, resetLookUpTimer): up on the D-pad while the player stands still; the camera comes back
 // down when the player does anything else. CameraPose is {yaw, pitch, distance, offset x, y, z}.
 static const CameraPose kCfLookUp = {0, 4004, 0x17200, 0, 0x2c00, -0x4000};
-static const s32 kCfToLookUp[4] = {0, 150, 30, 120}, kCfBack[4] = {0, 30, 5, 20};   // (start, end, ease in, out)
+// (start, end, ease in, ease out; 60 Hz frames) Going up: faster than City Folk's 150 frames and eased evenly both
+// ends (City Folk eases out over 120 of them: a long slow end); coming back: City Folk's transition 7.
+static const s32 kCfToLookUp[4] = {0, 84, 42, 42}, kCfBack[4] = {0, 30, 5, 20};
 extern "C" int gHostLookBtn;     // (frontend) the look-up button is held: the Vita's D-pad up
 extern "C" int gHostLookArmed;   // (to the frontend) the D-pad's up is the camera's now, not a step north
 int gHostLookBtn, gHostLookArmed;
@@ -386,12 +389,15 @@ BOOL Camera::onExecute() {
         static int lastBtn;
         const int btn = gHostLookBtn, pressed = btn && !lastBtn;
         lastBtn = btn;
-        const BOOL follow = Host_SkyCamera() && this == gCamera && mode == 0 && gCurSceneInfo->isOutdoor == 1 &&
-                            PlayerActor_Get(4) != NULL && !TalkRequest_IsActive() && !MenuCtrl_IsMenuOpen();
-        gHostLookArmed = follow;
-        if (!follow) {   // (another camera mode, a talk, a menu: back at the town's preset when it follows again -
-                         // City Folk's initFollow sets preset 0 and mLookUpTimer)
+        const BOOL town = Host_SkyCamera() && this == gCamera && mode == 0 && gCurSceneInfo->isOutdoor == 1 &&
+                          PlayerActor_Get(4) != NULL;
+        const BOOL free = town && !TalkRequest_IsActive() && !MenuCtrl_IsMenuOpen();
+        gHostLookArmed = free;
+        if (!town) {   // (another camera mode: back at the town's preset when it follows again - City Folk's
+                       // initFollow sets preset 0 and mLookUpTimer)
             sCfLook = 0, sCfTime = -1, sCfLookingUp = FALSE, sCfTimer = 180;
+        } else if (!free) {
+            // (a menu over the town - the inventory - or a talk: the camera stays where it is, looked up or not)
         } else {
             const BOOL idle = PlayerActor_GetAction(4) == 2;   // (standing: the player's "wait" action)
             if (pressed && idle && !sCfLookingUp) sCfTimer = 0;   // resetLookUpTimer (the player's D-pad up)

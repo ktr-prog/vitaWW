@@ -6324,6 +6324,7 @@ extern "C" void Sky_HBlankMain()
 // sky in place of the main screen's flat backdrop band (gpu2d.c sSkyOn).
 static int sSkyAlive;   // (the sky task exists: SkyProc onCreate .. onDelete)
 extern "C" int Sky_HostOnSub(void) { return sSkyAlive && sSkyOutdoors != 0 && gWeatherManager.engine == 0; }
+extern "C" int Sky_HostOutdoorAlive(void) { return sSkyAlive && sSkyOutdoors != 0; }   // (wherever it is drawn)
 extern "C" int Sky_HostExtLine(int line, s32 *out)
 {
     if (sSkyOutdoors == 0) return 0;
