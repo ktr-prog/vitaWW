@@ -1242,7 +1242,7 @@ static void gc_line(Engine *e, const Gpu2dFrameInput *in, int line) {
     p[11] = (u8)(mbf > 16 ? 16 : mbf);
     u32 bd = rgb6(pal16(e->palette, 0));
     // (the sky: beside the 2D area, where there is no sky picture, the sky's own colour on this line)
-    if (sSkyOn && line < SKY_OUT) bd = rgb6(pal16(s2dPalSnapB[(SKY_SRC0(line) + SKY_SRC0(line + 1)) / 2], 0));
+    if (sSkyOn) bd = rgb6(pal16(s2dPalSnapB[line < SKY_OUT ? (SKY_SRC0(line) + SKY_SRC0(line + 1)) / 2 : SCREEN_H - 1], 0));
     p[12] = (u8)(bd & 0x3f); p[13] = (u8)(bd >> 8 & 0x3f); p[14] = (u8)(bd >> 16 & 0x3f); p[15] = 0;
     s32 hofs3d = reg16(e, REG_BGHOFS) & 0x1ff;
     if (hofs3d & 0x100) hofs3d -= 0x200;
@@ -1846,16 +1846,27 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         if (skyBand) sky_bg3_check(&sEngine[1], bAll || vm);
         if (bAll) memset(sBDirty, 1, sizeof sBDirty);
         if (skyBand) {
-            if (bAll) {   // every line now; below the strip no sky picture (the main screen's backdrop)
+            static int warm, refresh;
+            if (bAll) warm = 8;   // the sky's first frames (often still in the fade in): every line, several times
+            if (warm > 0) {
+                warm--;
+                memset(sBDirty, 1, sizeof sBDirty);
                 memset(sSkyPend, 0, sizeof sSkyPend);
-                memset(sLogo + SKY_OUT * SCREEN_W, 0, (SCREEN_H - SKY_OUT) * SCREEN_W * sizeof *sLogo);
-                for (int y = SKY_OUT; y < SCREEN_H; y++) __atomic_store_n(&sLogoRows[y], 1, __ATOMIC_RELEASE);
-            } else {   // the changed lines, at most SKY_MAXLINES a frame (top first; the rest wait)
+            } else {
+                // and 4 lines a frame in turn whatever changed: no line can stay wrong (a change the line check
+                // misses - the scene's setup during the fade - is redrawn within 48 frames)
+                for (int k = 0; k < 4; k++) sSkyPend[(refresh + k) % SCREEN_H] = 1;
+                refresh = (refresh + 4) % SCREEN_H;
+                // the changed lines, at most SKY_MAXLINES a frame, in turn from where the last frame stopped
+                static int cursor;   // (top first starved the lower lines while the top ones changed every frame)
                 int n = 0;
                 for (int y = 0; y < SCREEN_H; y++) sSkyPend[y] |= sBDirty[y];
                 memset(sBDirty, 0, sizeof sBDirty);
-                for (int y = 0; y < SCREEN_H && n < SKY_MAXLINES; y++)
-                    if (sSkyPend[y]) sBDirty[y] = 1, sSkyPend[y] = 0, n++;
+                const int start = cursor;
+                for (int k = 0; k < SCREEN_H && n < SKY_MAXLINES; k++) {
+                    int y = (start + k) % SCREEN_H;
+                    if (sSkyPend[y]) sBDirty[y] = 1, sSkyPend[y] = 0, n++, cursor = (y + 1) % SCREEN_H;
+                }
             }
         }
         gSubCheckNs += host_plat_time_ns() - t0;
@@ -1951,6 +1962,20 @@ static void sky_combine(void) {
         }
         __atomic_store_n(&sLogoRows[v], 1, __ATOMIC_RELEASE);
     }
+    // Below the strip (where the horizon is lower): the top screen's bottom line - its horizon - all the way down,
+    // so no flat backdrop shows anywhere (rewritten only when that line changed).
+    static u32 last[SCREEN_W];
+    static int have;
+    const u32 *h = sSkyFull + (SCREEN_H - 1) * SCREEN_W;
+    if (!have || memcmp(last, h, sizeof last)) {
+        memcpy(last, h, sizeof last);
+        have = 1;
+        for (int y = SKY_OUT; y < SCREEN_H; y++) {
+            u32 *d = sLogo + y * SCREEN_W;
+            for (int x = 0; x < SCREEN_W; x++) d[x] = h[x] | 0xff000000u;
+            __atomic_store_n(&sLogoRows[y], 1, __ATOMIC_RELEASE);
+        }
+    }
 }
 static void render_engine0_mt_bands(u32 *canvas) {
     Engine *e = &sEngine[0];
@@ -2038,6 +2063,7 @@ static void gc_test_dump(void) {
         int m = sMirrorReady ? 1 : sOvlReady ? 2 : sSkyReady ? 3 : 0;
         fwrite(&m, 4, 1, f);
         fwrite(sLogo, 4, SCREEN_W * SCREEN_H, f);
+        fwrite(sSkyFull, 4, SCREEN_W * SCREEN_H, f);
         fclose(f);
     }
 }
@@ -2102,7 +2128,13 @@ static int sky_shown(void) {
     // that takes the top screen moves the sky off it first - Sky_SetEngine(1) - so Sky_HostOnSub says it)
     // (the game's sky task, not the scene number: on the Vita Scene_GetCurrent stays at the title's 0x2c in town after
     // a game is continued from the title, and Scene_HostIsOutdoor with it)
-    return Sky_HostOnSub() && (sPowCnt & 0x200) && !(d & 0x80) && (d >> 16 & 3) == 1;
+    extern void *PlayerActor_Get(int);
+    extern int MenuCtrl_IsIdle(void);
+    extern int MenuCtrl_IsMenuOpen(void);
+    // (the player exists: not the title, whose fly-over has the town's sky task too; a menu on its way in or open with
+    // the screens swapped: the menu overlay's)
+    const int menu = (sPowCnt & 0x8000) && (!MenuCtrl_IsIdle() || MenuCtrl_IsMenuOpen());
+    return Sky_HostOnSub() && PlayerActor_Get(4) && !menu && (sPowCnt & 0x200) && !(d & 0x80) && (d >> 16 & 3) == 1;
 }
 // (render.c, before the frame's VRAM snapshot) the sky will be drawn this frame: keep engine B's banks
 int gpu2d_sky_wanted(void) {
