@@ -353,15 +353,11 @@ extern "C" s32 gVBlanksPerFrame;
 // so a City Folk length L is L / 16 here; its angles are s16 (0x10000 a turn) as here, its pitch negative where this
 // game's is positive; its target is the player's position + 20 up (execFollow), the preset's offset added to that.
 //   preset 20, look up:  pitch -4004 (22 deg), distance 370, offset (0, 24, -64) -> offset y (20 + 24) / 16 = 2.75
-//   preset 0, the town:  pitch -9466 (52 deg), distance 332, offset (0, 0, 20), field of view 22.5 deg
-//   (the town's camera stays this game's - preset 0's distance, look-at point and 30 deg field of view, the player
-//   as big as on the DS - but tilted so the horizon is where City Folk's preset 0 puts it: row 50.4 of the picture's
-//   192 (gpu2d.c sky_horizon_row, measured with City Folk's whole camera), City Folk's band of sky. This game's
-//   56.2 deg puts it at 38.8; 0x25ce (53.2 deg) at 50.4. The look-up is City Folk's, its angles as they are.)
+//   (the town's own camera stays this game's - preset 0's tilt, distance, look-at point and 30 deg field of view;
+//   only City Folk's look-up and its angles are taken: updateModeDefault)
 //   transition 6 (to looking up): 150 frames, easing in 30, out 120; transition 7 (back): 30 frames, 5, 20 (60 Hz)
 // Looking up (execFollow, resetLookUpTimer): up on the D-pad while the player stands still; the camera comes back
 // down when the player does anything else. CameraPose is {yaw, pitch, distance, offset x, y, z}.
-enum { kCfHorizonPitch = 0x25ce };
 static const CameraPose kCfLookUp = {0, 4004, 0x17200, 0, 0x2c00, -0x4000};
 static const s32 kCfToLookUp[4] = {0, 150, 30, 120}, kCfBack[4] = {0, 30, 5, 20};   // (start, end, ease in, out)
 extern "C" int gHostLookBtn;     // (frontend) the look-up button is held: the Vita's D-pad up
@@ -907,10 +903,9 @@ void Camera::updateModeDefault() {
 #ifdef HOST
         static BOOL sHostOutdoorPreset;
         if (Host_SkyCamera() && PlayerActor_Get(4) != NULL) {
-            // This game's own town camera (sCameraPoseTable[0], as on the DS: distance, look-at point, field of
-            // view) tilted so its horizon is where City Folk's is (kCfHorizonPitch); the camera grid's other cells
-            // as differences from its middle cell; City Folk's look-up blended in (sCfLook, kCfLookUp). (The title's
-            // fly-over has no player: its camera stays as it is.)
+            // This game's own town camera (sCameraPoseTable[0], as on the DS: tilt, distance, look-at point, field
+            // of view; the camera grid's other cells as differences from its middle cell), with City Folk's look-up
+            // blended in (sCfLook, kCfLookUp). (The title's fly-over has no player: its camera stays as it is.)
             s32 g = sCameraPoseGrid[presetRow].v[presetCol], m = sCameraPoseGrid[1].v[1];
             const CameraPose &t0 = sCameraPoseTable[0];
             CameraPose b;
@@ -918,7 +913,7 @@ void Camera::updateModeDefault() {
             b.y = t0.y + sCameraPoseTable[g].y - sCameraPoseTable[m].y;
             b.z = t0.z + sCameraPoseTable[g].z - sCameraPoseTable[m].z;
             b.w0 = t0.w0 + sCameraPoseTable[g].w0 - sCameraPoseTable[m].w0;
-            b.h1 = (s16)(kCfHorizonPitch + sCameraPoseTable[g].h1 - sCameraPoseTable[m].h1);
+            b.h1 = (s16)(t0.h1 + sCameraPoseTable[g].h1 - sCameraPoseTable[m].h1);
             b.h0 = (s16)(t0.h0 + sCameraPoseTable[g].h0 - sCameraPoseTable[m].h0);
             const s32 w = sCfLook;
             target.x = cf_lerp(b.x, kCfLookUp.x, w);

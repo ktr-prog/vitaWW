@@ -837,6 +837,10 @@ static int sOverlayOn, sOvlReady;   // (Vita) a menu over the scene: engine B dr
 // shown into sSkyTex (without engine B's own master brightness), SKY_MAXLINES a frame (the rest on the next).
 // sSkyTex: row 1 + l = sky line l (columns: SKY_SIDE left of the DS's screen, its 256, SKY_SIDE right); row 0 and
 // the last row the plain colours of lines 0 and 191 (the texture's edge rows: above the sky and below the horizon).
+// SKY_DOWN: the sky sits that many lines lower than its bottom line on the horizon - its lowest lines behind the
+// ground - so that looking up (City Folk's look-up: the horizon at row 133.1) shows the whole top screen's sky, line 0
+// at the picture's top row: 191 - 133.
+enum { SKY_DOWN = 58 };
 enum { SKY_SIDE = GPU2D_SKY_SIDE, SKY_TW = GPU2D_SKY_W, SKY_TH = GPU2D_SKY_H, SKY_MAXLINES = 24 };
 static int sSkyOn, sSkyReady, sSkyEdges;
 static int sSkyOfs = SCREEN_H - 1 - 38, sSkyOfsSnap = SCREEN_H - 1 - 38;   // sky line at picture row r: r + ofs
@@ -2277,10 +2281,10 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         }
     }
 #endif
-    if (sSkyOn) {   // the sky line at picture row r is r + sSkyOfs: line 191 in the horizon's row
+    if (sSkyOn) {   // the sky line at picture row r is r + sSkyOfs: line 191 - SKY_DOWN in the horizon's row
         float h;
         if (sky_horizon_row(&h)) {
-            const float o = 191.0f - floorf(h);
+            const float o = 191.0f - floorf(h) - SKY_DOWN;
             sSkyOfs = o < -SCREEN_H ? -SCREEN_H : o > SCREEN_H + 1 ? SCREEN_H + 1 : (int)o;
         }
         static int log = -1;   // (host check: ACWW_SKYLOG prints the horizon every frame)
