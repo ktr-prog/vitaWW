@@ -672,8 +672,13 @@ static void job2d_wait(void) {
 // The longest render-thread frame since the last report and its parts (us), for the "render thread split" line.
 static unsigned long long sWWorst, sWWorst3d, sWWorstWait2d, sWWorstPresent, sWWorstTex, sWWorstUploads, sWWorstSync,
     sWWorstSwap, sWWorstBands;
+// Whether the main engine's screen is fully black for the frame being handed off (its brightness-down effect at 16 on
+// every layer with no window or second target, or master brightness at -16): a late frame there repeats a black
+// picture, which cannot be seen. Set at hand-off, read when the render thread starts that frame (log only).
+static int sHoBlack, sWWorstBlack;
 static void render_worker_phase(void) {
     uint64_t tw = host_plat_time_ns();
+    const int black = sHoBlack;
     uint64_t f3d = 0, fwait = 0, fpres = 0, fbands = 0;
     int par = job2d_start();
     if (!par) {
@@ -731,6 +736,7 @@ static void render_worker_phase(void) {
         sWWorstTex = gG3FrameTexNs / 1000; sWWorstUploads = gG3FrameUploads; sWWorstSync = gG3FrameSyncNs / 1000;
         sWWorstSwap = gVitaFrameSwapNs / 1000;
 #endif
+        sWWorstBlack = black;
         sWWorst = ftot / 1000; sWWorst3d = f3d / 1000; sWWorstWait2d = fwait / 1000; sWWorstPresent = fpres / 1000;
         sWWorstBands = fbands / 1000;
     }
@@ -898,6 +904,14 @@ static void render_frame_mt(void) {
     }
     memcpy(sSnapPal, gHostPltt, sizeof sSnapPal);
     memcpy(sSnapOam, gHostOam, sizeof sSnapOam);
+    {
+        extern u8 *host_io(u32 addr);
+        const u16 bc = *(const u16 *)host_io(0x04000050), by = *(const u16 *)host_io(0x04000054) & 31;
+        const u16 mb = *(const u16 *)host_io(0x0400006c);
+        const u32 dc = *(const u32 *)host_io(0x04000000);
+        sHoBlack = ((mb >> 14) == 2 && (mb & 31) >= 16) ||
+                   ((bc >> 6 & 3) == 3 && (bc & 0x3f) == 0x3f && !(bc >> 8 & 0x3f) && by >= 16 && !(dc >> 13 & 7));
+    }
     const u32 *lines3d = sOwn3d ? gpu3d_lines() : s3d;
     Gpu2dFrameInput *in = &sWorkIn;
     for (int i = 0; i < 9; i++) in->bank[i] = sSnapBank[i];
@@ -1035,10 +1049,10 @@ static void render_frame_mt(void) {
             const char *g3 = "";
 #endif
             fprintf(stderr, "render thread split (avg/drawn frame): 2d bands %llu us, present %llu us%s\n", bands, pres, g3);
-            fprintf(stderr, "render thread longest frame %llu us: 3d %llu us (texture sync %llu us, texture decode+upload %llu us "
+            fprintf(stderr, "render thread longest frame %llu us%s: 3d %llu us (texture sync %llu us, texture decode+upload %llu us "
                     "for %llu textures), 2d bands %llu us (waited %llu us after the 3d), present %llu us (swap %llu us)\n",
-                    sWWorst, sWWorst3d, sWWorstSync, sWWorstTex, sWWorstUploads, sWWorstBands, sWWorstWait2d,
-                    sWWorstPresent, sWWorstSwap);
+                    sWWorst, sWWorstBlack ? " (screen faded to black)" : "", sWWorst3d, sWWorstSync, sWWorstTex,
+                    sWWorstUploads, sWWorstBands, sWWorstWait2d, sWWorstPresent, sWWorstSwap);
             sWWorst = 0;
             fprintf(stderr, "game thread hand-off split (avg/frame): wait for render thread %llu us, VRAM snapshot %llu us,"
                     " 2d prepass %llu us (of which hblank IRQs %llu us), geometry commit (incl. wait for GX worker) %llu us\n",
