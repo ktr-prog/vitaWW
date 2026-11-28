@@ -997,6 +997,20 @@ static void render_frame_mt(void) {
                         gSubDraws, gSubFrames, gSubCheckNs / 1000 / gSubFrames);
             gSubFrames = gSubDraws = 0;
             gSubCheckNs = 0;
+            {   // the top screen's sky on the Vita's screen (gpu2d sSkyOn): shown, or why not
+                extern unsigned gSkyStat[8];
+#if HOST_VITA
+                extern int vita_gl_sky_frames(void);
+#else
+#define vita_gl_sky_frames() 0
+#endif
+                if (gSkyStat[7])
+                    fprintf(stderr, "render: sky shown in %u of %u frames, drawn by the compose in %d (not shown: sky not on the top "
+                            "screen %u, indoors %u, top screen off %u, screens swapped %u, top screen blank %u, title/boot/menu %u)\n",
+                            gSkyStat[0], gSkyStat[7], vita_gl_sky_frames(), gSkyStat[1], gSkyStat[2], gSkyStat[3],
+                            gSkyStat[4], gSkyStat[5], gSkyStat[6]);
+                memset(gSkyStat, 0, sizeof gSkyStat);
+            }
             {   // the menus over the scene: engine B's lines redrawn on the CPU (the bands) and what they cost
                 extern unsigned long long gBProfNs, gBProfLines, gBProfRuns, gBgKindN[2][5][2];
                 if (gBProfLines)

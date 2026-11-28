@@ -2082,10 +2082,16 @@ static int render_engine0_mt(const Gpu2dFrameInput *in) {
 }
 
 // The top screen shows the town's sky (the game's sky on engine B, displayed normally, the screens not swapped).
+unsigned gSkyStat[8];   // (render.c's log, per second) frames: sky shown; not: no sky on top, indoors, B off, swapped, B blank/mode, title/boot/menu
 static int sky_shown(void) {
     extern int Sky_HostOnSub(void);
     extern int Scene_HostIsOutdoor(void);
     const u32 d = reg32(&sEngine[1], REG_DISPCNT);
+    gSkyStat[1] += !Sky_HostOnSub();
+    gSkyStat[2] += !Scene_HostIsOutdoor();
+    gSkyStat[3] += !(sPowCnt & 0x200);
+    gSkyStat[4] += (sPowCnt & 0x8000) != 0;
+    gSkyStat[5] += (d & 0x80) || (d >> 16 & 3) != 1;
     return Sky_HostOnSub() && Scene_HostIsOutdoor() && (sPowCnt & 0x200) && !(sPowCnt & 0x8000) && !(d & 0x80) &&
            (d >> 16 & 3) == 1;
 }
@@ -2120,7 +2126,10 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         // The menus (the game puts engine A on the top screen, POWCNT1 bit 15, and draws the menu with engine B):
         // one screen, as the iPhone build - the scene keeps being drawn and the menu goes over it (sOverlayOn).
         sOverlayOn = !sMirrorOn && (sPowCnt & 0x8000);
-        sSkyOn = !sLogoOn && !sMirrorOn && !sOverlayOn && sky_shown();
+        sSkyOn = sky_shown() && !sLogoOn && !sMirrorOn && !sOverlayOn;
+        gSkyStat[0] += sSkyOn;
+        gSkyStat[6] += sLogoOn || sMirrorOn || sOverlayOn;
+        gSkyStat[7]++;
     }
 #else
     static int forceMain = -1;

@@ -247,6 +247,8 @@ static void gc_static_uniforms(GLuint prog) {
     glUniform1f(glGetUniformLocation(prog, "uV3dTexW"), (float)GC_W);
     glUseProgram(0);
 }
+static int sSkyFrames;   // frames the compose drew with the sky (render.c's log)
+int vita_gl_sky_frames(void) { return __atomic_exchange_n(&sSkyFrames, 0, __ATOMIC_RELAXED); }
 // This frame's compose uniforms (vita_gl_present_gc), set on whichever compose program draws.
 static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift, sky; } sGcU;
 static void gc_frame_uniforms(GLuint prog) {
@@ -700,6 +702,7 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
         sGcU.mirror = mirror == 1 ? 1.0f : 0.0f;   // the boot screens: the top screen's picture instead
         sOvlNow = mirror == 2 && on;
         sGcU.sky = on && mirror == 3 ? 1.0f : 0.0f;   // the top screen's sky where the backdrop would be (gpu2d sSkyOn)
+        if (sGcU.sky > 0.5f) __atomic_fetch_add(&sSkyFrames, 1, __ATOMIC_RELAXED);
         mirrorNow = on && mirror == 1;   // a menu: drawn over the composed picture below (its own small pass)
         sGcU.ofs[0] = (float)dx; sGcU.ofs[1] = (float)dy;
         sGcU.bg3 = prompt ? (float)GC_R : 0.0f;   // (to the screen's right edge)
