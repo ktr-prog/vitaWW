@@ -29,6 +29,7 @@ void frontend_init(const char *argv0) {
 
 AcwwShm *frontend_shm(void) { return sShm; }
 
+int gHostPadLook;   // (frontend_sdl.c) a pad's D-pad up is held
 static const char *sKeySpec;
 HOST_STATE_KEEP(sKeySpec)
 static u32 scripted_keys(void) {
@@ -637,6 +638,10 @@ void frontend_frame(void) {
     net_scan();
     action_log();
     u32 sk = scripted_keys() | goto_keys() | sFishKeys;
+    {   // the camera's look-up button (Camera::onExecute): the pad's D-pad up (frontend_sdl.c), or 0x10000 in a script
+        extern int gHostLookBtn;
+        gHostLookBtn = gHostPadLook || (sk & 0x10000) != 0;
+    }
     keyinput &= (u16)~(sk & 0x3ff);
     xy &= (u16)~(sk & 0x0c00);
     {

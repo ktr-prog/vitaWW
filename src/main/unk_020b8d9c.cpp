@@ -6378,6 +6378,9 @@ void Sky_VBlankDisabled(void) {
     IO_W((vu32 *)0x4000000, IO_R((vu32 *)0x4000000) & 0xfffff5ff);
 }
 
+#ifdef HOST
+extern "C" int Host_SkyCamera(void);
+#endif
 void Sky_FrameOutdoor(void) {
     s32 a, b;
     SkyGradient_Build();
@@ -6393,6 +6396,10 @@ void Sky_FrameOutdoor(void) {
         a = MenuCtrl_GetTransitionProgress() * 0x123 >> 12;
 #endif
         b = Camera_GetCloseUpFactor() * 30 >> 12;
+#ifdef HOST
+        // (the one-screen sky: placed on the camera's own horizon - gpu2d.c - so not moved for the close-ups too)
+        if (Host_SkyCamera()) b = 0;
+#endif
         gWeatherManager.screenOffsetY[gWeatherManager.bufferIndex ^ 1] = a + b;
     }
     gWeatherManager.starScrollY = Sky_GetStarScrollYNow(&gWeatherManager);

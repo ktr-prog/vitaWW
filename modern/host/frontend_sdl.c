@@ -348,10 +348,16 @@ static uint32_t pad_keys(void) {
     }
     gHostCamStickX = cx;
     gHostCamStickY = cy;
+    // D-pad up: City Folk's look-up while the town's camera follows the player (Camera::onExecute says so: then it
+    // is not the DS's up - the stick still walks north); the DS's up everywhere else (the menus, the talks)
+    extern int gHostPadLook, gHostLookArmed;
+    gHostPadLook = 0;
     for (int p = 0; p < 4; p++) {
         SDL_GameController *c = sPads[p];
         if (!c) continue;
-        k |= ui_pad_keys(c);
+        const int up = SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+        gHostPadLook |= up;
+        k |= ui_pad_keys(c) & (up && gHostLookArmed ? ~(1u << 6) : ~0u);
         int x = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTX), y = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_LEFTY);
         if (x > DEAD) k |= 1u << 4;
         if (x < -DEAD) k |= 1u << 5;

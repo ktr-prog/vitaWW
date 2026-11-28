@@ -54,7 +54,7 @@ int feature_on(int f) { return f == FEAT_CIRCLE_PAD || (f >= 0 && f < FEAT_COUNT
 
 static int env_off(const char *name) { return getenv(name) && atoi(getenv(name)) == 0; }
 int host_local_play_on(void) { return !env_off("ACWW_LOCAL_PLAY"); }
-int host_never_resetti(void) { return feature_on(FEAT_NO_RESETTI); }
+int host_never_resetti(void) { return feature_on(FEAT_NO_RESETTI) || getenv("ACWW_NO_RESETTI"); }   // (env: headless test runs)
 int host_wiimmfi_on(void) { return !env_off("ACWW_WIIMMFI"); }
 
 void feature_set(int f, int on) {

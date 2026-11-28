@@ -52,6 +52,8 @@ static const char kGcVertexShader[] =
     "uniform vec4 uObjMove;\n" \
     "uniform float uObjShift;\n" \
     "uniform float uSkyOn;\n" \
+    "uniform sampler2D uSky;\n" \
+    "uniform float uSkyOfs;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
     "float bitOf(float v, float p) { return gmod(floor(v / p), 2.0); }\n"   \
     "vec3 col15(float lo, float hi) {\n" \
@@ -63,7 +65,7 @@ static const char kGcVertexShader[] =
     "vec3 brighten(vec3 c, float ev, float bias) { return c + floor(((63.0 - c) * ev + bias) / 16.0); }\n" \
     "vec3 darken(vec3 c, float ev, float bias) { return c - floor((c * ev + bias) / 16.0); }\n" \
     "vec4 compose(vec2 fc, vec4 L0, vec4 L1, vec4 L2, vec4 L3, vec4 L4, vec4 L5, vec4 pAux, vec4 p3d, vec4 pLg, vec4 pObj,\n" \
-    "             vec4 pBg0, vec4 pBg1, vec4 pBg2, vec4 pBg3) {\n" \
+    "             vec4 pBg0, vec4 pBg1, vec4 pBg2, vec4 pBg3, vec4 pSk) {\n" \
     "  L0 = floor(L0 + 0.5); L1 = floor(L1 + 0.5); L2 = floor(L2 + 0.5);\n" \
     "  L3 = floor(L3 + 0.5); L4 = floor(L4 + 0.5); L5 = floor(L5 + 0.5);\n" \
     "  float cx = floor(fc.x), y = floor(fc.y);\n" \
@@ -76,8 +78,8 @@ static const char kGcVertexShader[] =
     "  float first = L1.x, second = L1.y, effect = L1.z, evy = L1.w;\n" \
     "  float eva = L2.x, evb = L2.y, mbm = L2.z, mbf = L2.w;\n" \
     "  vec3 bd = L3.xyz;\n" \
-    /* the sky (gpu2d.c sSkyOn): the top screen's sky picture in uLogo, 1:1, where the backdrop colour would be */ \
-    "  if (uSkyOn > 0.5 && in2d > 0.5 && pLg.a > 0.5) bd = floor(pLg.rgb * 63.0 + 0.5);\n" \
+    /* the sky (gpu2d.c sSkyOn): the top screen's sky, 1:1 across the whole picture, where the backdrop would be */ \
+    "  if (uSkyOn > 0.5) bd = floor(pSk.rgb * 63.0 + 0.5);\n" \
     "  float objOn = L4.x, on3d = L4.y, uni = L4.z;\n" \
     "  vec4 ax = pAux;\n" \
     "  vec2 euv = vec2(x < 0.0 ? 0.5 / 256.0 : 255.5 / 256.0, uv.y);\n" \
@@ -233,6 +235,11 @@ static const char kGcVertexShader[] =
     "  return res;\n" \
     "}\n"
 
+// The sky texture (gpu2d.c sSkyTex: GPU2D_SKY_W x GPU2D_SKY_H, its DS columns from GPU2D_SKY_SIDE; row 1 + l = sky line
+// l, rows 0 and the last the colours above and below it - the texture clamps to them), as shader numbers.
+#define GC_SKY_SIDE "48.0"
+#define GC_SKY_W "352.0"
+#define GC_SKY_H "194.0"
 #define GC_GMOD "float gmod(float a, float b) { return a - b * floor(a / b); }\n"
 // The layer samples compose() takes, read at coordinates worked out from the pixel position (the line-quad shaders)
 #define GC_DEP_PREFETCH \
@@ -242,8 +249,9 @@ static const char kGcVertexShader[] =
     "  vec4 pBg1 = texture2D(uBg1, puv), pBg2 = texture2D(uBg2, puv);\n" \
     "  vec4 pBg3 = texture2D(uBg3, vec2((ppx - uBg3Shift + 0.5) / 256.0, puv.y));\n" \
     "  vec4 pLg = texture2D(uLogo, puv - uLogoOfs / vec2(256.0, 192.0));\n" \
+    "  vec4 pSk = texture2D(uSky, vec2((ppx + " GC_SKY_SIDE " + 0.5) / " GC_SKY_W ", (ppy + uSkyOfs + 1.5) / " GC_SKY_H "));\n" \
     "  vec4 p3d = texture2D(u3d, vec2((floor((pcx + 0.5) * u3dCols / uW) + 0.5) / u3dTexW, (191.0 - ppy + 0.5) / 192.0));\n"
-#define GC_PARGS "pAux, p3d, pLg, pObj, pBg0, pBg1, pBg2, pBg3"
+#define GC_PARGS "pAux, p3d, pLg, pObj, pBg0, pBg1, pBg2, pBg3, pSk"
 static const char kGcFragmentShader[] =   // GLSL ES 1.00
     "precision highp float;\n" GC_GMOD "varying vec4 vL0, vL1, vL2, vL3, vL4, vL5;\n" GC_FRAGMENT_BODY
     "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_DEP_PREFETCH
@@ -365,7 +373,7 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
 // what made the compose cost 13 ms. Sides of the 2D area: the layer textures clamp to their edge column, which is
 // the edge sample the compose wants there. uVFlip: the GPU's pixel rows run the other way from the quad's y (the
 // Vita: measured once at start, vita_gl.c), so the interpolated rows match gl_FragCoord's.
-#define GC_VARYINGS_GLSL "varying vec2 vUv, vUv3, v3d, vLg, vP0, vP1, vP2, vP3, vP4, vP5;\n"
+#define GC_VARYINGS_GLSL "varying vec2 vUv, vUv3, v3d, vP0, vP1, vP2, vP3, vP4, vP5;\nvarying vec4 vLg;\n"
 #define GC_VARY_FETCH(TEX) \
     "  vec4 L0 = " TEX "(uLp, vP0) * 255.0;\n" \
     "  vec4 L1 = " TEX "(uLp, vP1) * 255.0;\n" \
@@ -375,7 +383,7 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
     "  vec4 L5 = " TEX "(uLp, vP5) * 255.0;\n" \
     "  vec4 pAux = " TEX "(uAux, vUv), pObj = " TEX "(uObj, vUv), pBg0 = " TEX "(uBg0, vUv);\n" \
     "  vec4 pBg1 = " TEX "(uBg1, vUv), pBg2 = " TEX "(uBg2, vUv), pBg3 = " TEX "(uBg3, vUv3);\n" \
-    "  vec4 pLg = " TEX "(uLogo, vLg), p3d = " TEX "(u3d, v3d);\n" \
+    "  vec4 pLg = " TEX "(uLogo, vLg.xy), p3d = " TEX "(u3d, v3d), pSk = " TEX "(uSky, vLg.zw);\n" \
     "  float lfast = L3.w;\n" \
     "  L3.w = L5.x + L5.y * 256.0 - 1024.0;\n" \
     "  L5 = vec4(L5.z + L5.w * 256.0 - 1024.0, lfast, 0.0, 0.0);\n"
@@ -386,7 +394,7 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
     "  vUv = vec2(xx / 256.0, py / 192.0);\n" \
     "  vUv3 = vec2((xx - uVBg3Shift) / 256.0, py / 192.0);\n" \
     "  v3d = vec2(px * uV3dCols / uVW / uV3dTexW, (192.0 - py) / 192.0);\n" \
-    "  vLg = vUv - uVLogoOfs / vec2(256.0, 192.0);\n" \
+    "  vLg = vec4(vUv - uVLogoOfs / vec2(256.0, 192.0), (xx + " GC_SKY_SIDE ") / " GC_SKY_W ", (py + uVSkyOfs + 1.0) / " GC_SKY_H ");\n" \
     "  vP0 = vec2(0.5 / 8.0, py / 192.0); vP1 = vec2(1.5 / 8.0, py / 192.0); vP2 = vec2(2.5 / 8.0, py / 192.0);\n" \
     "  vP3 = vec2(3.5 / 8.0, py / 192.0); vP4 = vec2(4.5 / 8.0, py / 192.0); vP5 = vec2(5.5 / 8.0, py / 192.0);\n"
 static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
@@ -398,11 +406,11 @@ static const char kGcqFastFragmentShader[] =   // (the first pass: GC_FASTONLY)
     "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_VARY_FETCH("texture2D")
     "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5, " GC_PARGS "); }\n";
 static const char kGcqVertexShader[] =
-    "attribute vec2 aPos;\nuniform float uVW, uV3dCols, uV3dTexW, uVBg3Shift, uVFlip;\nuniform vec2 uVLogoOfs;\n"
+    "attribute vec2 aPos;\nuniform float uVW, uV3dCols, uV3dTexW, uVBg3Shift, uVFlip, uVSkyOfs;\nuniform vec2 uVLogoOfs;\n"
     GC_VARYINGS_GLSL "void main() { gl_Position = vec4(aPos, 0.0, 1.0);\n" GC_VS_BODY "}\n";
 #define GC_CG_FS_MAIN \
     "float4 main(float4 fc : WPOS, float2 vUv : TEXCOORD0, float2 vUv3 : TEXCOORD1, float2 v3d : TEXCOORD2,\n" \
-    "            float2 vLg : TEXCOORD3, float2 vP0 : TEXCOORD4, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6,\n" \
+    "            float4 vLg : TEXCOORD3, float2 vP0 : TEXCOORD4, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6,\n" \
     "            float2 vP3 : TEXCOORD7, float2 vP4 : TEXCOORD8, float2 vP5 : TEXCOORD9) : COLOR {\n" GC_VARY_FETCH("tex2D") \
     "  return compose(fc.xy, L0, L1, L2, L3, L4, L5, " GC_PARGS ");\n" \
     "}\n"
@@ -413,10 +421,10 @@ static const char kGcqFastFragmentShaderCg[] =
     "#define GC_FASTONLY 1\n#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
     "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY GC_CG_FS_MAIN;
 static const char kGcqVertexShaderCg[] =
-    "#define vec2 float2\n"
+    "#define vec2 float2\n#define vec4 float4\n"
     "void main(float2 aPos, uniform float uVW, uniform float uV3dCols, uniform float uV3dTexW, uniform float uVBg3Shift,\n"
-    "          uniform float uVFlip, uniform float2 uVLogoOfs, out float4 oPos : POSITION, out float2 vUv : TEXCOORD0,\n"
-    "          out float2 vUv3 : TEXCOORD1, out float2 v3d : TEXCOORD2, out float2 vLg : TEXCOORD3, out float2 vP0 : TEXCOORD4,\n"
+    "          uniform float uVFlip, uniform float2 uVLogoOfs, uniform float uVSkyOfs, out float4 oPos : POSITION, out float2 vUv : TEXCOORD0,\n"
+    "          out float2 vUv3 : TEXCOORD1, out float2 v3d : TEXCOORD2, out float4 vLg : TEXCOORD3, out float2 vP0 : TEXCOORD4,\n"
     "          out float2 vP1 : TEXCOORD5, out float2 vP2 : TEXCOORD6, out float2 vP3 : TEXCOORD7, out float2 vP4 : TEXCOORD8,\n"
     "          out float2 vP5 : TEXCOORD9) {\n"
     "  oPos = float4(aPos, 0.0, 1.0);\n" GC_VS_BODY "}\n";
@@ -430,8 +438,8 @@ static const char kGcqVertexShaderCg[] =
     "  vec4 L3 = floor(" TEX "(uLp, vP3) * 255.0 + 0.5), q = " TEX "(u3d, v3d);\n" \
     "  float qa = floor(by(q.a) / 8.0), b2 = bitOf(L1.y, 32.0);\n" \
     "  vec3 c = floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0), bd = L3.xyz;\n" \
-    "  vec4 sk = " TEX "(uLogo, vLg);\n" \
-    "  if (uSkyOn > 0.5 && sk.a > 0.5 && vLg.x > 0.0 && vLg.x < 1.0) bd = floor(sk.rgb * 63.0 + 0.5);\n" \
+    "  vec4 sk = " TEX "(uSky, vLg.zw);\n" \
+    "  if (uSkyOn > 0.5) bd = floor(sk.rgb * 63.0 + 0.5);\n" \
     "  vec3 o = qa > 30.5 ? c : (qa < 0.5 ? bd : (b2 > 0.5 ? blend3d(c, bd, qa) : c));\n" \
     "  float al = qa < 0.5 || (qa < 30.5 && b2 > 0.5) ? 1.0 : 0.0;\n" \
     "  if (L2.z > 0.5 && L2.z < 1.5 && L2.w > 0.5) o = brighten(o, L2.w, 0.0);\n" \
@@ -443,7 +451,7 @@ static const char kGcTileFragmentShader[] =   // GLSL ES 1.00 (host check)
 static const char kGcTileFragmentShaderCg[] =
     "#define vec2 float2\n#define vec3 float3\n#define vec4 float4\n#define texture2D(s, c) tex2Dlod(s, float4(c, 0.0, 0.0))\n" GC_GMOD
     "uniform sampler2D uLp;\n" GC_FRAGMENT_BODY
-    "float4 main(float2 v3d : TEXCOORD2, float2 vLg : TEXCOORD3, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6,\n"
+    "float4 main(float2 v3d : TEXCOORD2, float4 vLg : TEXCOORD3, float2 vP1 : TEXCOORD5, float2 vP2 : TEXCOORD6,\n"
     "            float2 vP3 : TEXCOORD7) : COLOR {\n"
     GC_TILE_FAST_MAIN("tex2D") "  return res;\n}\n";
 // The tiles as two lists of triangles (x, y in clip space; 6 vertices a tile run): fast (the program above) and full.
