@@ -846,6 +846,8 @@ static int sSkyTop = 110 + SKY_DOWN_PX - 2 * SCREEN_H, sSkyTopSnap = 110 + SKY_D
 static u32 sSkyTex[SKY_TW * SKY_TH];
 static u8 sSkyRows[SKY_TH];    // rows written since the present last took them
 static u8 sSkyValid[SCREEN_H]; // the sky line in sSkyTex is this frame's (else drawn when it is shown)
+static u8 sSkyHave[SCREEN_H];  // the sky line in sSkyTex was drawn since the sky came up (maybe a few frames old)
+enum { SKY_MAXCHG = 40 };
 static unsigned sLogoGen;   // counts the frames that wrote sLogo (the present uploads it only then)
 unsigned gpu2d_gc_logo_gen(void) { return sLogoGen; }
 // The rows of sLogo written since the present last took them (it uploads only those): set by whoever writes a row
@@ -1179,7 +1181,11 @@ typedef struct {
     int part, nparts;   // (menu overlay) every band walks all lines and draws every nparts-th changed one from part
 } Band2d;
 static u8 s2dRegSnapB[SCREEN_H][REG_SIZE];   // (Vita) engine B's per-line registers and palettes, for the menu overlay
-static u8 s2dPalSnapB[SCREEN_H][0x400];
+// Engine B's per-line palettes, two sets used in turn: a line's palette is compared with the same line's of the
+// frame before (memcmp; hashing each line's 1 KB measured ~0.7 ms of the game thread with the sky's gradient, every
+// line's palette different from the line above's).
+static u8 s2dPalSnapBSet[2][SCREEN_H][0x400];
+static u8 (*s2dPalSnapB)[0x400] = s2dPalSnapBSet[0], (*s2dPalPrevB)[0x400] = s2dPalSnapBSet[1];
 
 static void ref_advance(Engine *e, int line) {
     for (int i = 0; i < 2; i++) {
@@ -1789,6 +1795,10 @@ unsigned long long gSubCheckNs;   // the time the check above took
 
 static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     Engine *e = &sEngine[0];
+    {   // (engine B's palette snapshots: this frame's into the other set; the frame before's stays to compare with)
+        u8 (*t)[0x400] = s2dPalSnapB;
+        s2dPalSnapB = s2dPalPrevB, s2dPalPrevB = t;
+    }
     // the sub screen's picture: redrawn only when its inputs changed (above)
     int subDraw = 0;
     u32 subLines = 2166136261u;
@@ -1867,15 +1877,19 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         }
         if (whole) {   // this line's inputs against last frame's: redraw it when they differ
             static u32 palh;
-            const u8 *pl = bSnap ? s2dPalSnapB[line] : s2dPalSnap[line];
-            const u8 *pp = line ? (bSnap ? s2dPalSnapB[line - 1] : s2dPalSnap[line - 1]) : NULL;
-            if (!pp || memcmp(pl, pp, 0x400)) {
-                u32 g;
-                palh = hash_words(0x27d4eb2du, 0, pl, 0x400, &g);
-                palh = mix32(palh, g);
+            int palDiff = 0;
+            if (bSnap)   // (engine B's snapshots: against the frame before's, line for line)
+                palDiff = memcmp(s2dPalSnapB[line], s2dPalPrevB[line], 0x400) != 0, palh = 0;
+            else {
+                const u8 *pl = s2dPalSnap[line], *pp = line ? s2dPalSnap[line - 1] : NULL;
+                if (!pp || memcmp(pl, pp, 0x400)) {
+                    u32 g;
+                    palh = hash_words(0x27d4eb2du, 0, pl, 0x400, &g);
+                    palh = mix32(palh, g);
+                }
             }
             u32 ls = bline_sig(sEngine[1].regs, palh, skyBand && sSkyBg3Empty ? 8u : 0u);
-            if (bAll || ls != sBLineSig[line]) sBDirty[line] = 1;
+            if (bAll || palDiff || ls != sBLineSig[line]) sBDirty[line] = 1;
             sBLineSig[line] = ls;
         }
         if (mirrorBand || bSnap) {   // engine B's own per-line state, for the band snapshots above
@@ -1923,22 +1937,29 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         if (skyBand) sky_bg3_check(&sEngine[1], bAll || vm);
         if (bAll) memset(sBDirty, 1, sizeof sBDirty);
         if (skyBand) {
-            // The sky lines shown (from the one at the screen's top row, a line's margin above) that are not this
-            // frame's yet - all of them this frame (none ever shows late: the sky moves
-            // as the camera looks up, the clouds scroll every frame on the title) - and 4 lines a frame in turn
-            // whatever changed, so no line can stay wrong (a change the line check misses - the scene's setup during
-            // the fade in - is redrawn within 48 frames).
-            static int refresh;
+            // The sky lines shown (from the one at the screen's top row, a line's margin above): a line never drawn
+            // since the sky came up is drawn at once, all of them (none ever shows empty: looking up uncovers lines);
+            // a line drawn before that changed, SKY_MAXCHG a frame in turn from where the last frame stopped (the
+            // clouds scroll every line every frame: all of them each frame was ~19 ms of the bands, looked up), and 4
+            // lines a frame in turn whatever changed, so no line can stay wrong (a change the line check misses - the
+            // scene's setup during the fade in - is redrawn within 48 frames).
+            static int refresh, cursor;
             const int top = (sSkyTop < 0 ? -sSkyTop / 2 : 0) - 1;
             for (int y = 0; y < SCREEN_H; y++)
                 if (sBDirty[y]) sSkyValid[y] = 0;
-            if (bAll) memset(sSkyValid, 0, sizeof sSkyValid);
+            if (bAll) memset(sSkyValid, 0, sizeof sSkyValid), memset(sSkyHave, 0, sizeof sSkyHave);
             for (int k = 0; k < 4; k++) sSkyValid[(refresh + k) % SCREEN_H] = 0;
             refresh = (refresh + 4) % SCREEN_H;
-            for (int y = 0; y < SCREEN_H; y++) {
-                sBDirty[y] = y >= top && !sSkyValid[y];
-                if (sBDirty[y]) sSkyValid[y] = 1;
+            memset(sBDirty, 0, sizeof sBDirty);
+            for (int y = top < 0 ? 0 : top; y < SCREEN_H; y++)
+                if (!sSkyHave[y]) sBDirty[y] = 1;
+            const int from = cursor;
+            for (int k = 0, n = 0; k < SCREEN_H && n < SKY_MAXCHG; k++) {
+                const int y = (from + k) % SCREEN_H;
+                if (y >= top && !sSkyValid[y] && !sBDirty[y]) sBDirty[y] = 1, n++, cursor = (y + 1) % SCREEN_H;
             }
+            for (int y = 0; y < SCREEN_H; y++)
+                if (sBDirty[y]) sSkyValid[y] = 1, sSkyHave[y] = 1;
         }
         gSubCheckNs += host_plat_time_ns() - t0;
         for (int i = 0; i < SCREEN_H; i++) bLines += sBDirty[i];

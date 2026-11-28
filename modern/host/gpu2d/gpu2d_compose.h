@@ -78,10 +78,6 @@ static const char kGcVertexShader[] =
     "  float first = L1.x, second = L1.y, effect = L1.z, evy = L1.w;\n" \
     "  float eva = L2.x, evb = L2.y, mbm = L2.z, mbf = L2.w;\n" \
     "  vec3 bd = L3.xyz;\n" \
-    /* the sky (gpu2d.c sSkyOn): the top screen's sky where the backdrop would be - here the sky texel under the pixel, \
-       for the pixels the canvas makes (blended with it); a pixel that is just the sky is marked (alpha 0, as an \
-       exact 3D pixel) and the present draws the sky there at the screen's resolution (vita_gl.c present_sky) */ \
-    "  if (uSkyOn > 0.5) bd = floor(pSk.rgb * 63.0 + 0.5);\n" \
     "  float objOn = L4.x, on3d = L4.y, uni = L4.z;\n" \
     "  vec4 ax = pAux;\n" \
     "  vec2 euv = vec2(x < 0.0 ? 0.5 / 256.0 : 255.5 / 256.0, uv.y);\n" \
@@ -108,6 +104,13 @@ static const char kGcVertexShader[] =
     "    covBg3 = use3 > 0.5 ? bitOf(by(texture2D(uAux, uv3).r), 64.0) : 0.0;\n" \
     "  }\n" \
     "  float m = in2d > 0.5 ? axl : sideM, oa = in2d > 0.5 ? by(ax.a) : 0.0;\n" \
+    /* the sky (gpu2d.c sSkyOn): the top screen's sky where the backdrop would be behind the 3D - where the window \
+       lets the 3D through on a line with it (not outside the iris wipe's circle: the plain backdrop, black, there). \
+       Here the sky texel under the pixel, for the pixels the canvas makes (blended with it); a pixel that is just \
+       the sky is marked (alpha 0, as an exact 3D pixel) and the present draws the sky there at the screen's \
+       resolution (vita_gl.c present_sky) */ \
+    "  float skyHere = uSkyOn > 0.5 && on3d > 0.5 && bitOf(m, 1.0) > 0.5 ? 1.0 : 0.0;\n" \
+    "  if (skyHere > 0.5) bd = floor(pSk.rgb * 63.0 + 0.5);\n" \
     /* Fast path: nothing but the 3D (or, where it has no pixel, the backdrop) can show here - no 2D pixel, the \
        line's colour effects leave the 3D and the backdrop as they are (L5.y, gc_line_params), no logo, overlay or \
        translucent 3D pixel - so the result is that colour with the master brightness: the rest is skipped (a \
@@ -135,7 +138,7 @@ static const char kGcVertexShader[] =
     "    vec3 qo = qa > 30.5 ? floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0) : bd;\n" \
     "    if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) qo = brighten(qo, mbf, 0.0);\n" \
     "    else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) qo = darken(qo, mbf, 15.0);\n" \
-    "    res = vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 || uSkyOn > 0.5 ? 0.0 : 1.0);\n" \
+    "    res = vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 || skyHere > 0.5 ? 0.0 : 1.0);\n" \
     "  } else {\n" \
     /* (GC_FASTONLY: the compose's first pass - only the fast path's pixels, the rest discarded, and the full \
        compose then drawn only where this pass wrote nothing: the depth test skips the others before shading) */ \
@@ -219,7 +222,7 @@ static const char kGcVertexShader[] =
     "    else if (effect > 1.5 && effect < 2.5) { o = brighten(c1, evy, 8.0); pure = 0.0; }\n" \
     "    else if (effect > 2.5) { o = darken(c1, evy, 7.0); pure = 0.0; }\n" \
     "  }\n" \
-    "  if (uSkyOn > 0.5 && l1 > 4.5 && dot(abs(o - c1), vec3(1.0)) < 0.5) pure = 1.0;\n" \
+    "  if (skyHere > 0.5 && l1 > 4.5 && dot(abs(o - c1), vec3(1.0)) < 0.5) pure = 1.0;\n" \
     "  if (uLogoOn > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
     "    vec2 lu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
     "    vec4 lg = pLg;\n" \

@@ -303,33 +303,40 @@ static const char kCopyFragmentCg[] =
 static const char kNearFragmentCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz) : COLOR {\n"
     "  return tex2D(uTex, (floor(vTex * uSz.xy) + 0.5) * uSz.zw); }\n";
-// The 3D buffer where it has a pixel (alpha from 0.5): over the sky the present drew first (present_sky)
+// The sky (present_sky): over the 3D where the 3D has no pixel - its alpha 0 in the compose's 5 bits (below 4 / 255,
+// the compose's qa < 0.5: a translucent 3D pixel, the sea's, stays the 3D's) - the sky texel there.
+static const char kSkyVertexCg[] =
+    "void main(float2 aPos, float2 aTex, float2 aSky, out float4 oPos : POSITION, out float2 vTex : TEXCOORD0,\n"
+    "          out float2 vSky : TEXCOORD1) {\n"
+    "  oPos = float4(aPos, 0.0, 1.0); vTex = aTex; vSky = aSky; }\n";
 static const char kKeyFragmentCg[] =
-    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
+    "float4 main(float2 vTex : TEXCOORD0, float2 vSky : TEXCOORD1, uniform sampler2D uTex, uniform sampler2D uSky) : COLOR {\n"
     "  float4 c = tex2D(uTex, vTex);\n"
-    "  if (c.a < 0.5) discard;\n"
-    "  return c; }\n";
+    "  if (c.a > 3.5 / 255.0) discard;\n"
+    "  return tex2D(uSky, vSky); }\n";
 static const char kFillVertexCg[] =
     "void main(float2 aPos, float4 aCol, out float4 oPos : POSITION, out float4 vCol : COLOR) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vCol = aCol; }\n";
 static const char kFillFragmentCg[] =
     "float4 main(float4 vCol : COLOR) : COLOR { return vCol; }\n";
 static GLuint sCopyProg, sFillProg, sNearProg, sPreTex, sPreFbo, sKeyProg;
-static GLint sKeyPos = -1, sKeyTex = -1;
+static GLint sKeyPos = -1, sKeyTex = -1, sKeySky = -1;
 static GLint sNearPos = -1, sNearTex = -1;
 static GLint sCopyPos = -1, sCopyTex = -1, sFillPos = -1, sFillCol = -1;
 static void present_init(void) {
     sCopyProg = cached_program(kCopyVertexCg, kCopyFragmentCg, "copy");
     sFillProg = cached_program(kFillVertexCg, kFillFragmentCg, "fill");
     sNearProg = cached_program(kCopyVertexCg, kNearFragmentCg, "near");
-    sKeyProg = cached_program(kCopyVertexCg, kKeyFragmentCg, "key3d");   // (none: no sky behind the 3D - present_draw)
+    sKeyProg = cached_program(kSkyVertexCg, kKeyFragmentCg, "skykey");   // (none: no sky behind the 3D - present_draw)
     if (sKeyProg) {
         sKeyPos = glGetAttribLocation(sKeyProg, "aPos");
         sKeyTex = glGetAttribLocation(sKeyProg, "aTex");
+        sKeySky = glGetAttribLocation(sKeyProg, "aSky");
         glUseProgram(sKeyProg);
         glUniform1i(glGetUniformLocation(sKeyProg, "uTex"), 0);
+        glUniform1i(glGetUniformLocation(sKeyProg, "uSky"), 11);   // (the sky texture's unit: the compose's)
         glUseProgram(0);
-        if (sKeyPos < 0 || sKeyTex < 0) sKeyProg = 0;
+        if (sKeyPos < 0 || sKeyTex < 0 || sKeySky < 0) sKeyProg = 0;
     }
     fprintf(stderr, "vita_gl: present sky %s\n", sKeyProg ? "ready" : "unavailable");
     if (sNearProg) {
@@ -406,24 +413,36 @@ static void present_3d(unsigned tex3d) {
     glDisable(GL_BLEND);
     copy_quad(tex3d, kFlatUv);
 }
-// The sky (gpu2d sSkyOn) at the screen's resolution, each texel 2 x 2 pixels - line 0's top at screen row top - and
-// the 3D buffer over it where it has a pixel. The canvas then goes over both, marked (alpha 0) where it is just the
-// sky or the 3D (gpu2d_compose.h).
+// The sky (gpu2d sSkyOn) at the screen's resolution, each texel 2 x 2 pixels - line 0's top at screen row top: the
+// 3D buffer copied as always, then the sky where the 3D has no pixel, over the rows the sky's picture covers only
+// (the normal view: its top fifth). The canvas then goes over both, marked (alpha 0) where it is just the sky or the
+// 3D (gpu2d_compose.h).
 static void present_sky(unsigned tex3d, int top) {
-    const float v0 = (float)(2 - top) / (2.0f * GPU2D_SKY_H), v1 = (float)(SCREEN_H + 2 - top) / (2.0f * GPU2D_SKY_H);
-    const float uv[8] = {0, v1, 1, v1, 0, v0, 1, v0};   // (screen row 0 at the top: the quad's y = 1)
+    present_3d(tex3d);
+    int end = top + 2 * GPU2D_SKY_H;   // (the sky's picture and its edge rows)
+    if (end > SCREEN_H) end = SCREEN_H;
+    if (end <= 0) return;
+    const float yb = 1.0f - 2.0f * (float)end / SCREEN_H;   // (clip y: 1 at screen row 0)
+    const float pos[8] = {-1, yb, 1, yb, -1, 1, 1, 1};
+    const float t3[8] = {0, (yb + 1) * 0.5f, 1, (yb + 1) * 0.5f, 0, 1, 1, 1};   // (the 3D buffer: row 0 at the bottom)
+    const float v0 = (float)(2 - top) / (2.0f * GPU2D_SKY_H), v1 = (float)(end + 2 - top) / (2.0f * GPU2D_SKY_H);
+    const float sk[8] = {0, v1, 1, v1, 0, v0, 1, v0};
     glDisable(GL_BLEND);
-    copy_quad(sSkyGlTex, uv);
     glUseProgram(sKeyProg);
+    glActiveTexture(GL_TEXTURE0 + 11);
+    glBindTexture(GL_TEXTURE_2D, sSkyGlTex);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex3d);
     glEnableVertexAttribArray((GLuint)sKeyPos);
     glEnableVertexAttribArray((GLuint)sKeyTex);
-    glVertexAttribPointer((GLuint)sKeyPos, 2, GL_FLOAT, GL_FALSE, 0, kFullPos);
-    glVertexAttribPointer((GLuint)sKeyTex, 2, GL_FLOAT, GL_FALSE, 0, kFlatUv);
+    glEnableVertexAttribArray((GLuint)sKeySky);
+    glVertexAttribPointer((GLuint)sKeyPos, 2, GL_FLOAT, GL_FALSE, 0, pos);
+    glVertexAttribPointer((GLuint)sKeyTex, 2, GL_FLOAT, GL_FALSE, 0, t3);
+    glVertexAttribPointer((GLuint)sKeySky, 2, GL_FLOAT, GL_FALSE, 0, sk);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glDisableVertexAttribArray((GLuint)sKeyPos);
     glDisableVertexAttribArray((GLuint)sKeyTex);
+    glDisableVertexAttribArray((GLuint)sKeySky);
 }
 // The fades over the 3D: per DS line with a master brightness, white (up) or black (down) at factor / 16.
 static int present_fades(const Gpu2dGc *gc) {
