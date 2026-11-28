@@ -827,30 +827,25 @@ static uint32_t sLogo[SCREEN_W * SCREEN_H];
 static int sOverlayOn, sOvlReady;   // (Vita) a menu over the scene: engine B drawn by the bands into sLogo
 // (Vita) The sky, one screen, as City Folk has it: outdoors with no menu the DS shows the sky on the top screen
 // (engine B: its gradient, clouds, stars, sun, moon, fireworks, the presents' balloons) and the main screen only a
-// flat backdrop colour above the town's horizon. The Vita shows the top screen's whole sky in the main screen's
-// picture instead, wherever the main screen's backdrop colour would be (the GPU compose: so the 3D's translucent
-// edges, the colour effects and the fades work on it as on the backdrop). The sky is made smaller, the same in both
-// directions (not stretched), so that all of it fits above the horizon when the camera looks up (City Folk's
-// look-up, Camera::onExecute: the horizon at row 133.1 of 192): SKY_SH rows, SKY_SW columns in the middle - the
-// columns beside it the plain colour of its row (its gradient) for now. Its bottom row sits on the camera's horizon
-// (sky_horizon_row); the normal view shows its lower part, looking up all of it.
-// The bands draw the changed lines of the part shown into sSkyFull (without engine B's own master brightness); then
-// sky_scale makes the rows of sSkyTex they stand for: each pixel the one of its ~1.4 x 1.4 source pixels furthest
-// from its line's plain gradient colour (a star, a spark, a cloud's edge stays).
-// sSkyTex: row 1 + j = the small sky's row j; row 0 and the rows below it the plain colours of lines 0 and 191 (the
-// texture's edge rows: above the sky and below the horizon).
+// flat backdrop colour above the town's horizon. The Vita shows the top screen's whole sky behind the main screen's
+// picture instead, wherever the main screen's backdrop colour would be. It is drawn by the present at the screen's
+// own resolution (vita_gl.c), each sky pixel exactly 2 x 2 screen pixels (pixel-perfect: no stretching), 480 sky
+// columns across the 960-pixel screen: the DS's 256 in the middle and, either side, SKY_SIDE more drawn as the DS
+// draws columns beside its screen (sky_side_lines: the same line's registers, everything moved 256 columns). At 2x
+// its 192 lines are 384 screen rows: the camera looking up (City Folk's look-up, Camera::onExecute) puts the horizon
+// at screen row 377, so the sky's bottom sits SKY_DOWN_PX below the horizon (behind the ground) and looking up shows
+// all of it, line 0 at the screen's top (sky_horizon_row: the horizon from the camera; sSkyTop: line 0's screen row).
+// The bands draw the changed lines of the part shown into sSkyTex (without engine B's own master brightness).
+// sSkyTex: row 1 + l = sky line l; rows 0 and SKY_TH - 1 the plain colours of lines 0 and 191 (the texture's edge
+// rows: above the sky and below it).
 enum { SKY_SIDE = GPU2D_SKY_SIDE, SKY_TW = GPU2D_SKY_W, SKY_TH = GPU2D_SKY_H };
-enum { SKY_SH = 134, SKY_SW = 179, SKY_X0 = SKY_SIDE + (SCREEN_W - SKY_SW) / 2 };   // (134 / 192 of the sky's size)
-#define SKY_SRC_Y(j) ((j) * SCREEN_H / SKY_SH)   // the first sky line the small sky's row j stands for
-#define SKY_SRC_X(i) ((i) * SCREEN_W / SKY_SW)
+enum { SKY_SCREEN_H = 544, SKY_DOWN_PX = 2 * SCREEN_H - 377 };   // (377: the looked-up horizon, row 133.1 of 192)
 static int sSkyOn, sSkyReady, sSkyEdges, sSkyHold, sSkyWas;
 static int sSkyBack;   // the sky was held (sky_hold): every line again when it is drawn again
-static int sSkyOfs = SKY_SH - 1 - 38, sSkyOfsSnap = SKY_SH - 1 - 38;   // texture row at picture row r: r + ofs + 1
+static int sSkyTop = 110 + SKY_DOWN_PX - 2 * SCREEN_H, sSkyTopSnap = 110 + SKY_DOWN_PX - 2 * SCREEN_H;
 static u32 sSkyTex[SKY_TW * SKY_TH];
-static u32 sSkyFull[SCREEN_W * SCREEN_H];
 static u8 sSkyRows[SKY_TH];    // rows written since the present last took them
-static u8 sSkyValid[SCREEN_H]; // the sky line in sSkyFull is this frame's (else drawn when it is shown)
-static u8 sSkyDrawn[SCREEN_H]; // drawn by this frame's bands (sky_scale makes their rows)
+static u8 sSkyValid[SCREEN_H]; // the sky line in sSkyTex is this frame's (else drawn when it is shown)
 static unsigned sLogoGen;   // counts the frames that wrote sLogo (the present uploads it only then)
 unsigned gpu2d_gc_logo_gen(void) { return sLogoGen; }
 // The rows of sLogo written since the present last took them (it uploads only those): set by whoever writes a row
@@ -886,10 +881,10 @@ int gpu2d_gc_logo(const uint32_t **px, int *dx, int *dy, int *prompt, int *mirro
     *px = sLogoReady ? sLogo : NULL;
     return sLogoReady;
 }   // gHostIrisRadius as the frame's prepass saw it (the GPU compose's wide-screen iris)
-// (Vita) The sky (sSkyTex, GPU2D_SKY_W x GPU2D_SKY_H) this frame, and the sky line at picture row r: r + ofs.
+// (Vita) The sky (sSkyTex, GPU2D_SKY_W x GPU2D_SKY_H) this frame, and its line 0's top screen row (544 rows; 2 each).
 int gpu2d_gc_sky(const uint32_t **px, int *ofs) {
     *px = sSkyTex;
-    *ofs = sSkyOfsSnap;
+    *ofs = sSkyTopSnap;
     return sSkyReady;
 }
 void gpu2d_gc_sky_take_rows(unsigned char *rows) {   // (as gpu2d_gc_logo_take_rows: the rows written since)
@@ -1371,6 +1366,51 @@ static void sky_put(u32 *d, const u32 *o, int n) {
         d[x] = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | 0xff000000u;
     }
 }
+// (the sky) The DS's columns beside its screen on this sky line - x -SKY_SIDE..-1 and 256..256+SKY_SIDE-1 - as the
+// line's registers draw them: the line drawn twice more with everything moved 256 columns, each time keeping the
+// columns next to the screen. Text BGs' horizontal scroll and sprites' x are 9 bits (512 columns: 256 either way is
+// the same move); the affine BGs' start moves by 256 steps of their x step (pa, pc), and the clouds' BG3 wraps
+// round (as the tall PC sky's lines above the screen: render_ext_sky) - its picture goes on, not stopping at the
+// edge of its map. Everything the line's own drawing uses is put back afterwards.
+static void sky_side_lines(Engine *e, const Band2d *w, int line, u32 *d) {
+    static ObjLine objSide[N2DBANDS], objKeep[N2DBANDS];
+    static u8 oamSide[N2DBANDS][0x400];
+    const int b = w->part < N2DBANDS ? w->part : 0;
+    u8 *oam = oamSide[b];
+    memcpy(oam, e->oam, 0x400);
+    for (int i = 0; i < 128; i++) oam[i * 8 + 3] ^= 1;   // (attribute 1 bit 8: x + 256)
+    const u8 *oamKeep = e->oam;
+    const int ml = e->objMosaicLine, mc = e->objMosaicCount;
+    u8 regs[REG_SIZE];
+    s32 rx[2], ry[2];
+    memcpy(regs, e->regs, REG_SIZE);
+    memcpy(rx, e->refX, sizeof rx), memcpy(ry, e->refY, sizeof ry);
+    objKeep[b] = e->obj;
+    e->oam = oam;
+    gpu2d_render_obj_line(e, line, &objSide[b]);
+    e->oam = oamKeep;
+    e->obj = objSide[b];
+    for (int n = 0; n < 4; n++) e->regs[REG_BGHOFS + 4 * n + 1] ^= 1;
+    e->regs[REG_BGCNT + 7] |= 0x20;
+    for (int side = 0; side < 2; side++) {
+        const s32 sh = side ? SCREEN_W : -SCREEN_W;
+        for (int i = 0; i < 2; i++) {
+            const s32 pa = (s16)reg16(e, REG_BG2PA + 0x10 * (u32)i), pc = (s16)reg16(e, REG_BG2PA + 4 + 0x10 * (u32)i);
+            e->refX[i] = rx[i] + pa * sh;
+            e->refY[i] = ry[i] + pc * sh;
+        }
+        e->objMosaicLine = ml, e->objMosaicCount = mc;
+        render_line(e, w->in, line);
+        const u32 *o = e->out + line * SCREEN_W;
+        if (side) sky_put(d + SKY_SIDE + SCREEN_W, o, SKY_SIDE);
+        else sky_put(d, o + SCREEN_W - SKY_SIDE, SKY_SIDE);
+    }
+    memcpy(e->regs, regs, REG_SIZE);
+    memcpy(e->refX, rx, sizeof rx), memcpy(e->refY, ry, sizeof ry);
+    e->objMosaicLine = ml, e->objMosaicCount = mc;
+    objSide[b] = e->obj;
+    e->obj = objKeep[b];
+}
 static void band2d_run_(Band2d *w) {
     Engine *e = w->be;
     // e already holds a copy of the engine's inputs (regs, VRAM/palette/oam ptrs, objNextLine0 ...), taken on the
@@ -1416,12 +1456,14 @@ static void band2d_run_(Band2d *w) {
         if (line == 0 && e->haveNextLine0) e->obj = e->objNextLine0;
         else if (line == 0) memset(&e->obj, 0, sizeof e->obj);
         else gpu2d_render_obj_line(e, line, &e->obj);
-        if (w->mirror == 3) {   // (Vita) the sky: the line, for sky_scale
+        if (w->mirror == 3) {   // (Vita) the sky: the line, and the DS's columns either side of its screen
+            u32 *d = sSkyTex + (line + 1) * SKY_TW;
             render_line(e, w->in, line);
-            sky_put(sSkyFull + line * SCREEN_W, e->out + line * SCREEN_W, SCREEN_W);
+            sky_put(d + SKY_SIDE, e->out + line * SCREEN_W, SCREEN_W);
+            sky_side_lines(e, w, line, d);
             ref_advance(e, line);
             if (line + 1 == w->hi) e->objCandOn = 0;
-            sSkyDrawn[line] = 1;
+            __atomic_store_n(&sSkyRows[line + 1], 1, __ATOMIC_RELEASE);
             continue;
         }
         if (w->mirror) {   // (Vita) engine B's whole picture, for the mirror (the menus, the boot screens)
@@ -1881,13 +1923,13 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
         if (skyBand) sky_bg3_check(&sEngine[1], bAll || vm);
         if (bAll) memset(sBDirty, 1, sizeof sBDirty);
         if (skyBand) {
-            // The sky lines shown (the small sky's rows from sSkyOfs: the lines they stand for, a line's margin
-            // above) that are not this frame's yet - all of them this frame (none ever shows late: the sky moves
+            // The sky lines shown (from the one at the screen's top row, a line's margin above) that are not this
+            // frame's yet - all of them this frame (none ever shows late: the sky moves
             // as the camera looks up, the clouds scroll every frame on the title) - and 4 lines a frame in turn
             // whatever changed, so no line can stay wrong (a change the line check misses - the scene's setup during
             // the fade in - is redrawn within 48 frames).
             static int refresh;
-            const int top = SKY_SRC_Y(sSkyOfs < 0 ? 0 : sSkyOfs > SKY_SH ? SKY_SH : sSkyOfs) - 1;
+            const int top = (sSkyTop < 0 ? -sSkyTop / 2 : 0) - 1;
             for (int y = 0; y < SCREEN_H; y++)
                 if (sBDirty[y]) sSkyValid[y] = 0;
             if (bAll) memset(sSkyValid, 0, sizeof sSkyValid);
@@ -1909,7 +1951,7 @@ static void render_engine0_mt_prepass(const Gpu2dFrameInput *in) {
     if (overlayBand) sOvlReady = 1;
     sSkyReady = skyBand || sSkyHold;   // (held: the last sky stays - sky_hold)
     sSkyEdges = skyBand;   // (the edge rows: after the bands, render_engine0_mt_bands)
-    sSkyOfsSnap = sSkyOfs;
+    sSkyTopSnap = sSkyTop;
     sLogoReady = sLogoOn && !sLogoFull;
     sPromptSnap = gHostTitlePrompt;
     sClockSnap = gHostClockDrawn;
@@ -1967,53 +2009,21 @@ static void *band2d_helper(void *arg) {
     }
     return 0;
 }
-// (the sky) After the bands: the small sky's rows whose lines were drawn (each pixel the most visible of the source
-// pixels it stands for: the one furthest from its line's plain gradient colour), the columns beside it its row's plain
-// colour; and the edge rows - the plain colours of lines 0 (above the sky) and 191 (below the horizon) - when they
-// change.
+// (the sky) After the bands: the texture's edge rows - the plain colours of lines 0 (above the sky) and 191 (below it)
+// - when they change.
 static u32 sky_rgba(u32 c6) {
     u32 c = argb(c6);
     return (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | 0xff000000u;
 }
-static void sky_scale(void) {
-    for (int j = 0; j < SKY_SH; j++) {
-        const int y0 = SKY_SRC_Y(j), y1 = SKY_SRC_Y(j + 1);
-        int any = 0;
-        for (int y = y0; y < y1; y++) any |= sSkyDrawn[y];
-        if (!any) continue;
-        u32 plain[3];
-        for (int y = y0; y < y1 && y - y0 < 3; y++) plain[y - y0] = sky_rgba(rgb6(pal16(s2dPalSnapB[y], 0)));
-        u32 *d = sSkyTex + (j + 1) * SKY_TW;
-        const u32 side = plain[(y1 - y0 - 1) / 2];
-        for (int x = 0; x < SKY_X0; x++) d[x] = side;
-        for (int x = SKY_X0 + SKY_SW; x < SKY_TW; x++) d[x] = side;
-        for (int i = 0; i < SKY_SW; i++) {
-            const int x0 = SKY_SRC_X(i), x1 = SKY_SRC_X(i + 1);
-            u32 best = sSkyFull[((y0 + y1 - 1) / 2) * SCREEN_W + (x0 + x1 - 1) / 2];
-            int bestD = 0;
-            for (int y = y0; y < y1; y++) {
-                const u32 b = plain[y - y0 < 3 ? y - y0 : 2];
-                for (int x = x0; x < x1; x++) {
-                    const u32 p = sSkyFull[y * SCREEN_W + x];
-                    const int dd = abs((int)(p & 0xff) - (int)(b & 0xff)) + abs((int)(p >> 8 & 0xff) - (int)(b >> 8 & 0xff)) +
-                                   abs((int)(p >> 16 & 0xff) - (int)(b >> 16 & 0xff));
-                    if (dd > bestD) bestD = dd, best = p;
-                }
-            }
-            d[SKY_X0 + i] = best;
-        }
-        __atomic_store_n(&sSkyRows[j + 1], 1, __ATOMIC_RELEASE);
-    }
-    memset(sSkyDrawn, 0, sizeof sSkyDrawn);
+static void sky_edges(void) {
     static u32 last[2] = {1, 1};
     for (int k = 0; k < 2; k++) {
         const u32 c = sky_rgba(rgb6(pal16(s2dPalSnapB[k ? SCREEN_H - 1 : 0], 0)));
         if (c == last[k]) continue;
         last[k] = c;
-        for (int row = k ? SKY_SH + 1 : 0; row < (k ? SKY_TH : 1); row++) {
-            for (int x = 0; x < SKY_TW; x++) sSkyTex[row * SKY_TW + x] = c;
-            __atomic_store_n(&sSkyRows[row], 1, __ATOMIC_RELEASE);
-        }
+        const int row = k ? SKY_TH - 1 : 0;
+        for (int x = 0; x < SKY_TW; x++) sSkyTex[row * SKY_TW + x] = c;
+        __atomic_store_n(&sSkyRows[row], 1, __ATOMIC_RELEASE);
     }
 }
 static void render_engine0_mt_bands(u32 *canvas) {
@@ -2038,7 +2048,7 @@ static void render_engine0_mt_bands(u32 *canvas) {
     pthread_mutex_lock(&s2dMu);
     while (s2dPending) pthread_cond_wait(&s2dDoneCv, &s2dMu);
     pthread_mutex_unlock(&s2dMu);
-    if (sSkyEdges) { sSkyEdges = 0; sky_scale(); }
+    if (sSkyEdges) { sSkyEdges = 0; sky_edges(); }
     for (int b = 0; b < nb && !canvas && !sGcFrame; b++) {
         int lo = sMtBnd[b], n = sMtBnd[b + 1] - lo;
         memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
@@ -2099,7 +2109,7 @@ static void gc_test_dump(void) {
     fclose(f);
     snprintf(path, sizeof path, "%s/logo_%u.bin", getenv("ACWW_GCTEST"), sFrame);   // (the top-screen layer: the sky)
     if ((f = fopen(path, "wb"))) {
-        int m = sMirrorReady ? 1 : sOvlReady ? 2 : 0, k[4] = {sSkyReady, sSkyOfsSnap, sLogoReady, sLogoDy};
+        int m = sMirrorReady ? 1 : sOvlReady ? 2 : 0, k[4] = {sSkyReady, sSkyTopSnap, sLogoReady, sLogoDy};
         fwrite(&m, 4, 1, f);
         fwrite(sLogo, 4, SCREEN_W * SCREEN_H, f);
         fwrite(k, 4, 4, f);   // (the sky: shown, its offset; the title logo: shown, its move up)
@@ -2282,11 +2292,12 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         }
     }
 #endif
-    if (sSkyOn || sSkyHold) {   // the small sky's row at picture row r is r + sSkyOfs: its bottom row in the horizon's
+    if (sSkyOn || sSkyHold) {   // line 0's top screen row: the sky's bottom (2 rows a line) SKY_DOWN_PX below the horizon
         float h;
         if (sky_horizon_row(&h)) {
-            const float o = (float)(SKY_SH - 1) - floorf(h);
-            sSkyOfs = o < -SCREEN_H ? -SCREEN_H : o > SCREEN_H + 1 ? SCREEN_H + 1 : (int)o;
+            const int hz = (int)floorf(h * SKY_SCREEN_H / SCREEN_H + 0.5f);
+            const int t = hz + SKY_DOWN_PX - 2 * SCREEN_H;
+            sSkyTop = t < -4 * SCREEN_H ? -4 * SCREEN_H : t > 2 * SKY_SCREEN_H ? 2 * SKY_SCREEN_H : t;
         }
         static int log = -1;   // (host check: ACWW_SKYLOG prints the horizon every frame)
         if (log < 0) log = getenv("ACWW_SKYLOG") != 0;
@@ -2294,8 +2305,8 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
             s32 v[11];
             extern int Camera_HostSkyView(s32 *o);
             int got = Camera_HostSkyView(v);
-            fprintf(stderr, "sky frame %u hold %d menu %d ofs %d horizon %.2f eye %d %d %d target %d %d %d up %d %d %d fovy %d\n", sFrame,
-                    sSkyHold, (sPowCnt & 0x8000) != 0, sSkyOfs, got && sky_horizon_row(&h) ? h : -999.0f, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+            fprintf(stderr, "sky frame %u hold %d menu %d top %d horizon %.2f eye %d %d %d target %d %d %d up %d %d %d fovy %d\n", sFrame,
+                    sSkyHold, (sPowCnt & 0x8000) != 0, sSkyTop, got && sky_horizon_row(&h) ? h : -999.0f, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
                     v[8], v[9]);
         }
     }

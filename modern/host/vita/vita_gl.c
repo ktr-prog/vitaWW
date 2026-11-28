@@ -21,7 +21,7 @@
 #include "vita.h"
 #include "../gpu2d/gpu2d.h"
 #include "../gpu2d/gpu2d_compose.h"
-_Static_assert(GPU2D_SKY_SIDE == 48 && GPU2D_SKY_W == 352 && GPU2D_SKY_H == 194, "gpu2d_compose.h: GC_SKY_*");
+_Static_assert(GPU2D_SKY_W * 2 == 960 && GPU2D_SKY_H == 194, "gpu2d_compose.h: GC_SKY_* (the sky: 2x2 screen pixels)");
 #include "../host_features.h"
 
 #define SCREEN_W 960
@@ -252,7 +252,8 @@ static void gc_static_uniforms(GLuint prog) {
 static int sSkyFrames;   // frames the compose drew with the sky (render.c's log)
 int vita_gl_sky_frames(void) { return __atomic_exchange_n(&sSkyFrames, 0, __ATOMIC_RELAXED); }
 // This frame's compose uniforms (vita_gl_present_gc), set on whichever compose program draws.
-static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift, sky, skyOfs; } sGcU;
+static struct { float have3d, ovlOn, logoOn, mirror, ofs[2], bg3, mv[4], objShift, sky, skyTop; } sGcU;
+static GLuint sSkyGlTex;   // this frame's sky texture (the present draws it: present_sky)
 static void gc_frame_uniforms(GLuint prog) {
     // (the locations looked up once per program: vitaGL finds a uniform by comparing names)
     static GLuint progs[4];
@@ -263,7 +264,7 @@ static void gc_frame_uniforms(GLuint prog) {
     if (progs[k] != prog) {
         static const char *const kN[14] = {"uHave3d", "uOvlOn", "uLogoOn", "uMirror", "uLogoOfs", "uBg3Shift",
                                            "uObjMove", "uVLogoOfs", "uVBg3Shift", "uVFlip", "uObjShift", "uSkyOn",
-                                           "uSkyOfs", "uVSkyOfs"};
+                                           "uSkyTop", "uVSkyTop"};
         progs[k] = prog;
         for (int i = 0; i < 14; i++) loc[k][i] = glGetUniformLocation(prog, kN[i]);
     }
@@ -281,8 +282,8 @@ static void gc_frame_uniforms(GLuint prog) {
     glUniform1f(l[9], sGcFlip);
     glUniform1f(l[10], sGcU.objShift);
     glUniform1f(l[11], sGcU.sky);
-    glUniform1f(l[12], sGcU.skyOfs);
-    glUniform1f(l[13], sGcU.skyOfs);
+    glUniform1f(l[12], sGcU.skyTop);
+    glUniform1f(l[13], sGcU.skyTop);
 }
 // The present, built from plain texture copies and the GPU's blending (per-pixel arithmetic at the screen's
 // 960x544 is what costs on the Vita: a shader of a few dozen operations took 10 ms, a copy 1.2 ms):
@@ -302,18 +303,35 @@ static const char kCopyFragmentCg[] =
 static const char kNearFragmentCg[] =
     "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex, uniform float4 uSz) : COLOR {\n"
     "  return tex2D(uTex, (floor(vTex * uSz.xy) + 0.5) * uSz.zw); }\n";
+// The 3D buffer where it has a pixel (alpha from 0.5): over the sky the present drew first (present_sky)
+static const char kKeyFragmentCg[] =
+    "float4 main(float2 vTex : TEXCOORD0, uniform sampler2D uTex) : COLOR {\n"
+    "  float4 c = tex2D(uTex, vTex);\n"
+    "  if (c.a < 0.5) discard;\n"
+    "  return c; }\n";
 static const char kFillVertexCg[] =
     "void main(float2 aPos, float4 aCol, out float4 oPos : POSITION, out float4 vCol : COLOR) {\n"
     "  oPos = float4(aPos, 0.0, 1.0); vCol = aCol; }\n";
 static const char kFillFragmentCg[] =
     "float4 main(float4 vCol : COLOR) : COLOR { return vCol; }\n";
-static GLuint sCopyProg, sFillProg, sNearProg, sPreTex, sPreFbo;
+static GLuint sCopyProg, sFillProg, sNearProg, sPreTex, sPreFbo, sKeyProg;
+static GLint sKeyPos = -1, sKeyTex = -1;
 static GLint sNearPos = -1, sNearTex = -1;
 static GLint sCopyPos = -1, sCopyTex = -1, sFillPos = -1, sFillCol = -1;
 static void present_init(void) {
     sCopyProg = cached_program(kCopyVertexCg, kCopyFragmentCg, "copy");
     sFillProg = cached_program(kFillVertexCg, kFillFragmentCg, "fill");
     sNearProg = cached_program(kCopyVertexCg, kNearFragmentCg, "near");
+    sKeyProg = cached_program(kCopyVertexCg, kKeyFragmentCg, "key3d");   // (none: no sky behind the 3D - present_draw)
+    if (sKeyProg) {
+        sKeyPos = glGetAttribLocation(sKeyProg, "aPos");
+        sKeyTex = glGetAttribLocation(sKeyProg, "aTex");
+        glUseProgram(sKeyProg);
+        glUniform1i(glGetUniformLocation(sKeyProg, "uTex"), 0);
+        glUseProgram(0);
+        if (sKeyPos < 0 || sKeyTex < 0) sKeyProg = 0;
+    }
+    fprintf(stderr, "vita_gl: present sky %s\n", sKeyProg ? "ready" : "unavailable");
     if (sNearProg) {
         sNearPos = glGetAttribLocation(sNearProg, "aPos");
         sNearTex = glGetAttribLocation(sNearProg, "aTex");
@@ -388,6 +406,25 @@ static void present_3d(unsigned tex3d) {
     glDisable(GL_BLEND);
     copy_quad(tex3d, kFlatUv);
 }
+// The sky (gpu2d sSkyOn) at the screen's resolution, each texel 2 x 2 pixels - line 0's top at screen row top - and
+// the 3D buffer over it where it has a pixel. The canvas then goes over both, marked (alpha 0) where it is just the
+// sky or the 3D (gpu2d_compose.h).
+static void present_sky(unsigned tex3d, int top) {
+    const float v0 = (float)(2 - top) / (2.0f * GPU2D_SKY_H), v1 = (float)(SCREEN_H + 2 - top) / (2.0f * GPU2D_SKY_H);
+    const float uv[8] = {0, v1, 1, v1, 0, v0, 1, v0};   // (screen row 0 at the top: the quad's y = 1)
+    glDisable(GL_BLEND);
+    copy_quad(sSkyGlTex, uv);
+    glUseProgram(sKeyProg);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex3d);
+    glEnableVertexAttribArray((GLuint)sKeyPos);
+    glEnableVertexAttribArray((GLuint)sKeyTex);
+    glVertexAttribPointer((GLuint)sKeyPos, 2, GL_FLOAT, GL_FALSE, 0, kFullPos);
+    glVertexAttribPointer((GLuint)sKeyTex, 2, GL_FLOAT, GL_FALSE, 0, kFlatUv);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableVertexAttribArray((GLuint)sKeyPos);
+    glDisableVertexAttribArray((GLuint)sKeyTex);
+}
 // The fades over the 3D: per DS line with a master brightness, white (up) or black (down) at factor / 16.
 static int present_fades(const Gpu2dGc *gc) {
     static float pos[GC_VERTS][2], col[GC_VERTS][4];
@@ -438,7 +475,8 @@ static void present_draw(const Gpu2dGc *gc, unsigned tex3d, int has3d) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, SCREEN_W, SCREEN_H);
     if (has3d) {
-        present_3d(tex3d);
+        if (sGcU.sky > 0.5f && sKeyProg && sSkyGlTex) present_sky(tex3d, (int)sGcU.skyTop);
+        else present_3d(tex3d);
         present_fades(gc);
     }
     present_final(has3d, smooth);
@@ -756,9 +794,11 @@ void vita_gl_present_gc(const Gpu2dGc *gc, unsigned tex3d, const uint32_t *ovl) 
             memset(pend[cur], 0, sizeof pend[cur]);
         }
         glBindTexture(GL_TEXTURE_2D, skyTex[cur]);
-        sGcU.sky = on ? 1.0f : 0.0f;
-        sGcU.skyOfs = (float)ofs;
-        if (on) __atomic_fetch_add(&sSkyFrames, 1, __ATOMIC_RELAXED);
+        // (only with the present's sky: the compose leaves the sky's pixels to it - present_sky)
+        sGcU.sky = on && sKeyProg && sCopyProg && sCopyProg != (GLuint)-1 ? 1.0f : 0.0f;
+        sGcU.skyTop = (float)ofs;
+        sSkyGlTex = skyTex[cur];
+        if (sGcU.sky > 0.5f) __atomic_fetch_add(&sSkyFrames, 1, __ATOMIC_RELAXED);
     }
     {   // this frame's per-line parameters, decoded once per line
         static unsigned char lt[192][8][4];

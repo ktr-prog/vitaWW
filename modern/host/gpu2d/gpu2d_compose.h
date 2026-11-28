@@ -53,7 +53,7 @@ static const char kGcVertexShader[] =
     "uniform float uObjShift;\n" \
     "uniform float uSkyOn;\n" \
     "uniform sampler2D uSky;\n" \
-    "uniform float uSkyOfs;\n" \
+    "uniform float uSkyTop;\n" \
     "float by(float tv) { return floor(tv * 255.0 + 0.5); }\n" \
     "float bitOf(float v, float p) { return gmod(floor(v / p), 2.0); }\n"   \
     "vec3 col15(float lo, float hi) {\n" \
@@ -78,7 +78,9 @@ static const char kGcVertexShader[] =
     "  float first = L1.x, second = L1.y, effect = L1.z, evy = L1.w;\n" \
     "  float eva = L2.x, evb = L2.y, mbm = L2.z, mbf = L2.w;\n" \
     "  vec3 bd = L3.xyz;\n" \
-    /* the sky (gpu2d.c sSkyOn): the top screen's sky, 1:1 across the whole picture, where the backdrop would be */ \
+    /* the sky (gpu2d.c sSkyOn): the top screen's sky where the backdrop would be - here the sky texel under the pixel, \
+       for the pixels the canvas makes (blended with it); a pixel that is just the sky is marked (alpha 0, as an \
+       exact 3D pixel) and the present draws the sky there at the screen's resolution (vita_gl.c present_sky) */ \
     "  if (uSkyOn > 0.5) bd = floor(pSk.rgb * 63.0 + 0.5);\n" \
     "  float objOn = L4.x, on3d = L4.y, uni = L4.z;\n" \
     "  vec4 ax = pAux;\n" \
@@ -133,7 +135,7 @@ static const char kGcVertexShader[] =
     "    vec3 qo = qa > 30.5 ? floor(vec3(by(q.r), by(q.g), by(q.b)) / 4.0) : bd;\n" \
     "    if (mbm > 0.5 && mbm < 1.5 && mbf > 0.5) qo = brighten(qo, mbf, 0.0);\n" \
     "    else if (mbm > 1.5 && mbm < 2.5 && mbf > 0.5) qo = darken(qo, mbf, 15.0);\n" \
-    "    res = vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 ? 0.0 : 1.0);\n" \
+    "    res = vec4((qo * 4.0 + floor(qo / 16.0)) / 255.0, qa > 30.5 || uSkyOn > 0.5 ? 0.0 : 1.0);\n" \
     "  } else {\n" \
     /* (GC_FASTONLY: the compose's first pass - only the fast path's pixels, the rest discarded, and the full \
        compose then drawn only where this pass wrote nothing: the depth test skips the others before shading) */ \
@@ -217,6 +219,7 @@ static const char kGcVertexShader[] =
     "    else if (effect > 1.5 && effect < 2.5) { o = brighten(c1, evy, 8.0); pure = 0.0; }\n" \
     "    else if (effect > 2.5) { o = darken(c1, evy, 7.0); pure = 0.0; }\n" \
     "  }\n" \
+    "  if (uSkyOn > 0.5 && l1 > 4.5 && dot(abs(o - c1), vec3(1.0)) < 0.5) pure = 1.0;\n" \
     "  if (uLogoOn > 0.5 && (l1 > 4.5 || (l1 < 0.5 && on3d > 0.5))) {\n" \
     "    vec2 lu = uv - uLogoOfs / vec2(256.0, 192.0);\n" \
     "    vec4 lg = pLg;\n" \
@@ -235,11 +238,12 @@ static const char kGcVertexShader[] =
     "  return res;\n" \
     "}\n"
 
-// The sky texture (gpu2d.c sSkyTex: GPU2D_SKY_W x GPU2D_SKY_H, its DS columns from GPU2D_SKY_SIDE; row 1 + l = sky line
-// l, rows 0 and the last the colours above and below it - the texture clamps to them), as shader numbers.
-#define GC_SKY_SIDE "48.0"
-#define GC_SKY_W "352.0"
-#define GC_SKY_H "194.0"
+// The sky texture (gpu2d.c sSkyTex: GPU2D_SKY_W x GPU2D_SKY_H, row 1 + l = sky line l, rows 0 and the last the colours
+// above and below it - the texture clamps to them): each texel 2 x 2 of the 960 x 544 screen, its columns across the
+// whole screen, line 0's top at screen row uSkyTop. A canvas pixel (the canvas spans the screen: uW columns, 192 rows)
+// reads the texel under its middle. As shader numbers: the screen's rows per canvas row, 2 * GPU2D_SKY_H.
+#define GC_SKY_RS "2.8333333"
+#define GC_SKY_2H "388.0"
 #define GC_GMOD "float gmod(float a, float b) { return a - b * floor(a / b); }\n"
 // The layer samples compose() takes, read at coordinates worked out from the pixel position (the line-quad shaders)
 #define GC_DEP_PREFETCH \
@@ -249,7 +253,7 @@ static const char kGcVertexShader[] =
     "  vec4 pBg1 = texture2D(uBg1, puv), pBg2 = texture2D(uBg2, puv);\n" \
     "  vec4 pBg3 = texture2D(uBg3, vec2((ppx - uBg3Shift + 0.5) / 256.0, puv.y));\n" \
     "  vec4 pLg = texture2D(uLogo, puv - uLogoOfs / vec2(256.0, 192.0));\n" \
-    "  vec4 pSk = texture2D(uSky, vec2((ppx + " GC_SKY_SIDE " + 0.5) / " GC_SKY_W ", (ppy + uSkyOfs + 1.5) / " GC_SKY_H "));\n" \
+    "  vec4 pSk = texture2D(uSky, vec2((pcx + 0.5) / uW, ((ppy + 0.5) * " GC_SKY_RS " - uSkyTop + 2.0) / " GC_SKY_2H "));\n" \
     "  vec4 p3d = texture2D(u3d, vec2((floor((pcx + 0.5) * u3dCols / uW) + 0.5) / u3dTexW, (191.0 - ppy + 0.5) / 192.0));\n"
 #define GC_PARGS "pAux, p3d, pLg, pObj, pBg0, pBg1, pBg2, pBg3, pSk"
 static const char kGcFragmentShader[] =   // GLSL ES 1.00
@@ -394,7 +398,7 @@ static inline void present_line_quads(const unsigned char *par, int parStride, f
     "  vUv = vec2(xx / 256.0, py / 192.0);\n" \
     "  vUv3 = vec2((xx - uVBg3Shift) / 256.0, py / 192.0);\n" \
     "  v3d = vec2(px * uV3dCols / uVW / uV3dTexW, (192.0 - py) / 192.0);\n" \
-    "  vLg = vec4(vUv - uVLogoOfs / vec2(256.0, 192.0), (xx + " GC_SKY_SIDE ") / " GC_SKY_W ", (py + uVSkyOfs + 1.0) / " GC_SKY_H ");\n" \
+    "  vLg = vec4(vUv - uVLogoOfs / vec2(256.0, 192.0), px / uVW, (py * " GC_SKY_RS " - uVSkyTop + 2.0) / " GC_SKY_2H ");\n" \
     "  vP0 = vec2(0.5 / 8.0, py / 192.0); vP1 = vec2(1.5 / 8.0, py / 192.0); vP2 = vec2(2.5 / 8.0, py / 192.0);\n" \
     "  vP3 = vec2(3.5 / 8.0, py / 192.0); vP4 = vec2(4.5 / 8.0, py / 192.0); vP5 = vec2(5.5 / 8.0, py / 192.0);\n"
 static const char kGcqFragmentShader[] =   // GLSL ES 1.00 (host check)
@@ -406,7 +410,7 @@ static const char kGcqFastFragmentShader[] =   // (the first pass: GC_FASTONLY)
     "void main() { vec2 fc = gl_FragCoord.xy;\n" GC_VARY_FETCH("texture2D")
     "  gl_FragColor = compose(fc, L0, L1, L2, L3, L4, L5, " GC_PARGS "); }\n";
 static const char kGcqVertexShader[] =
-    "attribute vec2 aPos;\nuniform float uVW, uV3dCols, uV3dTexW, uVBg3Shift, uVFlip, uVSkyOfs;\nuniform vec2 uVLogoOfs;\n"
+    "attribute vec2 aPos;\nuniform float uVW, uV3dCols, uV3dTexW, uVBg3Shift, uVFlip, uVSkyTop;\nuniform vec2 uVLogoOfs;\n"
     GC_VARYINGS_GLSL "void main() { gl_Position = vec4(aPos, 0.0, 1.0);\n" GC_VS_BODY "}\n";
 #define GC_CG_FS_MAIN \
     "float4 main(float4 fc : WPOS, float2 vUv : TEXCOORD0, float2 vUv3 : TEXCOORD1, float2 v3d : TEXCOORD2,\n" \
@@ -423,7 +427,7 @@ static const char kGcqFastFragmentShaderCg[] =
 static const char kGcqVertexShaderCg[] =
     "#define vec2 float2\n#define vec4 float4\n"
     "void main(float2 aPos, uniform float uVW, uniform float uV3dCols, uniform float uV3dTexW, uniform float uVBg3Shift,\n"
-    "          uniform float uVFlip, uniform float2 uVLogoOfs, uniform float uVSkyOfs, out float4 oPos : POSITION, out float2 vUv : TEXCOORD0,\n"
+    "          uniform float uVFlip, uniform float2 uVLogoOfs, uniform float uVSkyTop, out float4 oPos : POSITION, out float2 vUv : TEXCOORD0,\n"
     "          out float2 vUv3 : TEXCOORD1, out float2 v3d : TEXCOORD2, out float4 vLg : TEXCOORD3, out float2 vP0 : TEXCOORD4,\n"
     "          out float2 vP1 : TEXCOORD5, out float2 vP2 : TEXCOORD6, out float2 vP3 : TEXCOORD7, out float2 vP4 : TEXCOORD8,\n"
     "          out float2 vP5 : TEXCOORD9) {\n"
@@ -441,7 +445,7 @@ static const char kGcqVertexShaderCg[] =
     "  vec4 sk = " TEX "(uSky, vLg.zw);\n" \
     "  if (uSkyOn > 0.5) bd = floor(sk.rgb * 63.0 + 0.5);\n" \
     "  vec3 o = qa > 30.5 ? c : (qa < 0.5 ? bd : (b2 > 0.5 ? blend3d(c, bd, qa) : c));\n" \
-    "  float al = qa < 0.5 || (qa < 30.5 && b2 > 0.5) ? 1.0 : 0.0;\n" \
+    "  float al = (qa < 0.5 && uSkyOn < 0.5) || (qa > 0.5 && qa < 30.5 && b2 > 0.5) ? 1.0 : 0.0;\n" \
     "  if (L2.z > 0.5 && L2.z < 1.5 && L2.w > 0.5) o = brighten(o, L2.w, 0.0);\n" \
     "  else if (L2.z > 1.5 && L2.z < 2.5 && L2.w > 0.5) o = darken(o, L2.w, 15.0);\n" \
     "  vec4 res = vec4((o * 4.0 + floor(o / 16.0)) / 255.0, al);\n"
