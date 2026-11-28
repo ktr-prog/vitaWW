@@ -2033,6 +2033,13 @@ static void gc_test_dump(void) {
     fwrite(&sGc.used, 4, 1, f);
     fwrite(l3 ? l3 : zero, 1, sizeof zero, f);
     fclose(f);
+    snprintf(path, sizeof path, "%s/logo_%u.bin", getenv("ACWW_GCTEST"), sFrame);   // (the top-screen layer: the sky)
+    if ((f = fopen(path, "wb"))) {
+        int m = sMirrorReady ? 1 : sOvlReady ? 2 : sSkyReady ? 3 : 0;
+        fwrite(&m, 4, 1, f);
+        fwrite(sLogo, 4, SCREEN_W * SCREEN_H, f);
+        fclose(f);
+    }
 }
 // Validation hook: hash the finished engine-0 canvas so a threaded run can be byte-compared with a sync run.
 static void canvas_hash(void) {
@@ -2092,14 +2099,15 @@ static int sky_shown(void) {
     gSkyStat[3] += !(sPowCnt & 0x200);
     gSkyStat[4] += (sPowCnt & 0x8000) != 0;
     gSkyStat[5] += (d & 0x80) || (d >> 16 & 3) != 1;
-    return Sky_HostOnSub() && Scene_HostIsOutdoor() && (sPowCnt & 0x200) && !(sPowCnt & 0x8000) && !(d & 0x80) &&
-           (d >> 16 & 3) == 1;
+    // (not POWCNT1's screen swap: the game leaves it set in town after some scene changes, with no menu open; a menu
+    // that takes the top screen moves the sky off it first - Sky_SetEngine(1) - so Sky_HostOnSub says it)
+    return Sky_HostOnSub() && Scene_HostIsOutdoor() && (sPowCnt & 0x200) && !(d & 0x80) && (d >> 16 & 3) == 1;
 }
 // (render.c, before the frame's VRAM snapshot) the sky will be drawn this frame: keep engine B's banks
 int gpu2d_sky_wanted(void) {
     extern unsigned Scene_GetCurrent(void);
     const unsigned sc = Scene_GetCurrent();
-    return sc != 0x2c && sc != 0x3f && !(sPowCnt & 0x8000) && sky_shown();
+    return sc != 0x2c && sc != 0x3f && sky_shown();
 }
 void gpu2d_render_frame(const Gpu2dFrameInput *in) {
     {   // (host check) both engines' finished pictures of the previous frame
@@ -2125,8 +2133,8 @@ void gpu2d_render_frame(const Gpu2dFrameInput *in) {
         sMirrorOn = sc == 0x3f;
         // The menus (the game puts engine A on the top screen, POWCNT1 bit 15, and draws the menu with engine B):
         // one screen, as the iPhone build - the scene keeps being drawn and the menu goes over it (sOverlayOn).
-        sOverlayOn = !sMirrorOn && (sPowCnt & 0x8000);
-        sSkyOn = sky_shown() && !sLogoOn && !sMirrorOn && !sOverlayOn;
+        sSkyOn = sky_shown() && !sLogoOn && !sMirrorOn;
+        sOverlayOn = !sMirrorOn && !sSkyOn && (sPowCnt & 0x8000);
         gSkyStat[0] += sSkyOn;
         gSkyStat[6] += sLogoOn || sMirrorOn || sOverlayOn;
         gSkyStat[7]++;
