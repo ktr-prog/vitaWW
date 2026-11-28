@@ -1880,11 +1880,6 @@ static void render_engine0_mt_bands(u32 *canvas) {
     pthread_mutex_lock(&s2dMu);
     while (s2dPending) pthread_cond_wait(&s2dDoneCv, &s2dMu);
     pthread_mutex_unlock(&s2dMu);
-    if (getenv("ACWW_LOGOHASH")) {   // TEMPHASH
-        u32 h = 2166136261u;
-        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) h = (h ^ sLogo[i]) * 16777619u;
-        fprintf(stderr, "logohash %llu %08x\n", (unsigned long long)host_frame(), h);
-    }
     for (int b = 0; b < nb && !canvas && !sGcFrame; b++) {
         int lo = sMtBnd[b], n = sMtBnd[b + 1] - lo;
         memcpy(e->out + lo * SCREEN_W, s2dBandEng[b].out + lo * SCREEN_W, (size_t)n * SCREEN_W * sizeof(u32));
